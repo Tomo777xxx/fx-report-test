@@ -9,3 +9,5 @@ openai
 romkan
 rapidfuzz
 openpyxl
+lxml
+# rebuild
