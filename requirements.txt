@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+yfinance
+pypdf
+pyyaml
+requests
+openai
+romkan
+rapidfuzz
+openpyxl
