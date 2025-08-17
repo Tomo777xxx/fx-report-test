@@ -418,7 +418,13 @@ def _enforce_regime_language(para2_text: str, regime: str | None) -> tuple[str, 
 
 
 # 目的：タイトル語尾・段落②の締めをホワイトリストから安全選択（LLM利用時も“候補外禁止”）。rules_digestは文体/禁止語の守るべき要点を短く共有するために使用
-# ===== タイトル・結び・ルールダイジェスト =====
+# ===== タイトル・結び・ルールダイジェスト（丸ごと置換用） =====
+import os
+import random
+from pathlib import Path
+import streamlit as st
+
+# 1) ホワイトリスト（LLMが"候補外"を出しても採用しない安全設計）
 ALLOWED_TITLE_TAILS = ["注視か", "警戒か", "静観か", "要注意か", "見極めたい"]
 
 ALLOWED_PARA2_CLOSERS = [
@@ -426,26 +432,7 @@ ALLOWED_PARA2_CLOSERS = [
     "一段の変動に要注意としたい。", "方向感を見極めたい。"
 ]
 
-
-def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
-    try:
-        from openai import OpenAI
-        api_key = _get_api_key()
-        if not api_key:
-            return None
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="gpt-5-thinking",
-            messages=[{"role": "system", "content": system_msg},
-                      {"role": "user", "content": user_msg}],
-            temperature=0.2,
-            max_tokens=16,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        return text.replace("\n", "").strip()
-    except Exception:
-        return None
-
+# 2) ルール要約の読込（存在しなければ空文字）
 def _read_rules_digest(path: str | Path = "data/rules_digest.txt") -> str:
     p = Path(path)
     if not p.exists():
@@ -455,6 +442,57 @@ def _read_rules_digest(path: str | Path = "data/rules_digest.txt") -> str:
 
 RULES_DIGEST = _read_rules_digest()
 
+# 3) APIキー取得（既存の _get_api_key があればそれを使う）
+try:
+    _get_api_key  # 既存が定義済みならそれを使う
+except NameError:
+    def _get_api_key() -> str:
+        # st.secrets 優先 → [general] → 環境変数
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+        if "general" in st.secrets and "OPENAI_API_KEY" in st.secrets["general"]:
+            return st.secrets["general"]["OPENAI_API_KEY"]
+        return os.environ.get("OPENAI_API_KEY", "")
+
+# 4) LLM呼び出し（今回の生成で使えたかを session_state に記録）
+def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
+    # 初期化（この生成での状態を上書き）
+    st.session_state["llm_used"] = None
+    st.session_state["llm_error"] = None
+
+    try:
+        api_key = _get_api_key()
+    except Exception as e:
+        st.session_state["llm_used"] = False
+        st.session_state["llm_error"] = f"key error: {e}"
+        return None
+
+    if not api_key:
+        st.session_state["llm_used"] = False
+        st.session_state["llm_error"] = "No OPENAI_API_KEY"
+        return None
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",  # 安定提供の汎用モデル（必要なら変更可）
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=16,
+        )
+        text = (resp.choices[0].message.content or "").strip().replace("\n", "")
+        st.session_state["llm_used"] = True
+        return text
+    except Exception as e:
+        st.session_state["llm_used"] = False
+        st.session_state["llm_error"] = str(e)[:240]
+        return None
+
+# 5) タイトル語尾の選択（LLM→ホワイトリスト検証→不一致ならランダムにフォールバック）
 def choose_title_tail(para1: str, para2: str) -> str:
     system = (
         "あなたは金融レポートの校正者です。断定を避けた語尾を選びます。"
@@ -470,6 +508,7 @@ def choose_title_tail(para1: str, para2: str) -> str:
     picked = _llm_pick_from_list(system, user)
     return picked if picked in ALLOWED_TITLE_TAILS else random.choice(ALLOWED_TITLE_TAILS)
 
+# 6) 段落②の結びの選択（同様）
 def choose_para2_closer(para1: str, para2: str) -> str:
     system = (
         "あなたは金融レポートの校正者です。断定を避けた結びの一文を選びます。"
@@ -484,6 +523,9 @@ def choose_para2_closer(para1: str, para2: str) -> str:
     )
     picked = _llm_pick_from_list(system, user)
     return picked if picked in ALLOWED_PARA2_CLOSERS else random.choice(ALLOWED_PARA2_CLOSERS)
+
+# ===== ここまでを既存ブロックと置換 =====
+
 
 # ---- タイトル初期値（助詞の自動補正を含む“正”の版だけを残す） ----
 def _default_title_for(pair: str, tail: str) -> str:
@@ -3165,5 +3207,6 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
 
