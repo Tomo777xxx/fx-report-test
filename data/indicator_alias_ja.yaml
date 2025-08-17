@@ -1,0 +1,38 @@
+# data/indicator_alias_ja.yaml
+exact:
+  "RICS House Price Balance": "住宅価格指数（RICS）"
+  "Existing Home Sales": "中古住宅販売件数"
+  "MBA Mortgage Applications": "MBA住宅ローン申請指数"
+  "Crude Oil Inventories": "週間原油在庫"
+contains:
+  "Inflation Expectations": "インフレ期待"
+  "CPI": "消費者物価指数（CPI）"
+  "Retail Sales": "小売売上高"
+  "RICS House Price Balance": "RICS住宅価格バランス"
+"Consumer Inflation Expectations": "消費者インフレ期待"
+"Business Inflation Expectations": "企業インフレ期待"
+"RICS House Price Balance": "RICS住宅価格バランス"
+"GDP Growth Rate YoY Final": "GDP成長率（前年比・確報）"
+"GDP Growth Rate QoQ Final": "GDP成長率（前期比・確報）"
+"Current Account": "経常収支"
+# --- 小売関連 ---
+"Retail Sales (YoY)": "小売売上高（前年比）"
+"Retail Sales (MoM)": "小売売上高（前月比）"
+"Retail Sales Control Group": "小売売上高（コントロールグループ）"
+"Retail Control": "小売売上高（コントロールグループ）"
+"小売管理": "小売売上高（コントロールグループ）"  # 既存の微妙な訳を上書き
+
+# --- ミシガン大学関連 ---
+"UoM 1-year Inflation Expectations": "ミシガン大学1年先インフレ期待"
+"UoM 5-year Inflation Expectations": "ミシガン大学5年先インフレ期待"
+"University of Michigan Consumer Sentiment": "ミシガン大学消費者信頼感指数（速報）"
+"ロイター・ミシガン大学消費者信頼感指数": "ミシガン大学消費者信頼感指数（速報）"
+"ミシガン消費": "ミシガン大学消費者信頼感指数（速報）"
+
+# --- そのほか、今回ログにあったもの ---
+"Corporate Inventories": "企業在庫"
+"Industrial Production (MoM)": "鉱工業生産（前月比）"
+"NY Empire State Manufacturing Index": "ニューヨーク連銀製造業景気指数"
+"Treasury Bill 4-Week Auction": "財務省短期証券（T-Bill）4週間物入札"
+
+

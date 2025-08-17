@@ -1,0 +1,38 @@
+pdf_paths:
+  - "./PDF.data/サンプル相場レポート.pdf"
+  - "./PDF.data/公開用体裁ルール_正典_v1.1_2025-08-12.pdf"
+
+app:
+  title: "相場レポート自動生成（モック版）"
+
+events_csv_path: "data/events_today.csv"
+
+text_guards:
+  p1_min_chars: 220
+  p2_min_chars: 180
+
+live:
+  enabled: true
+  yf_days: 30
+  thresholds:
+    adx_trend: 22
+    bb_range_max: 0.012
+    slope_ema200_min: 0.0
+    slope_sma20_abs_max: 0.0006
+
+providers:
+  tradingeconomics:
+    enabled: true
+    endpoint: "https://api.tradingeconomics.com/calendar"
+    key_env: "TE_API_KEY"
+    timeout_sec: 12
+    window_days: 2
+providers:
+  fxon:
+    enabled: true
+    list_url: "https://fxon.com/lib/fxscalendar/index.php"
+    detail_url: "https://fxon.com/lib/fxscalendar/get-event.php"
+    timeout_sec: 15
+    tz_param: -9        # FxON側のtz指定（JST→-9）
+    window_days: 1      # 1=当日, 2=当日+翌日
+    use_detail: true    # 可能なら詳細APIでカテゴリ/通貨など補完
