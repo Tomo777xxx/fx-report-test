@@ -467,10 +467,11 @@ except NameError:
 
 # 4) LLM呼び出し（今回の生成で使えたかを session_state に記録）
 def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
-    # 初期化（この生成での状態を上書き）
+    # この生成での状態を初期化
     st.session_state["llm_used"] = None
     st.session_state["llm_error"] = None
 
+    # APIキー取得
     try:
         api_key = _get_api_key()
     except Exception as e:
@@ -484,23 +485,53 @@ def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
         return None
 
     try:
+        # OpenAIクライアント
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-    model="gpt-5",
-    messages=[{"role":"system","content":system_msg},
-              {"role":"user","content":user_msg}],
-    temperature=0.2,
-    max_tokens=16,
-)
 
+        # ★モデルとパラメータ（gpt-5 と 4o 系で自動出し分け）
+        MODEL_NAME = "gpt-5"  # 必要に応じて 'gpt-4o-mini' などに変更可
+        kwargs = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            "temperature": 0.2,
+        }
+        # gpt-5 系は max_completion_tokens、4o 系は max_tokens
+        if str(MODEL_NAME).startswith("gpt-5"):
+            kwargs["max_completion_tokens"] = 16
+        else:
+            kwargs["max_tokens"] = 16
+
+        resp = client.chat.completions.create(**kwargs)
+
+        # テキスト抽出
         text = (resp.choices[0].message.content or "").strip().replace("\n", "")
+
+        # 見える化メタ
         st.session_state["llm_used"] = True
+        try:
+            st.session_state["llm_model"] = getattr(resp, "model", None) or MODEL_NAME
+        except Exception:
+            st.session_state["llm_model"] = MODEL_NAME
+        try:
+            u = getattr(resp, "usage", None)
+            st.session_state["llm_tokens"] = (
+                (getattr(u, "prompt_tokens", 0) or 0)
+                + (getattr(u, "completion_tokens", 0) or 0)
+            )
+        except Exception:
+            st.session_state["llm_tokens"] = None
+
         return text
+
     except Exception as e:
         st.session_state["llm_used"] = False
         st.session_state["llm_error"] = str(e)[:240]
         return None
+
 
 # 5) タイトル語尾の選択（LLM→ホワイトリスト検証→不一致ならランダムにフォールバック）
 def choose_title_tail(para1: str, para2: str) -> str:
@@ -3217,6 +3248,7 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
 
 
