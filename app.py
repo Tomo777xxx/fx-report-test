@@ -203,13 +203,23 @@ except Exception as e:
     st.warning(f"config.yaml の読み込みで問題が発生しました（既定値で起動）：{e}")
     CFG = _DEFAULT_CFG.copy()
 
+# ここから画面のヘッダ部
 st.set_page_config(page_title=CFG["app"]["title"], layout="centered")
-# LLM稼働インジケーター（関数に依存しない版）
+
+# LLM稼働インジケーター（鍵の存在だけを表示）
 _has_key = ("OPENAI_API_KEY" in st.secrets) or ("general" in st.secrets and "OPENAI_API_KEY" in st.secrets["general"])
 st.caption(f"LLM: {'ON' if _has_key else 'OFF (OpenAIキー未設定)'}")
 
-
 st.title(CFG["app"]["title"])
+
+# ▼この生成で LLM を使えたか（USED / FALLBACK）を表示
+badge = ("USED ✅" if st.session_state.get("llm_used") is True
+         else "FALLBACK ⚠️" if st.session_state.get("llm_used") is False
+         else "–")
+st.caption(f"LLM call: {badge}")
+if st.session_state.get("llm_error"):
+    st.caption(f"LLM note: {st.session_state['llm_error']}")
+
 # --- BLS公式の発表日(YAML) → 次回NFPを出す（無ければ従来ルールへフォールバック） ---
 def _load_bls_empsit_schedule(path: str | Path = "data/bls_empsit_schedule.yaml") -> list[date]:
     """ローカルYAMLからBLSの公式発表日を読み込んでdate配列で返す。失敗時は[]。"""
@@ -245,6 +255,7 @@ def next_nfp_official_or_rule(today: date) -> date:
     return next_nfp_date(today)
 
 # ====== サイドバー（主役ペア / NFPカウントダウン） ======
+
 PAIRS = [
     "ドル円", "ユーロドル", "ユーロ円", "ポンドドル", "ポンド円",
     "豪ドル米ドル", "NZドル米ドル", "金/米ドル", "ビットコイン/米ドル"
@@ -3207,6 +3218,7 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
 
 
