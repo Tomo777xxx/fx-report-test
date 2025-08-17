@@ -487,14 +487,13 @@ def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",  # 安定提供の汎用モデル（必要なら変更可）
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=16,
-        )
+    model="gpt-5",
+    messages=[{"role":"system","content":system_msg},
+              {"role":"user","content":user_msg}],
+    temperature=0.2,
+    max_tokens=16,
+)
+
         text = (resp.choices[0].message.content or "").strip().replace("\n", "")
         st.session_state["llm_used"] = True
         return text
@@ -3218,6 +3217,7 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
 
 
