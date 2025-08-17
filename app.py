@@ -204,8 +204,10 @@ except Exception as e:
     CFG = _DEFAULT_CFG.copy()
 
 st.set_page_config(page_title=CFG["app"]["title"], layout="centered")
-# LLM稼働インジケーター
-st.caption(f"LLM: {'ON' if _get_api_key() else 'OFF (OpenAIキー未設定)'}")
+# LLM稼働インジケーター（関数に依存しない版）
+_has_key = ("OPENAI_API_KEY" in st.secrets) or ("general" in st.secrets and "OPENAI_API_KEY" in st.secrets["general"])
+st.caption(f"LLM: {'ON' if _has_key else 'OFF (OpenAIキー未設定)'}")
+
 
 st.title(CFG["app"]["title"])
 # --- BLS公式の発表日(YAML) → 次回NFPを出す（無ければ従来ルールへフォールバック） ---
@@ -3163,4 +3165,5 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
