@@ -491,21 +491,27 @@ def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
 
         # ★モデルとパラメータ（gpt-5 と 4o 系で自動出し分け）
         MODEL_NAME = "gpt-5"  # 必要に応じて 'gpt-4o-mini' などに変更可
+        is_gpt5 = str(MODEL_NAME).startswith("gpt-5")
+
         kwargs = {
             "model": MODEL_NAME,
             "messages": [
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
             ],
-            "temperature": 0.2,
+            # gpt-5 は temperature のカスタム不可（デフォルトのみ）なので渡さない
+            # 4o 系はこれまで通り設定してOK
+            **({} if is_gpt5 else {"temperature": 0.2}),
         }
-        # gpt-5 系は max_completion_tokens、4o 系は max_tokens
-        if str(MODEL_NAME).startswith("gpt-5"):
+
+        # 出力トークン上限の指定もモデルで分岐
+        if is_gpt5:
             kwargs["max_completion_tokens"] = 16
         else:
             kwargs["max_tokens"] = 16
 
         resp = client.chat.completions.create(**kwargs)
+
 
         # テキスト抽出
         text = (resp.choices[0].message.content or "").strip().replace("\n", "")
@@ -3248,6 +3254,7 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
 
 
