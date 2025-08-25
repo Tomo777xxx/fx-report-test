@@ -56,32 +56,50 @@
 
 
 
-# ===== app.py 冒頭〜Step1直前（安全化・重複解消 版） =====
+# ===== 必要インポート（安全版・重複なし） =====
+from __future__ import annotations
+
+# 標準ライブラリ
 import os
-from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
 import json
 import random
-import pandas as pd
-import streamlit as st
-try:
-    import yaml
-except Exception:
-    yaml = None  # 未インストールでもアプリは落とさない
+import re
+from datetime import datetime, date, timezone as _tz, timedelta as _td
 
+# サードパーティ（必須系）
+import pandas as pd
 import numpy as np
+import streamlit as st
+
 import yfinance as yf
 
 
-# ---------- yfinance ベースの TA 計算（安全版：4Hは1Hからリサンプリング） ----------
-import pandas as pd, numpy as np, yfinance as yf
+# サードパーティ（任意系：未導入でもアプリは落とさない）
+try:
+    import yaml  # 設定YAMLがあれば使う
+except Exception:
+    yaml = None
 
+# 祝日・市場カレンダー用（未導入なら None にして“未判定”表示）
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
-# ---------- 置き換えここまで ----------
+try:
+    import jpholiday  # 日本の祝日
+except Exception:
+    jpholiday = None
 
-# === Canonical helpers (追加のみ／既存の呼び出しはまだ変更しない) ===
-from datetime import timezone as _tz, timedelta as _td
+try:
+    import exchange_calendars as xc  # NYSEカレンダー
+except Exception:
+    xc = None
+
+# ===== インポートここまで =====
+
 
 CANON_JST = _tz(_td(hours=9))
 
@@ -203,23 +221,8 @@ except Exception as e:
     st.warning(f"config.yaml の読み込みで問題が発生しました（既定値で起動）：{e}")
     CFG = _DEFAULT_CFG.copy()
 
-# ここから画面のヘッダ部
 st.set_page_config(page_title=CFG["app"]["title"], layout="centered")
-
-# LLM稼働インジケーター（鍵の存在だけを表示）
-_has_key = ("OPENAI_API_KEY" in st.secrets) or ("general" in st.secrets and "OPENAI_API_KEY" in st.secrets["general"])
-st.caption(f"LLM: {'ON' if _has_key else 'OFF (OpenAIキー未設定)'}")
-
 st.title(CFG["app"]["title"])
-
-# ▼この生成で LLM を使えたか（USED / FALLBACK）を表示
-badge = ("USED ✅" if st.session_state.get("llm_used") is True
-         else "FALLBACK ⚠️" if st.session_state.get("llm_used") is False
-         else "–")
-st.caption(f"LLM call: {badge}")
-if st.session_state.get("llm_error"):
-    st.caption(f"LLM note: {st.session_state['llm_error']}")
-
 # --- BLS公式の発表日(YAML) → 次回NFPを出す（無ければ従来ルールへフォールバック） ---
 def _load_bls_empsit_schedule(path: str | Path = "data/bls_empsit_schedule.yaml") -> list[date]:
     """ローカルYAMLからBLSの公式発表日を読み込んでdate配列で返す。失敗時は[]。"""
@@ -253,27 +256,73 @@ def next_nfp_official_or_rule(today: date) -> date:
         if d >= today:
             return d
     return next_nfp_date(today)
+# === 主役ペア → yfinance ティッカー対応（サイドバーの候補に完全対応） ===
+PAIR_TO_TICKER = {
+    # 為替（対円）
+    "ドル円":             {"1d": "USDJPY=X", "4h": "USDJPY=X"},
+    "ユーロ円":           {"1d": "EURJPY=X", "4h": "EURJPY=X"},
+    "ポンド円":           {"1d": "GBPJPY=X", "4h": "GBPJPY=X"},
+    "豪ドル円":           {"1d": "AUDJPY=X", "4h": "AUDJPY=X"},
+    "NZドル円":           {"1d": "NZDJPY=X", "4h": "NZDJPY=X"},
+    "カナダドル円":       {"1d": "CADJPY=X", "4h": "CADJPY=X"},
+    "スイスフラン円":     {"1d": "CHFJPY=X", "4h": "CHFJPY=X"},
+    "メキシコペソ円":     {"1d": "MXNJPY=X", "4h": "MXNJPY=X"},
+    "南アフリカランド円": {"1d": "ZARJPY=X", "4h": "ZARJPY=X"},
+
+    # 為替（対米ドル）
+    "ユーロドル":         {"1d": "EURUSD=X", "4h": "EURUSD=X"},
+    "ポンドドル":         {"1d": "GBPUSD=X", "4h": "GBPUSD=X"},
+    "豪ドル米ドル":       {"1d": "AUDUSD=X", "4h": "AUDUSD=X"},
+    "米ドルフラン":       {"1d": "USDCHF=X", "4h": "USDCHF=X"},
+
+    # コモディティ / 仮想通貨
+    "金/米ドル":          {"1d": "XAUUSD=X", "4h": "XAUUSD=X"},
+    "ビットコイン/米ドル": {"1d": "BTC-USD",   "4h": "BTC-USD"},
+}
+
+
+def _tickers_for(pair_label: str) -> tuple[str, str]:
+    """ラジオ/セレクトで選ばれた主役ペア → 1D, 4H 各ティッカー"""
+    m = PAIR_TO_TICKER.get(pair_label)
+    if not m:
+        return "USDJPY=X", "USDJPY=X"  # 未定義時の保険
+    return m["1d"], m["4h"]
+
+
 
 # ====== サイドバー（主役ペア / NFPカウントダウン） ======
-
 PAIRS = [
-    "ドル円", "ユーロドル", "ユーロ円", "ポンドドル", "ポンド円",
-    "豪ドル米ドル", "NZドル米ドル", "金/米ドル", "ビットコイン/米ドル"
+    "ドル円", "ユーロ円", "ポンド円", "豪ドル円",
+    "ユーロドル", "ポンドドル", "豪ドル米ドル", "米ドルフラン",
+    "金/米ドル", "ビットコイン/米ドル",
+    "NZドル円", "カナダドル円", "スイスフラン円", "メキシコペソ円", "南アフリカランド円",
+    # 必要なら "米ドル指数" もここに追加可
 ]
-# 目的：レポートの骨格となる「主役ペア」を人が選択し、タイトル語尾はホワイトリストから安全に選ぶ（LLM使用時も候補外は出さない）
+_default_idx = PAIRS.index("ドル円") if "ドル円" in PAIRS else 0
+
 with st.sidebar:
+    from datetime import date  # ← このブロック内だけで使うので局所インポート
     st.subheader("主役ペア / タイトル語尾")
-    pair = st.selectbox("主役ペア", PAIRS, index=4)  # 既定：ポンド円
+
+    # ★ ここがユーザー操作（ラベルは PAIRS の要素と一致）
+    pair = st.selectbox("主役ペア", PAIRS, index=_default_idx)
+    st.session_state["pair"] = pair  # 念のため保存
+
+    # ★ ラジオ/セレクトの選択に基づいて、使うティッカーをセッションに保存（これが肝）
+    _sel_1d, _sel_4h = _tickers_for(pair)
+    st.session_state["pair_selected"] = pair
+    st.session_state["ticker_1d"] = _sel_1d
+    st.session_state["ticker_4h"] = _sel_4h
+
     st.markdown("---")
 
-    # 目的：次回NFPまでの案内（公式があれば公式／無ければ目安）
+    # NFPカウントダウン（既存の関数をそのまま利用）
     st.subheader("NFPカウントダウン")
     _today = date.today()
-    _nfp = next_nfp_official_or_rule(_today)   # ← 公式優先に切替済み
+    _nfp = next_nfp_official_or_rule(_today)   # 既存関数
     _days_left = (_nfp - _today).days
 
-    # 公式スケジュール内に一致があれば「公式」、無ければ「目安」
-    _sched = _load_bls_empsit_schedule()
+    _sched = _load_bls_empsit_schedule()       # 既存関数
     _is_official = _nfp in _sched
     _badge = "（公式）" if _is_official else "（目安）"
 
@@ -402,7 +451,7 @@ def _enforce_regime_language(para2_text: str, regime: str | None) -> tuple[str, 
         rep(r"下降トレンド(?:が(?:続き|意識され)やすい|入り|基調)?", "下方向への明確なトレンドは確認しづらい", "range: 下降トレンド系→中立化")
         rep(r"(?<!非)トレンドが出ている", "方向性は限定的", "range: トレンド一般→限定的")
         # “境界”はレンジで許容されるので残す。レンジ語が足りなければ少し補う
-        if "レンジ" not in s and "持ち合い" not in s:
+        if not re.search(r"(レンジ|持ち合い|もみ合い)", s):
             s = s.rstrip("。") + "。短期は持ち合い（レンジ）を前提とした値動きが意識されやすい。"
             flags.append("range: レンジ補足文を追加")
 
@@ -429,13 +478,7 @@ def _enforce_regime_language(para2_text: str, regime: str | None) -> tuple[str, 
 
 
 # 目的：タイトル語尾・段落②の締めをホワイトリストから安全選択（LLM利用時も“候補外禁止”）。rules_digestは文体/禁止語の守るべき要点を短く共有するために使用
-# ===== タイトル・結び・ルールダイジェスト（丸ごと置換用） =====
-import os
-import random
-from pathlib import Path
-import streamlit as st
-
-# 1) ホワイトリスト（LLMが"候補外"を出しても採用しない安全設計）
+# ===== タイトル・結び・ルールダイジェスト =====
 ALLOWED_TITLE_TAILS = ["注視か", "警戒か", "静観か", "要注意か", "見極めたい"]
 
 ALLOWED_PARA2_CLOSERS = [
@@ -443,7 +486,26 @@ ALLOWED_PARA2_CLOSERS = [
     "一段の変動に要注意としたい。", "方向感を見極めたい。"
 ]
 
-# 2) ルール要約の読込（存在しなければ空文字）
+
+def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
+    try:
+        from openai import OpenAI
+        api_key = _get_api_key()
+        if not api_key:
+            return None
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model="gpt-5-thinking",
+            messages=[{"role": "system", "content": system_msg},
+                      {"role": "user", "content": user_msg}],
+            temperature=0.2,
+            max_tokens=16,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text.replace("\n", "").strip()
+    except Exception:
+        return None
+
 def _read_rules_digest(path: str | Path = "data/rules_digest.txt") -> str:
     p = Path(path)
     if not p.exists():
@@ -453,93 +515,6 @@ def _read_rules_digest(path: str | Path = "data/rules_digest.txt") -> str:
 
 RULES_DIGEST = _read_rules_digest()
 
-# 3) APIキー取得（既存の _get_api_key があればそれを使う）
-try:
-    _get_api_key  # 既存が定義済みならそれを使う
-except NameError:
-    def _get_api_key() -> str:
-        # st.secrets 優先 → [general] → 環境変数
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
-        if "general" in st.secrets and "OPENAI_API_KEY" in st.secrets["general"]:
-            return st.secrets["general"]["OPENAI_API_KEY"]
-        return os.environ.get("OPENAI_API_KEY", "")
-
-# 4) LLM呼び出し（今回の生成で使えたかを session_state に記録）
-def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
-    # この生成での状態を初期化
-    st.session_state["llm_used"] = None
-    st.session_state["llm_error"] = None
-
-    # APIキー取得
-    try:
-        api_key = _get_api_key()
-    except Exception as e:
-        st.session_state["llm_used"] = False
-        st.session_state["llm_error"] = f"key error: {e}"
-        return None
-
-    if not api_key:
-        st.session_state["llm_used"] = False
-        st.session_state["llm_error"] = "No OPENAI_API_KEY"
-        return None
-
-    try:
-        # OpenAIクライアント
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-
-        # ★モデルとパラメータ（gpt-5 と 4o 系で自動出し分け）
-        MODEL_NAME = "gpt-5"  # 必要に応じて 'gpt-4o-mini' などに変更可
-        is_gpt5 = str(MODEL_NAME).startswith("gpt-5")
-
-        kwargs = {
-            "model": MODEL_NAME,
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            # gpt-5 は temperature のカスタム不可（デフォルトのみ）なので渡さない
-            # 4o 系はこれまで通り設定してOK
-            **({} if is_gpt5 else {"temperature": 0.2}),
-        }
-
-        # 出力トークン上限の指定もモデルで分岐
-        if is_gpt5:
-            kwargs["max_completion_tokens"] = 16
-        else:
-            kwargs["max_tokens"] = 16
-
-        resp = client.chat.completions.create(**kwargs)
-
-
-        # テキスト抽出
-        text = (resp.choices[0].message.content or "").strip().replace("\n", "")
-
-        # 見える化メタ
-        st.session_state["llm_used"] = True
-        try:
-            st.session_state["llm_model"] = getattr(resp, "model", None) or MODEL_NAME
-        except Exception:
-            st.session_state["llm_model"] = MODEL_NAME
-        try:
-            u = getattr(resp, "usage", None)
-            st.session_state["llm_tokens"] = (
-                (getattr(u, "prompt_tokens", 0) or 0)
-                + (getattr(u, "completion_tokens", 0) or 0)
-            )
-        except Exception:
-            st.session_state["llm_tokens"] = None
-
-        return text
-
-    except Exception as e:
-        st.session_state["llm_used"] = False
-        st.session_state["llm_error"] = str(e)[:240]
-        return None
-
-
-# 5) タイトル語尾の選択（LLM→ホワイトリスト検証→不一致ならランダムにフォールバック）
 def choose_title_tail(para1: str, para2: str) -> str:
     system = (
         "あなたは金融レポートの校正者です。断定を避けた語尾を選びます。"
@@ -555,7 +530,6 @@ def choose_title_tail(para1: str, para2: str) -> str:
     picked = _llm_pick_from_list(system, user)
     return picked if picked in ALLOWED_TITLE_TAILS else random.choice(ALLOWED_TITLE_TAILS)
 
-# 6) 段落②の結びの選択（同様）
 def choose_para2_closer(para1: str, para2: str) -> str:
     system = (
         "あなたは金融レポートの校正者です。断定を避けた結びの一文を選びます。"
@@ -570,9 +544,6 @@ def choose_para2_closer(para1: str, para2: str) -> str:
     )
     picked = _llm_pick_from_list(system, user)
     return picked if picked in ALLOWED_PARA2_CLOSERS else random.choice(ALLOWED_PARA2_CLOSERS)
-
-# ===== ここまでを既存ブロックと置換 =====
-
 
 # ---- タイトル初期値（助詞の自動補正を含む“正”の版だけを残す） ----
 def _default_title_for(pair: str, tail: str) -> str:
@@ -742,8 +713,4298 @@ def _ja_category_name(cat: str, indicator: str = "") -> str:
 
 # =====（この下から Step1 セクション）=====
 
+# ====== 前日比ランキング（終値ベース / メインに1ブロック） ======
+import pandas as pd
+import yfinance as yf
+
+# 表示名→Yahoo!Finance ティッカー（未定義なら定義）
+if "_pair_to_symbol" not in globals():
+    _PAIR_MAP = {
+        "ドル円": "USDJPY=X",
+        "ユーロ円": "EURJPY=X",
+        "ポンド円": "GBPJPY=X",
+        "豪ドル円": "AUDJPY=X",
+        "ユーロドル": "EURUSD=X",
+        "ポンドドル": "GBPUSD=X",
+        "豪ドル米ドル": "AUDUSD=X",
+        "米ドルフラン": "USDCHF=X",
+        "金/米ドル": "XAUUSD=X",
+        "ビットコイン/米ドル": "BTC-USD",
+        "NZドル円": "NZDJPY=X",
+        "カナダドル円": "CADJPY=X",
+        "スイスフラン円": "CHFJPY=X",
+        "メキシコペソ円": "MXNJPY=X",
+        "南アフリカランド円": "ZARJPY=X",
+    }
+    def _pair_to_symbol(name: str) -> str:
+        return _PAIR_MAP.get((name or "").strip(), "USDJPY=X")
+
+# 直近終値2本を取得（t-1, t0）
+@st.cache_data(ttl=900)
+def _rank_last_two_closes(symbol: str):
+    try:
+        df = yf.download(symbol, period="10d", interval="1d",
+                         auto_adjust=False, progress=False)
+        if df is None or df.empty or "Close" not in df:
+            return None
+        close = df["Close"].dropna()
+        if len(close) < 2:
+            return None
+        d_prev, d_last = close.index[-2], close.index[-1]
+        return (d_prev, float(close.iloc[-2]), d_last, float(close.iloc[-1]))
+    except Exception:
+        return None
+
+def _pct_change(prev: float, last: float) -> float:
+    return (last / max(prev, 1e-12) - 1.0) * 100.0
+
+# 集計 → 表示
+_rows = []
+for _name in PAIRS:
+    _sym = _pair_to_symbol(_name)
+    _res = _rank_last_two_closes(_sym)
+    if not _res:
+        continue
+    _d_prev, _c_prev, _d_last, _c_last = _res
+    _pct = _pct_change(_c_prev, _c_last)
+    _rows.append({
+        "ペア": _name,
+        "変動率(%)": _pct,
+        "表示": f"{_pct:+.2f}%",
+        "t-1": _d_prev.strftime("%Y-%m-%d"),
+        "t0":  _d_last.strftime("%Y-%m-%d"),
+    })
+# === 祝日・市場カレンダー（日本/米）フラグの表示 ===
+from datetime import datetime, timezone, timedelta
+import pandas as pd
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+ に標準添付
+except Exception:
+    ZoneInfo = None  # 無くても動く（未判定表示に切替）
+
+# JST の「きょう／きのう」
+_now_jst = datetime.now(timezone(timedelta(hours=9)))
+_today_jst = _now_jst.date()
+_yday_jst = (_now_jst - timedelta(days=1)).date()
+
+# A. 日本の祝日（未導入でもエラーにしない）
+_jp_today = _jp_yday = None
+try:
+    import jpholiday  # 未導入なら except に落ちる
+    _jp_today = bool(jpholiday.is_holiday(_today_jst))
+    _jp_yday  = bool(jpholiday.is_holiday(_yday_jst))
+except Exception:
+    _jp_today = _jp_yday = None  # 未判定
+
+# B. 米国（NYSE）の営業／休場（未導入でもエラーにしない）
+_us_open_today = _us_open_yday = None
+_last_us_session = None
+try:
+    import exchange_calendars as xc
+    _cal = xc.get_calendar("XNYS")  # NYSE
+    if ZoneInfo:
+        _now_ny = datetime.now(ZoneInfo("America/New_York"))
+    else:
+        # 簡易フォールバック（厳密でなくてOK：未判定回避用）
+        _now_ny = datetime.utcnow()
+    _today_us = _now_ny.date()
+    _yday_us  = (_now_ny - timedelta(days=1)).date()
+
+    _ts_today = pd.Timestamp(_today_us)
+    _ts_yday  = pd.Timestamp(_yday_us)
+    _us_open_today = bool(_cal.is_session(_ts_today))
+    _us_open_yday  = bool(_cal.is_session(_ts_yday))
+
+    # 直近の米セッション日（カレンダー上）
+    if _us_open_today:
+        _last_us_session = _today_us
+    else:
+        _last_us_session = _cal.previous_session(_ts_today).date()
+except Exception:
+    _us_open_today = _us_open_yday = None
+    _last_us_session = None  # 未判定
+
+# 表示ユーティリティ
+def _yn(v, yes="はい", no="いいえ", na="（未判定）"):
+    return yes if v is True else (no if v is False else na)
+def _open_close(v):
+    return "営業" if v is True else ("休場" if v is False else "（未判定）")
+
+st.write("**祝日 / 市場カレンダー**")
+st.caption(
+    "本日 日本の祝日：" + _yn(_jp_today)
+    + "　/　本日 米国NYSE：" + _open_close(_us_open_today)
+    + "　/　昨日 日本の祝日：" + _yn(_jp_yday)
+    + "　/　昨日 米国NYSE：" + _open_close(_us_open_yday)
+)
+if _last_us_session:
+    st.caption(f"直近米セッション日（US/Eastern基準）：{_last_us_session}")
+
+# メタへ保存（後でLLMやログに渡せます）
+_meta = st.session_state.get("data_snapshot", {})
+_meta.update({
+    "jp_holiday_today": _jp_today,
+    "jp_holiday_yesterday": _jp_yday,
+    "us_nyse_open_today": _us_open_today,
+    "us_nyse_open_yesterday": _us_open_yday,
+    "us_last_session_date": str(_last_us_session) if _last_us_session else None,
+})
+st.session_state["data_snapshot"] = _meta
+st.markdown("---")
+# === 祝日・市場カレンダー 表示ここまで ===
+# === 冒頭の自動注記（祝日/休場）: 表示のみ、本文にはまだ合成しない ===
+_flags = st.session_state.get("data_snapshot", {})
+jp_today = _flags.get("jp_holiday_today")          # True/False/None
+us_open_yday = _flags.get("us_nyse_open_yesterday")# True=営業, False=休場, None
+us_open_today = _flags.get("us_nyse_open_today")    # True=営業, False=休場, None
+
+_intro_lines = []
+# 本日が日本の祝日 → 先頭に一言
+if jp_today is True:
+    _intro_lines.append("本日は日本が祝日で、東京時間は流動性がやや薄くなりやすい。")
+
+# 昨日が米祝日（休場） → 次に一言
+if us_open_yday is False:
+    _intro_lines.append("昨日は米国は祝日で株式は休場。直近の取引は前営業日。")
+
+# 本日が米祝日（休場） → 末尾に一言（任意）
+_tail_line = "なお、米国は本日祝日で株式は休場見込み。" if us_open_today is False else ""
+
+# 画面に表示（あれば）
+st.write("**冒頭の自動注記（祝日/休場）**")
+if _intro_lines or _tail_line:
+    st.caption("この下の本文に、のちほど自動合成します。今は確認用の表示だけです。")
+    if _intro_lines:
+        st.write("".join(_intro_lines))
+    if _tail_line:
+        st.write(_tail_line)
+else:
+    st.caption("差し込み要素なし（祝日/休場の注記は該当なし）")
+
+# 後工程用にメモしておく（次の手で本文に合成）
+st.session_state["intro_overlay_text"] = "".join(_intro_lines) + (_tail_line or "")
+st.markdown("---")
+# === 冒頭の自動注記（祝日/休場）ここまで ===
+
+# === データスナップショット（今回使用したデータを最上部に明示） ===
+from datetime import datetime, timezone, timedelta
+
+_asof_jst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M JST")
+_ok_pairs = [r.get("ペア") for r in _rows] if _rows else []
+_ok_syms  = [_pair_to_symbol(p) for p in _ok_pairs] if _ok_pairs else []
+
+st.subheader("本稿で使用したデータ（スナップショット）")
+st.caption(f"取得：{_asof_jst}")
+if _ok_pairs:
+    st.write(f"取得済み：前日比ランキング（終値ベース） {len(_ok_pairs)}ペア")
+    st.caption("取得ティッカー（今回）：" + ", ".join(_ok_syms))
+else:
+    st.write("取得済み：前日比ランキング（終値ベース） 0ペア")
+
+# 後工程（LLM再整形やログ保存）で参照するために保持
+st.session_state["data_snapshot"] = {
+    "asof_jst": _asof_jst,
+    "pairs_fetched": _ok_pairs,
+    "tickers_fetched": _ok_syms,
+    "source_hint": "Yahoo Finance（日次終値 t-1 / t0）"
+}
+st.markdown("---")
+# === データスナップショット ここまで ===
+
+
+if _rows:
+    _df = pd.DataFrame(_rows)
+    _df = _df.sort_values(by="変動率(%)", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+    _show = _df[["ペア", "表示", "t-1", "t0"]].rename(
+        columns={"表示": "前日比", "t-1": "比較日(t-1)", "t0": "直近日(t0)"}
+    )
+    _show.index = range(1, len(_show) + 1)  # 1始まり
+    _show.index.name = "順位"
+
+    st.subheader("前日比ランキング（終値ベース）")
+    st.caption("各ペアの直近の有効終値(t0) と その一つ前(t-1) の比較。％は +/− 表示。順位は1始まり。")
+    _show.insert(0, "主役", np.where(_show["ペア"] == pair, "⭐", ""))
+    st.dataframe(_show, use_container_width=True)
+else:
+    st.info("有効な終値が取得できませんでした。少し時間を置いて再試行してください。")
+# ====== 前日比ランキング ここまで ======
 
 # ====== ステップ1：参照PDFの確認 ======
+# === テクニカル・チャート（D1/H4）＋選択UI＋段落② v2.1 生成（常時2枚表示 & ベース足選択） ===
+import sys
+import importlib.util as _iul
+import pandas as _pd
+import numpy as _np
+import yfinance as _yf
+import streamlit as st
+# ==== 共通インポート／オプショナル依存の安全化（import streamlit as st の直後） ====
+import calendar  # Pylance「calendar 未定義」対策
+
+# オプショナル依存は try/except にしておく（未インストールでも落ちない）
+try:
+    import openai  # noqa: F401
+    HAVE_OPENAI = True
+except Exception:
+    HAVE_OPENAI = False
+
+try:
+    import pypdf  # noqa: F401
+    HAVE_PYPDF = True
+except Exception:
+    HAVE_PYPDF = False
+
+# Plotly の有無（チャートで使用）
+try:
+    import plotly.graph_objects as _go
+    from plotly.subplots import make_subplots as _mk
+    _PLOTLY_OK = True
+except Exception:
+    _PLOTLY_OK = False
+    _go = None
+    _mk = None
+
+# チャート共通のデフォルト（Pylance の「未定義」対策も兼ねる）
+_cfg = {"displayModeBar": True, "scrollZoom": True}
+_h_dpi = 460
+_candles = int(st.session_state.get("candles", 180))  # 本数デフォルト
+
+# セッションキーの存在を保証（なければデフォルトを入れる）
+st.session_state.setdefault("pair", "ドル円")
+st.session_state.setdefault("ticker_1d", "USDJPY=X")
+st.session_state.setdefault("ticker_4h", "USDJPY=X")
+
+# ---- Plotly availability (robust) ----
+_PLOTLY_OK = _iul.find_spec("plotly") is not None
+if _PLOTLY_OK:
+    import plotly.graph_objects as _go
+    from plotly.subplots import make_subplots as _mk
+else:
+    _go = None
+    _mk = None
+
+# デフォルト（上位で未定義でも動くように）
+try:
+    _candles
+except NameError:
+    _candles = 120
+try:
+    _h_dpi
+except NameError:
+    _h_dpi = 520
+try:
+    _cfg
+except NameError:
+    _cfg = {"displayModeBar": False}
+try:
+    _ticker
+except NameError:
+    _ticker = st.session_state.get("pair_ticker") or "USDJPY=X"
+
+_need = _candles + 220  # 200SMA計算ぶん余裕を持って確保
+
+# ---- TA helpers ----
+def _sma(s: _pd.Series, n: int) -> _pd.Series:
+    return s.rolling(n, min_periods=1).mean()
+
+def _bbands(s: _pd.Series, n: int = 20, k: float = 2.0):
+    ma = s.rolling(n, min_periods=1).mean()
+    sd = s.rolling(n, min_periods=1).std(ddof=0)
+    return ma + k*sd, ma - k*sd
+
+def _rsi(close: _pd.Series, n: int = 14) -> _pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    ema_up = up.ewm(alpha=1/n, adjust=False).mean()
+    ema_dn = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = ema_up / ema_dn.replace(0, _np.nan)
+    return (100 - (100/(1+rs))).clip(0, 100)
+
+# ---- OHLC downloader: 1d 直取得 / 4h は60m→4H リサンプル ----
+if "_dl_ohlc" not in globals():
+    def _dl_ohlc(ticker: str, interval: str, need: int) -> _pd.DataFrame | None:
+        """
+        interval: "1d" または "4h"
+        - "1d": download→空なら history フォールバック
+        - "4h": 60m を取得→4Hへリサンプル
+        """
+        try:
+            if interval == "1d":
+                df = _yf.download(ticker, period="900d", interval="1d",
+                                  auto_adjust=False, progress=False, threads=False)
+                if df is None or df.empty:
+                    h = _yf.Ticker(ticker).history(period="900d", interval="1d", auto_adjust=False)
+                    if h is None or h.empty:
+                        return None
+                    df = h
+                df = df.rename(columns=str.title)[["Open", "High", "Low", "Close"]]
+
+            elif interval == "4h":
+                raw = _yf.download(ticker, period="120d", interval="60m",
+                                   auto_adjust=False, progress=False, threads=False)
+                if raw is None or raw.empty:
+                    h = _yf.Ticker(ticker).history(period="120d", interval="60m", auto_adjust=False)
+                    if h is None or h.empty:
+                        return None
+                    raw = h
+                # 4時間に集約
+                o = raw["Open"].resample("4H").first()
+                h = raw["High"].resample("4H").max()
+                l = raw["Low"].resample("4H").min()
+                c = raw["Close"].resample("4H").last()
+                df = _pd.concat([o, h, l, c], axis=1).dropna()
+                df.columns = ["Open", "High", "Low", "Close"]
+            else:
+                return None
+
+            need_tail = max(need, _candles + 220)
+            return df.tail(need_tail).dropna()
+        except Exception:
+            return None
+
+# ---- yレンジ算出（Series比較エラー回避のため数値配列で計算） ----
+def _nanminmax_from_cols(df: _pd.DataFrame, cols: list[str]) -> tuple[float, float]:
+    """指定列の値から NaN を除外して全体の最小/最大を返す。
+    対象列が見つからない/空なら Low/High をフォールバックに使う。
+    """
+    vals: list[_np.ndarray] = []
+
+    # 指定列を順に集める（存在しない列や空はスキップ）
+    for c in cols:
+        if c in df.columns:
+            arr = _np.asarray(df[c].values, dtype="float64")
+            arr = arr[_np.isfinite(arr)]
+            if arr.size:
+                vals.append(arr)
+
+    # どれも取れなかったら Low/High でフォールバック
+    if not vals:
+        lo = _np.asarray(df.get("Low", _np.array([])),  dtype="float64")
+        hi = _np.asarray(df.get("High", _np.array([])), dtype="float64")
+        lo = lo[_np.isfinite(lo)]
+        hi = hi[_np.isfinite(hi)]
+        if lo.size and hi.size:
+            return float(lo.min()), float(hi.max())
+        # それでも無ければ安全側で 0〜1 を返す（描画はされる）
+        return 0.0, 1.0
+
+    # ここまで来れば少なくとも1配列ある
+    stacked = _np.concatenate(vals)
+    return float(_np.nanmin(stacked)), float(_np.nanmax(stacked))
+
+
+# ---- チャート1枚分の作成 ----
+# --- ここから _build_one を丸ごと置き換え ---
+def _build_one(fig_title: str, ohlc: _pd.DataFrame) -> _go.Figure:
+    # 直近_candles 本だけ使用（グローバル _candles を利用）
+    v = ohlc.tail(_candles).copy()
+
+    # 数値化（万一 object/str でも安全に）
+    for c in ["Open", "High", "Low", "Close"]:
+        v[c] = _pd.to_numeric(v[c], errors="coerce").astype("float64")
+
+    # 指標（SMA20/200, BB±2σ, RSI14）
+    sma20  = v["Close"].rolling(20,  min_periods=1).mean()
+    sma200 = v["Close"].rolling(200, min_periods=1).mean()
+    sd20   = v["Close"].rolling(20,  min_periods=1).std(ddof=0)
+    bbu    = sma20 + 2.0*sd20
+    bbl    = sma20 - 2.0*sd20
+    # RSI14
+    d = v["Close"].diff()
+    up = d.clip(lower=0.0); dn = (-d).clip(lower=0.0)
+    ema_up = up.ewm(alpha=1/14, adjust=False).mean()
+    ema_dn = dn.ewm(alpha=1/14, adjust=False).mean()
+    rs = ema_up / ema_dn.replace(0, _np.nan)
+    rsi14 = (100 - (100/(1+rs))).clip(0,100)
+
+    # Yレンジ（ローソク＋SMA＋BBの最大最小で固定）※BBははみ出してOKにしたいなら外しても可
+    vals = _np.vstack([
+        _np.asarray(v["Low"].values,  dtype="float64"),
+        _np.asarray(v["High"].values, dtype="float64"),
+        _np.asarray(sma20.values,     dtype="float64"),
+        _np.asarray(sma200.values,    dtype="float64"),
+        _np.asarray(bbu.values,       dtype="float64"),
+        _np.asarray(bbl.values,       dtype="float64"),
+    ])
+    y_min = float(_np.nanmin(vals))
+    y_max = float(_np.nanmax(vals))
+    pad   = (y_max - y_min) * 0.01
+    y_rng = [y_min - pad, y_max + pad]
+
+    # サブプロット（上=価格、下=RSI）
+    fig = _mk(rows=2, cols=1, shared_xaxes=True,
+              vertical_spacing=0.06, row_heights=[0.76, 0.24])
+
+    # ローソク（上段だけ）
+    fig.add_trace(_go.Candlestick(
+        x=v.index, open=v["Open"], high=v["High"], low=v["Low"], close=v["Close"],
+        increasing_line_color="green", increasing_fillcolor="green",
+        decreasing_line_color="red",   decreasing_fillcolor="red",
+        showlegend=False
+    ), row=1, col=1)
+
+    # SMA20（赤）/ SMA200（青）/ BB±2σ（薄灰）
+    fig.add_trace(_go.Scatter(x=v.index, y=sma20,  mode="lines",
+                              line=dict(width=2, color="red"),  name="SMA20"),
+                  row=1, col=1)
+    fig.add_trace(_go.Scatter(x=v.index, y=sma200, mode="lines",
+                              line=dict(width=2, color="blue"), name="SMA200"),
+                  row=1, col=1)
+    fig.add_trace(_go.Scatter(x=v.index, y=bbu, mode="lines",
+                              line=dict(width=1, color="rgba(0,0,0,0.25)"), name="BB+2σ"),
+                  row=1, col=1)
+    fig.add_trace(_go.Scatter(x=v.index, y=bbl, mode="lines",
+                              line=dict(width=1, color="rgba(0,0,0,0.25)"), name="BB-2σ"),
+                  row=1, col=1)
+
+    # RSI（下段のみ）
+    fig.add_trace(_go.Scatter(x=v.index, y=rsi14, mode="lines",
+                              line=dict(width=1.6), name="RSI(14)"),
+                  row=2, col=1)
+    # ガイドライン
+    fig.add_hline(y=30, line_width=1, line_dash="dot", line_color="gray", row=2, col=1)
+    fig.add_hline(y=70, line_width=1, line_dash="dot", line_color="gray", row=2, col=1)
+
+    # 右側余白（見やすさ用）
+    if len(v.index) >= 3:
+        xpad = (v.index[-1] - v.index[-3])
+    else:
+        xpad = _pd.Timedelta(days=2)
+
+    # 軸・見た目（上下で固定レンジ、上下ドラッグ禁止）
+    fig.update_xaxes(range=[v.index[0], v.index[-1] + xpad],
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=1, col=1)
+    fig.update_xaxes(range=[v.index[0], v.index[-1] + xpad],
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=2, col=1)
+    fig.update_yaxes(range=y_rng, fixedrange=True,
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=1, col=1)
+    fig.update_yaxes(range=[0,100], fixedrange=True,
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=2, col=1)
+
+    fig.update_layout(
+        title=dict(text=fig_title, y=0.98, x=0.01, xanchor="left", yanchor="top"),
+        margin=dict(l=8, r=24, t=30, b=8),
+        height=_h_dpi,
+        showlegend=False,
+        xaxis_rangeslider_visible=False  # 下部レンジスライダー非表示
+    )
+    return fig
+# --- ここまで置き換え ---
+
+
+
+# === 段落② 自動判定用ユーティリティ（_indicators / _vol_score） ===
+# 依存: _pd (pandas), _np (numpy), そして _sma/_bbands/_rsi が上で定義済みであること
+
+def _indicators(df: _pd.DataFrame | None) -> _pd.DataFrame | None:
+    """Close から SMA20/200, BB±2σ, RSI(14) を計算して返す。"""
+    if df is None or len(df) == 0 or "Close" not in df.columns:
+        return None
+    close = _pd.to_numeric(df["Close"], errors="coerce").astype("float64")
+    out = _pd.DataFrame(index=df.index)
+    out["SMA20"]  = _sma(close, 20)
+    out["SMA200"] = _sma(close, 200)
+    bbu, bbl      = _bbands(close, 20, 2.0)
+    out["BBU"], out["BBL"] = bbu, bbl
+    out["RSI14"]  = _rsi(close, 14)
+    return out
+
+def _vol_score(df: _pd.DataFrame | None, ind: _pd.DataFrame | None) -> float:
+    """
+    “どちらが変化が大きいか”の簡易スコア。
+    - 直近N本（N = _candles があればそれ、なければ120）
+    - ①リターンの標準偏差（ボラ）
+    - ②SMA20の傾きの絶対値（トレンド感）
+    の合算を返す（大きいほど“動きがある”）。
+    """
+    if df is None or ind is None or len(df) == 0:
+        return 0.0
+    N = int(globals().get("_candles", 120))
+    v = _pd.concat([df, ind], axis=1).tail(N)
+
+    # ① ボラ（%）
+    ret = _pd.to_numeric(v["Close"], errors="coerce").pct_change().dropna()
+    s1 = float(ret.std()) if len(ret) else 0.0
+
+    # ② SMA20 の傾き（単位を正規化）
+    y = _pd.to_numeric(v["SMA20"], errors="coerce").dropna()
+    if len(y) >= 5:
+        x = _np.arange(len(y), dtype="float64")
+        slope = _np.polyfit(x, y.values, 1)[0]
+        denom = float(abs(y.mean())) if float(abs(y.mean())) > 0 else 1.0
+        s2 = float(abs(slope) / denom)
+    else:
+        s2 = 0.0
+
+    return float(s1 + s2)
+# === ここまで ===
+# === Tech Charts (D1/H4) v2.1 — self-contained block START ===
+import importlib.util as _iul
+
+# Plotly 可否（未導入でもアプリは落とさない）
+_PLOTLY_OK = _iul.find_spec("plotly") is not None
+if _PLOTLY_OK:
+    import plotly.graph_objects as _go
+    from plotly.subplots import make_subplots as _mk
+else:
+    _go = None
+    _mk = None
+
+# この節だけで完結させるための既定値
+_candles = 120             # 表示本数（常に120本）
+_h_dpi   = 560             # 図の高さ
+_cfg     = {"displayModeBar": True, "scrollZoom": False, "displaylogo": False}
+
+# --- データ取得（1d は素直に、4h は 60m→4H リサンプル） ---
+def _dl_ohlc_v21(ticker: str, interval: str, need: int) -> pd.DataFrame | None:
+    """
+    すべて60分足から作る:
+      - interval == "4h": 60m → 4H にリサンプリング
+      - interval == "1d": 60m → 1D にリサンプリング（NY 17:00 区切りの“為替日足”）
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+        import yfinance as yf
+
+        # 60分足を長めに取得（上限は約730日）
+        period_for_60m = "730d" if interval in ("1d", "4h") else "120d"
+        raw = yf.download(
+            ticker, period=period_for_60m, interval="60m",
+            auto_adjust=False, progress=False
+        )
+        if raw is None or raw.empty:
+            return None
+
+        # 列名と必要列を整理
+        raw = raw.rename(columns=str.title)[["Open", "High", "Low", "Close"]].copy()
+
+        # ==== 1) タイムゾーンの扱い ====
+        # yfinance の 60m は通常 tz-aware。なければ UTC を付与
+        if getattr(raw.index, "tz", None) is None:
+            raw = raw.tz_localize("UTC")
+
+        # ==== 2) 集計 ====
+        if interval == "4h":
+            base = raw.tz_convert("UTC")  # 4H は UTC 境界でOK
+            o = base["Open"].resample("4H").first()
+            h = base["High"].resample("4H").max()
+            l = base["Low"].resample("4H").min()
+            c = base["Close"].resample("4H").last()
+            df = pd.concat([o, h, l, c], axis=1).dropna(how="any")
+            df.columns = ["Open", "High", "Low", "Close"]
+            # ラベルをtz-naiveに（以降の処理が楽）
+            df.index = df.index.tz_localize(None)
+
+        elif interval == "1d":
+            # ★ 為替日足：NY 17:00（5pm ET）で1日を区切るのが一般的
+            ny = raw.tz_convert("America/New_York")
+
+            # インデックスを 17 時間「戻して」日境界を NY17:00 に合わせる
+            ny_shift = ny.copy()
+            ny_shift.index = ny_shift.index - pd.Timedelta(hours=17)
+
+            o = ny_shift["Open"].resample("1D").first()
+            h = ny_shift["High"].resample("1D").max()
+            l = ny_shift["Low"].resample("1D").min()
+            c = ny_shift["Close"].resample("1D").last()
+            df = pd.concat([o, h, l, c], axis=1).dropna(how="any")
+            df.columns = ["Open", "High", "Low", "Close"]
+
+            # ラベルを 17 時間「戻す」（元の時刻側へ）
+            df.index = (df.index + pd.Timedelta(hours=17)).tz_localize(None)
+
+        else:
+            return None
+
+        # ==== 3) 数値化と最終整形 ====
+        df = df.apply(pd.to_numeric, errors="coerce").dropna(how="any")
+
+        # High/Low が必ず胴体(Open/Close)を内包するように強制補正（可視化の安全策）
+        body_hi = df[["Open", "Close"]].max(axis=1).to_numpy()
+        body_lo = df[["Open", "Close"]].min(axis=1).to_numpy()
+        df["High"] = np.maximum(df["High"].to_numpy(), body_hi)
+        df["Low"]  = np.minimum(df["Low"].to_numpy(),  body_lo)
+
+        # 必要本数を返す
+        return df.tail(max(need, _candles))
+
+    except Exception:
+        return None
+
+
+# --- 指標計算（SMA/BB/RSI） ---
+def _sma_v21(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=1).mean()
+
+def _bbands_v21(s: pd.Series, n: int = 20, k: float = 2.0):
+    ma = s.rolling(n, min_periods=1).mean()
+    sd = s.rolling(n, min_periods=1).std(ddof=0)
+    return ma + k*sd, ma - k*sd
+
+def _rsi_v21(close: pd.Series, n: int = 14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    ema_up = up.ewm(alpha=1/n, adjust=False).mean()
+    ema_dn = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = ema_up / ema_dn.replace(0, np.nan)
+    return (100 - (100/(1+rs))).clip(0, 100)
+
+def _dl_ohlc_v21(ticker: str, interval: str, need: int) -> pd.DataFrame | None:
+    """
+    すべて 60 分足から作成:
+      - interval == "4h": 60m → 4H にリサンプリング（UTC 境界）
+      - interval == "1d": 60m → 1D にリサンプリング（NY 17:00 区切りの“為替日足”）
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+        import yfinance as yf
+
+        # 60分足を長めに取得（最大 ~730 日）
+        period_for_60m = "730d" if interval in ("1d", "4h") else "120d"
+        raw = yf.download(
+            ticker, period=period_for_60m, interval="60m",
+            auto_adjust=False, progress=False
+        )
+        if raw is None or raw.empty:
+            return None
+
+        # 列名と必要列を整理
+        raw = raw.rename(columns=str.title)[["Open", "High", "Low", "Close"]].copy()
+
+        # yfinance の 60m は通常 tz-aware。なければ UTC を付与
+        if getattr(raw.index, "tz", None) is None:
+            raw = raw.tz_localize("UTC")
+
+        # === 集計 ===
+        if interval == "4h":
+            base = raw.tz_convert("UTC")
+            o = base["Open"].resample("4H").first()
+            h = base["High"].resample("4H").max()
+            l = base["Low"].resample("4H").min()
+            c = base["Close"].resample("4H").last()
+            df = pd.concat([o, h, l, c], axis=1).dropna(how="any")
+            df.columns = ["Open", "High", "Low", "Close"]
+            df.index = df.index.tz_localize(None)  # tz-naive に
+
+        elif interval == "1d":
+            # NY 17:00（5pm ET）を 1 日の区切りにする
+            ny = raw.tz_convert("America/New_York")
+            ny_shift = ny.copy()
+            ny_shift.index = ny_shift.index - pd.Timedelta(hours=17)
+
+            o = ny_shift["Open"].resample("1D").first()
+            h = ny_shift["High"].resample("1D").max()
+            l = ny_shift["Low"].resample("1D").min()
+            c = ny_shift["Close"].resample("1D").last()
+            df = pd.concat([o, h, l, c], axis=1).dropna(how="any")
+            df.columns = ["Open", "High", "Low", "Close"]
+
+            # インデックスを 17 時間戻す（元の側へ）＆ tz-naive
+            df.index = (df.index + pd.Timedelta(hours=17)).tz_localize(None)
+        else:
+            return None
+
+        # 数値化と安全補正（高値/安値が胴体を必ず包含）
+        df = df.apply(pd.to_numeric, errors="coerce").dropna(how="any")
+        body_hi = df[["Open", "Close"]].max(axis=1).to_numpy()
+        body_lo = df[["Open", "Close"]].min(axis=1).to_numpy()
+        df["High"] = np.maximum(df["High"].to_numpy(), body_hi)
+        df["Low"]  = np.minimum(df["Low"].to_numpy(),  body_lo)
+
+        # 必要本数を返す（_candles は既存のグローバル）
+        return df.tail(max(need, _candles))
+
+    except Exception:
+        return None
+
+
+# --- 指標計算（SMA/BB/RSI） ---
+def _sma_v21(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=1).mean()
+
+def _bbands_v21(s: pd.Series, n: int = 20, k: float = 2.0):
+    ma = s.rolling(n, min_periods=1).mean()
+    sd = s.rolling(n, min_periods=1).std(ddof=0)
+    return ma + k*sd, ma - k*sd
+
+def _rsi_v21(close: pd.Series, n: int = 14) -> pd.Series:
+    d  = close.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    ema_up = up.ewm(alpha=1/n, adjust=False).mean()
+    ema_dn = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = ema_up / ema_dn.replace(0, np.nan)
+    return (100 - (100/(1+rs))).clip(0, 100)
+
+def _build_one_v21(title, v):
+    import plotly.graph_objects as go
+
+    # --- 安全ガード：データが空ならプレースホルダ図を返す ---
+    if v is None or getattr(v, "empty", True) or len(v.index) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{title}：データなし",
+            template="plotly_white",
+            height=320,
+            margin=dict(l=8, r=8, t=40, b=8),
+        )
+        return fig
+    # --- ここから下は既存の処理（そのまま） ---
+
+
+def _build_one_v21(fig_title: str, ohlc: pd.DataFrame):
+    import numpy as np
+    import pandas as pd
+
+    # === 1) OHLC を 1D Series に正規化（MultiIndex/大小文字差も吸収） ===
+    v0 = ohlc.copy()
+
+    def _get_1d(df: pd.DataFrame, name: str) -> pd.Series:
+        s = None
+        if name in df.columns and isinstance(df[name], pd.Series):
+            s = df[name]
+        if s is None:
+            for col in df.columns:
+                base = col[0] if isinstance(col, tuple) else col
+                if str(base).lower() == name.lower():
+                    s = df[col]
+                    break
+        if s is None and isinstance(df.columns, pd.MultiIndex):
+            try:
+                tmp = df.xs(name, axis=1, level=0, drop_level=False)
+                s = tmp.iloc[:, 0]
+            except Exception:
+                pass
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        if s is None:
+            s = pd.Series(index=df.index, dtype="float64")
+        return pd.to_numeric(s, errors="coerce")
+
+    v = pd.DataFrame(index=v0.index)
+    for col in ["Open", "High", "Low", "Close"]:
+        v[col] = _get_1d(v0, col)
+
+    # NaN 行は除外 & 表示本数を揃える
+    v = v.dropna(subset=["Open", "High", "Low", "Close"], how="any")
+    # 表示本数を 2/3 に間引き（最低30本は確保）
+    _show = max(30, int(round(_candles * 1 / 2))) if not v.empty else 0   #★★★　ここでロウソク足の本数を調整する　★★★★★★★★★★★★★★★★★★　　　　　　
+    v = v.tail(_show) if not v.empty else v
+
+
+    # （安全）高値/安値が胴体を必ず包含
+    v["High"] = pd.concat([v["High"], v["Open"], v["Close"]], axis=1).max(axis=1)
+    v["Low"]  = pd.concat([v["Low"],  v["Open"], v["Close"]], axis=1).min(axis=1)
+
+    # === 2) 指標 ===
+    v["SMA20"]  = v["Close"].rolling(20,  min_periods=1).mean()
+    v["SMA200"] = v["Close"].rolling(200, min_periods=1).mean()
+    bb_mid = v["Close"].rolling(20, min_periods=1).mean()
+    bb_sd  = v["Close"].rolling(20, min_periods=1).std(ddof=0)
+    v["BBU"] = bb_mid + 2.0 * bb_sd
+    v["BBL"] = bb_mid - 2.0 * bb_sd
+    v["RSI14"] = _rsi_v21(v["Close"], 14)
+
+    # === 3) 上段 Y レンジ（ローソク + SMA） ===
+    def _smin(s: pd.Series) -> float:
+        s = pd.to_numeric(s, errors="coerce")
+        mn = s.min(skipna=True)
+        return float(mn) if pd.notna(mn) else np.nan
+
+    def _smax(s: pd.Series) -> float:
+        s = pd.to_numeric(s, errors="coerce")
+        mx = s.max(skipna=True)
+        return float(mx) if pd.notna(mx) else np.nan
+
+    lows  = [_smin(v["Low"]),  _smin(v["SMA20"]),  _smin(v["SMA200"])]
+    highs = [_smax(v["High"]), _smax(v["SMA20"]), _smax(v["SMA200"])]
+    try:
+        y_min = np.nanmin(lows)
+        y_max = np.nanmax(highs)
+    except Exception:
+        y_min, y_max = float(v["Close"].min()), float(v["Close"].max())
+
+    if (not np.isfinite(y_min)) or (not np.isfinite(y_max)) or y_max <= y_min:
+        y_min, y_max = float(v["Close"].min()), float(v["Close"].max())
+    if not np.isfinite(y_min) or not np.isfinite(y_max) or y_max <= y_min:
+        y_min, y_max = 0.0, 1.0
+
+    pad   = (y_max - y_min) * 0.01
+    y_rng = [y_min - pad, y_max + pad]
+
+    # X 右側の余白
+    xpad = (v.index[-1] - v.index[-3]) if len(v) >= 3 else pd.Timedelta(days=2)
+
+    # === 4) 図（上：ローソク＋SMA/BB、下：RSI） ===
+    fig = _mk(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.06, row_heights=[0.76, 0.24],
+        specs=[[{"type": "xy"}], [{"type": "xy"}]],
+    )
+
+    # 背景レイヤ（SMA/BB は先に描画）※ connectgaps で途切れ対策
+    fig.add_trace(_go.Scatter(x=v.index, y=v["SMA20"],  mode="lines",
+                              line=dict(width=2, color="red"),
+                              name="SMA20", connectgaps=True),
+                  row=1, col=1)
+    fig.add_trace(_go.Scatter(x=v.index, y=v["SMA200"], mode="lines",
+                              line=dict(width=2, color="blue"),
+                              name="SMA200", connectgaps=True),
+                  row=1, col=1)
+    fig.add_trace(_go.Scatter(x=v.index, y=v["BBU"], mode="lines",
+                              line=dict(width=1, color="rgba(0,0,0,0.25)"),
+                              name="BB+2σ", connectgaps=True),
+                  row=1, col=1)
+    fig.add_trace(_go.Scatter(x=v.index, y=v["BBL"], mode="lines",
+                              line=dict(width=1, color="rgba(0,0,0,0.25)"),
+                              name="BB-2σ", connectgaps=True),
+                  row=1, col=1)
+
+    # ローソク（最前面）。hovertemplate は使わず text + hoverinfo を使用
+    _ht = (
+        "Open: " + v["Open"].round(3).astype(str) + "<br>"
+        "High: " + v["High"].round(3).astype(str) + "<br>"
+        "Low : " + v["Low"].round(3).astype(str) + "<br>"
+        "Close: " + v["Close"].round(3).astype(str)
+    )
+    fig.add_trace(_go.Candlestick(
+        x=v.index, open=v["Open"], high=v["High"], low=v["Low"], close=v["Close"],
+        increasing_line_color="green", increasing_fillcolor="green",
+        decreasing_line_color="red",   decreasing_fillcolor="red",
+        whiskerwidth=0.9, opacity=1.0,
+        text=_ht, hoverinfo="x+text",
+        name="Candle", showlegend=False
+    ), row=1, col=1)
+
+    # RSI（下段）
+    fig.add_trace(_go.Scatter(x=v.index, y=v["RSI14"], mode="lines",
+                              line=dict(width=1.6),
+                              name="RSI(14)", connectgaps=True),
+                  row=2, col=1)
+    fig.add_hline(y=30, line_width=1, line_dash="dot", line_color="gray", row=2, col=1)
+    fig.add_hline(y=70, line_width=1, line_dash="dot", line_color="gray", row=2, col=1)
+
+    # === 週末・祝日などの“空白”を圧縮 ===
+    # 週末（土→月）は固定でスキップ + 祝日等の丸一日欠損もスキップ
+    _rb = [dict(bounds=["sat", "mon"])]
+    try:
+        _all_days = pd.date_range(v.index.min().normalize(),
+                                  v.index.max().normalize(),
+                                  freq="D")
+        _have_days = pd.to_datetime(v.index).normalize().unique()
+        _missing_days = _all_days.difference(_have_days)
+        if len(_missing_days) > 0:
+            _rb.append(dict(values=_missing_days))
+    except Exception:
+        pass
+
+    # X 軸（上下共通設定）
+    fig.update_xaxes(range=[v.index[0], v.index[-1] + xpad],
+                     rangebreaks=_rb,
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     row=1, col=1)
+    fig.update_xaxes(range=[v.index[0], v.index[-1] + xpad],
+                     rangebreaks=_rb,
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     row=2, col=1)
+
+    # Y 軸
+    fig.update_yaxes(range=y_rng, fixedrange=True,
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     row=1, col=1)
+    fig.update_yaxes(range=[0, 100], fixedrange=True,
+                     showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     row=2, col=1)
+
+    # レンジスライダー抑止
+    fig.update_layout(
+        title=dict(text=fig_title, y=0.98, x=0.01, xanchor="left", yanchor="top"),
+        margin=dict(l=8, r=24, t=30, b=8),
+        height=_h_dpi, showlegend=False,
+        xaxis_rangeslider_visible=False,
+        xaxis2_rangeslider_visible=False
+    )
+    return fig
+
+
+
+
+
+# ---- 表示本体（常時 D1/H4 の2枚を縦並びで表示）----
+st.subheader("テクニカル・チャート（D1/H4）")
+
+# フル/標準の切り替え（キー名は他と被らないように）
+_view = st.selectbox("表示", ["標準", "フルスクリーン"], index=0, key="tech_view_mode_v21")
+_is_full = (_view == "フルスクリーン")
+_h = int(_h_dpi * (1.25 if _is_full else 1.0))
+
+# 表示本数（見やすさ優先で少なめに）
+_candles = int(st.session_state.get("candles", 180))
+
+# サイドバーで選ばれた主役ペア → ティッカーを決定
+_pair_label = st.session_state.get("pair", "ドル円")
+_t1d, _t4h = _tickers_for(_pair_label)
+_ticker_1d = st.session_state.get("ticker_1d", _t1d)
+_ticker_4h = st.session_state.get("ticker_4h", _t4h)
+
+# データ取得（60m→日足/4Hを生成するv21ロジック）
+d1 = _dl_ohlc_v21(_ticker_1d, "1d", _candles)
+h4 = _dl_ohlc_v21(_ticker_4h, "4h", _candles)
+# --- 安全描画ユーティリティ（空データ/Noneでも落ちない） ---
+def _is_empty_like(v):
+    try:
+        if v is None:
+            return True
+        if hasattr(v, "empty") and v.empty:
+            return True
+        if hasattr(v, "index") and len(v.index) == 0:
+            return True
+    except Exception:
+        return True
+    return False
+
+def _placeholder_fig(title):
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.update_layout(
+        title=f"{title}：データなし",
+        template="plotly_white",
+        height=320,
+        margin=dict(l=8, r=8, t=40, b=8),
+    )
+    return fig
+
+def _safe_plotly_chart(title, v, _cfg):
+    fig = _placeholder_fig(title) if _is_empty_like(v) else _build_one_v21(title, v)
+    st.plotly_chart(fig, use_container_width=True, config=_cfg)
+# --- /安全描画ユーティリティ ---
+
+# --- 描画 ---
+if d1 is None:
+    st.info("日足データを取得できませんでした。")
+else:
+    _safe_plotly_chart(f"{_ticker_1d}（日足）", d1, _cfg)
+
+if h4 is None:
+    st.info("4時間足データを取得できませんでした。")
+else:
+    _safe_plotly_chart(f"{_ticker_4h}（4時間足）", h4, _cfg)
+
+
+
+
+# ==== 段落② UIブロック（置き換え版） =====================================
+
+# ---- 時間軸の使い方（旧ラジオの代替） ----
+st.markdown("#### 時間軸の使い方")
+st.radio(
+    "段落②で参照する時間軸",
+    ["日足のみ", "4時間足のみ", "両方（半々）"],
+    horizontal=True,
+    key="tf_mix_mode",
+    help="『両方（半々）』を選ぶと、本文を日足と4時間足で50:50の比重で組み立てます。"
+)
+
+# ---- 互換シム：旧コードが参照する tf_base_choice を自動設定 ----
+_mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+if _mix == "日足のみ":
+    st.session_state["tf_base_choice"] = "日足"
+elif _mix == "4時間足のみ":
+    st.session_state["tf_base_choice"] = "4時間足"
+else:
+    # 『両方（半々）』は旧ロジック上は「自動」と等価に扱う
+    st.session_state["tf_base_choice"] = "自動"
+
+# ---- D1/H4の印象（必須） ----
+st.markdown("#### D1/H4の印象（必須）")
+_IMP_CHOICES = ["横ばい", "緩やかなアップ", "アップ", "強いアップ", "緩やかなダウン", "ダウン", "強いダウン"]
+
+# 時間軸の使い方（未設定時は両方扱い）
+mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+
+col_d1, col_h4 = st.columns(2)
+
+with col_d1:
+    # ✅ D1は常に操作可能（H4のみでも必ず選べる）
+    st.selectbox(
+        "日足（D1）の印象",
+        _IMP_CHOICES,
+        index=_IMP_CHOICES.index(st.session_state.get("d1_imp", "横ばい"))
+        if st.session_state.get("d1_imp") in _IMP_CHOICES else 0,
+        key="d1_imp",
+        help="直感でOK。横ばい/アップ/ダウン＋強弱から最も近いものを選択。",
+        disabled=False,  # ← ここを常に False
+    )
+
+with col_h4:
+    # ✅ 「日足のみ」のときだけH4を無効化（それ以外は操作可）
+    if mix == "日足のみ":
+        st.selectbox("4時間足（H4）の印象", ["（日足のみを選択中：操作できません）"], index=0, key="h4_imp_dummy", disabled=True)
+    else:
+        st.selectbox(
+            "4時間足（H4）の印象",
+            _IMP_CHOICES,
+            index=_IMP_CHOICES.index(st.session_state.get("h4_imp", "横ばい"))
+            if st.session_state.get("h4_imp") in _IMP_CHOICES else 0,
+            key="h4_imp",
+            help="直感でOK。横ばい/アップ/ダウン＋強弱から最も近いものを選択。",
+            disabled=False,
+        )
+
+
+
+# ---- ここから：段落②の時間軸制御フラグ ----
+_mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+DISABLE_H4 = (_mix == "日足のみ")
+DISABLE_D1 = (_mix == "4時間足のみ")
+st.session_state["p2_disable_h4"] = DISABLE_H4
+st.session_state["p2_disable_d1"] = DISABLE_D1
+
+# 段落②の自動補完（初心者向け）デフォルトON
+if "p2_auto_complete" not in st.session_state:
+    st.session_state["p2_auto_complete"] = True
+
+def _coarse_trend(label: str) -> str:
+    s = str(label or "")
+    if "アップ" in s: return "上向き"
+    if "ダウン" in s: return "下向き"
+    return "横ばい"
+
+# 自動/日足/H4 の解決（インジごと）
+def _resolve_axis(pref_key: str, category: str) -> str:
+    """戻り: 'D1' or 'H4'"""
+    pref = str(st.session_state.get(pref_key, "自動") or "自動")
+    mix  = st.session_state.get("tf_mix_mode", "両方（半々）")
+    if pref != "自動":
+        return "D1" if "日足" in pref or "D1" in pref.upper() else "H4"
+    # 自動規則
+    if mix == "日足のみ":      return "D1"
+    if mix == "4時間足のみ":   return "H4"
+    # 両方（半々）の既定
+    if category == "MA":       return "D1"  # 長期骨格
+    return "H4"                 # 短期の張りつき/過熱
+# ---- ここまで：段落②の時間軸制御フラグ ----
+
+# ==== NEW: 移動平均クロス（20↔200, 任意） ====
+st.markdown("#### 移動平均クロス（20↔200, 任意）")
+
+# 参照時間軸（MA）— 重複キー回避の新ラジオ
+_mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+if _mix == "日足のみ":
+    _ma_axis_options = ["日足（D1）"]
+elif _mix == "4時間足のみ":
+    _ma_axis_options = ["4時間足（H4）"]
+else:
+    _ma_axis_options = ["自動", "日足（D1）", "4時間足（H4）"]
+
+_ma_axis_selected = st.radio(
+    "参照時間軸（MA）",
+    _ma_axis_options,
+    horizontal=True,
+    key="p2_ma_axis_ui2",   # ← ユニークな新キー（重複回避）
+    help="MAの時間軸。日足のみ/4時間足のみを選ぶと固定になります。"
+)
+
+# 実効値を統一キーに格納（後段互換のため）
+st.session_state["p2_ma_axis_effective"] = _ma_axis_selected
+st.session_state["p2_ma_axis"] = st.session_state["p2_ma_axis_effective"]  # 旧ロジック互換
+
+# 旧UI（参照時間軸ラジオ／時間軸セレクト）は撤去し、互換値だけ同期
+# gc_axis を参照する既存コード向けに、実効値から対応づけておく
+_gc_map = {"自動": "未選択", "日足（D1）": "日足（D1）", "4時間足（H4）": "4時間足（H4）"}
+st.session_state["gc_axis"] = _gc_map.get(st.session_state["p2_ma_axis_effective"], "未選択")
+
+# レイアウトは従来通り2カラムのまま（左は説明だけ、右に状態セレクト）
+col_axis, col_cross = st.columns([1, 2])
+with col_axis:
+    st.caption("（参照軸は上のラジオで制御します。旧「参照時間軸/時間軸」は廃止）")
+
+with col_cross:
+    st.selectbox(
+        "状態",
+        [
+            "未選択",
+            "ゴールデンクロス（短期20MAが長期200MAを上抜け）",
+            "デッドクロス（短期20MAが長期200MAを下抜け）",
+        ],
+        key="gc_state",
+        help="ゴールデンクロス＝短期（20MA）が長期（200MA）を上抜け。デッドクロス＝短期が長期を下抜け。発生日の厳密指定は不要です。"
+    )
+
+
+# ==== 整合性判定（D1/H4の印象 × 20/200クロス） ====
+
+def _trend_sign_from_label(label: str) -> int:
+    """
+    印象テキストから、上向き=+1 / 下向き=-1 / 横ばい=0 を返す。
+    """
+    s = str(label or "")
+    if "アップ" in s:
+        return 1
+    if "ダウン" in s:
+        return -1
+    return 0  # 横ばい等
+
+def _cross_sign(gc_state: str) -> int | None:
+    """
+    GC/DCの状態から、GC=+1 / DC=-1 / 未選択=None を返す。
+    """
+    s = str(gc_state or "")
+    if "ゴールデンクロス" in s:
+        return 1
+    if "デッドクロス" in s:
+        return -1
+    return None  # 未選択など
+
+def _consistency_judge(d1_imp: str, h4_imp: str, gc_axis: str, gc_state: str) -> tuple[str, str]:
+    """
+    戻り値: (バッジ文, 補足説明)
+    バッジは本文には入れず、UIに小さく表示する想定。
+    """
+    ax = str(gc_axis or "")
+    cs = _cross_sign(gc_state)           # +1 / -1 / None
+    if cs is None or ax == "未選択":
+        return ("", "")  # 比較対象なし → 何も出さない
+
+    # 比較するトレンドの軸を決定
+    if "日足" in ax:
+        ts = _trend_sign_from_label(d1_imp)
+    elif "4" in ax:  # 「4時間足」をざっくり検出
+        ts = _trend_sign_from_label(h4_imp)
+    else:
+        ts = 0
+
+    # 片方が中立(0)なら「△」
+    if ts == 0:
+        return ("**🟡 整合性△**", "比較材料が限定的。断定は避けつつ、様子見が無難。")
+
+    # 同方向 → 「◯」、逆方向 → 「⚠」
+    if ts == cs:
+        return ("**🟢 整合性◯**", "人の印象と20/200の基調がおおむね整合。流れの確認がしやすい局面。")
+    else:
+        return ("**🟠 整合性⚠**", "人の印象と20/200の基調が逆行気味。本文は人の選択を優先しつつ過度な決めつけは避けたい。")
+
+
+st.caption("※ 発生日の厳密指定は不要。文章では『発生して以降』など時制をぼかして表現します。")
+
+# ==== 整合性バッジ表示（本文には出しません） ====
+badge, tip = _consistency_judge(
+    st.session_state.get("d1_imp", "横ばい"),
+    st.session_state.get("h4_imp", "横ばい"),
+    st.session_state.get("gc_axis", "未選択"),
+    st.session_state.get("gc_state", "未選択"),
+)
+if badge:
+    st.markdown(badge)   # 🟢/🟠/🟡 のいずれか
+    st.caption(tip)      # 補足説明（小さく表示）
+
+# ==== NEW: ボリンジャーバンド（任意） ====
+st.markdown("#### ボリンジャーバンド（任意）")
+
+# 参照時間軸（BB）— 時間軸の使い方に連動（重複キー回避の新キー）
+_mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+if _mix == "日足のみ":
+    _bb_axis_options = ["日足（D1）"]
+elif _mix == "4時間足のみ":
+    _bb_axis_options = ["4時間足（H4）"]
+else:
+    _bb_axis_options = ["自動", "日足（D1）", "4時間足（H4）"]
+
+_bb_axis_selected = st.radio(
+    "参照時間軸（BB）",
+    _bb_axis_options,
+    horizontal=True,
+    key="p2_bb_axis_ui2",   # ← ユニークな新キー（重複回避）
+    help="BBの時間軸。日足のみ/4時間足のみを選ぶと固定になります。"
+)
+
+# 実効値を互換キーへ同期（既存ロジックを壊さない）
+st.session_state["p2_bb_axis_effective"] = _bb_axis_selected
+st.session_state["p2_bb_axis"] = st.session_state["p2_bb_axis_effective"]
+_bb_map = {"自動": "未選択", "日足（D1）": "日足（D1）", "4時間足（H4）": "4時間足（H4）"}
+st.session_state["bb_axis"] = _bb_map.get(st.session_state["p2_bb_axis_effective"], "未選択")
+
+# レイアウト：左に説明、右に状態セレクト（旧UIは撤去）
+col_axis, col_state = st.columns([1, 2])
+with col_axis:
+    st.caption("（参照軸は上のラジオで制御します。旧UIは廃止）")
+
+with col_state:
+    _bb_state_val = st.selectbox(
+        "状態（ボリンジャーバンド(20, ±2σ)）",
+        [
+            "未選択",
+            "上限付近（価格が上バンドに接近）",
+            "中心線付近（価格がミドルバンド付近）",
+            "下限付近（価格が下バンドに接近）",
+            "収縮（バンド幅が狭い＝ボラ低下）",
+            "拡大（バンド幅が広がる＝ボラ上昇）",
+            "上方向のバンドウォーク（上バンド沿いに推移）",
+            "下方向のバンドウォーク（下バンド沿いに推移）",
+        ],
+        key="p2_bb_state",
+        help="未選択のままでOK。選んだ場合のみ短句で反映します。"
+    )
+    # 互換キー（もし他所で参照していれば）
+    st.session_state["bb_state"] = _bb_state_val
+
+st.caption("※ 表記は ボリンジャーバンド(20, ±2σ)。ここでの選択は後の文章反映で自然に使います。")
+
+# ---- BB選択肢→短句マッピング（軸併記つき・公開本文にはまだ入れない）----
+def _bb_short_sentence(state_label: str) -> str:
+    label = (state_label or "").strip()
+    if not label or label == "未選択":
+        return ""
+    mapping = {
+        "上限付近（価格が上バンドに接近）": "ボリンジャーバンド(20, ±2σ)は上限付近。",
+        "中心線付近（価格がミドルバンド付近）": "ボリンジャーバンド(20, ±2σ)は中心線付近。",
+        "下限付近（価格が下バンドに接近）": "ボリンジャーバンド(20, ±2σ)は下限付近。",
+        "収縮（バンド幅が狭い＝ボラ低下）": "ボリンジャーバンド(20, ±2σ)は収縮気味。",
+        "拡大（バンド幅が広がる＝ボラ上昇）": "ボリンジャーバンド(20, ±2σ)は拡大型。",
+        "上方向のバンドウォーク（上バンド沿いに推移）": "上方向のバンドウォーク気味。",
+        "下方向のバンドウォーク（下バンド沿いに推移）": "下方向のバンドウォーク気味。",
+    }
+    return mapping.get(label, "")
+
+# 軸（D1/H4）の併記
+axis_eff = str(st.session_state.get("p2_bb_axis_effective", "自動"))
+axis_suffix = ""
+if "日足" in axis_eff or axis_eff.upper() == "D1":
+    axis_suffix = "（日足）"
+elif "4時間" in axis_eff or axis_eff.upper() == "H4":
+    axis_suffix = "（4時間足）"
+
+_bb_sentence = _bb_short_sentence(st.session_state.get("bb_state", "未選択"))
+if _bb_sentence and axis_suffix:
+    _bb_sentence = (_bb_sentence[:-1] if _bb_sentence.endswith("。") else _bb_sentence) + axis_suffix + "。"
+
+# 次の手順で本文組み込みに使うため、セッションに保存
+st.session_state["p2_bb_sentence_preview"] = _bb_sentence
+
+# 画面で軽く確認用（公開本文には混ぜない）
+st.caption(f"プレビュー（BB短句）：{_bb_sentence or '—（未選択）'}")
+# ---- /BB短句マッピングここまで ----
+
+# ==== NEW: RSI（任意） ====
+st.markdown("#### RSI（任意）")
+
+# 参照時間軸（RSI）— 重複キー回避の新ラジオ
+_mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+if _mix == "日足のみ":
+    _rsi_axis_options = ["日足（D1）"]
+elif _mix == "4時間足のみ":
+    _rsi_axis_options = ["4時間足（H4）"]
+else:
+    _rsi_axis_options = ["自動", "日足（D1）", "4時間足（H4）"]
+
+_rsi_axis_selected = st.radio(
+    "参照時間軸（RSI）",
+    _rsi_axis_options,
+    horizontal=True,
+    key="p2_rsi_axis_ui2",   # ← 新しいユニークキー（重複回避）
+    help="RSIの時間軸。日足のみ/4時間足のみを選ぶと固定になります。"
+)
+
+# 実効値を互換キーへ同期（後段の既存ロジックを壊さない）
+st.session_state["p2_rsi_axis_effective"] = _rsi_axis_selected
+st.session_state["p2_rsi_axis"] = st.session_state["p2_rsi_axis_effective"]
+_map = {"自動": "未選択", "日足（D1）": "日足（D1）", "4時間足（H4）": "4時間足（H4）"}
+st.session_state["rsi_axis"] = _map.get(st.session_state["p2_rsi_axis_effective"], "未選択")
+
+# レイアウトは従来通り：左に説明、右に状態セレクト（旧UIは撤去）
+col_axis, col_state = st.columns([1, 2])
+with col_axis:
+    st.caption("（参照軸は上のラジオで制御します。旧UIは廃止）")
+
+with col_state:
+    _rsi_state_val = st.selectbox(
+        "状態（RSI 14）",
+        ["未選択", "70接近", "50前後", "30接近", "ダイバージェンス示唆"],
+        key="p2_rsi_state",
+        help="未選択のままでも本文には出しません。選んだ場合のみ短句で反映。"
+    )
+    # 互換キー（もし他所で参照していれば）
+    st.session_state["rsi_state"] = _rsi_state_val
+# ---- RSI選択肢→短句マッピング（現行/旧ラベルどちらも対応）----
+def _rsi_short_sentence(state_label: str) -> str:
+    label = (state_label or "").strip()
+    if not label or label == "未選択":
+        return ""
+    mapping = {
+        # 現行ラベル
+        "70接近": "RSI(14)は70接近。",
+        "50前後": "RSI(14)は50前後。",
+        "30接近": "RSI(14)は30接近。",
+        "ダイバージェンス示唆": "RSI(14)にダイバージェンス示唆。",
+        # 旧ラベル（互換）
+        "70以上（買われすぎ気味）": "RSI(14)は70超で買われすぎ気味。",
+        "60〜70（上向きバイアス）": "RSI(14)は60台で上向きバイアス。",
+        "40〜50（下向きバイアス）": "RSI(14)は40〜50で下向きバイアス。",
+        "30〜40（売られ気味）": "RSI(14)は30台で売られ気味。",
+        "30未満（売られすぎ気味）": "RSI(14)は30割れで売られすぎ気味。",
+        "ダイバージェンスあり（価格とRSIの方向が逆）": "RSI(14)にダイバージェンス示唆。",
+    }
+    return mapping.get(label, "")
+
+# 現在の選択から短句を作成＋軸（D1/H4）を併記
+axis_eff = str(st.session_state.get("p2_rsi_axis_effective", "自動"))
+axis_suffix = ""
+if "日足" in axis_eff or axis_eff.upper() == "D1":
+    axis_suffix = "（日足）"
+elif "4時間" in axis_eff or axis_eff.upper() == "H4":
+    axis_suffix = "（4時間足）"
+
+_rsi_sentence = _rsi_short_sentence(st.session_state.get("rsi_state", "未選択"))
+if _rsi_sentence and axis_suffix:
+    # 文末の句点を一旦外して軸を付け足す
+    _rsi_sentence = (_rsi_sentence[:-1] if _rsi_sentence.endswith("。") else _rsi_sentence) + axis_suffix + "。"
+
+# 次の手順で本文組み込みに使うため、セッションに保存
+st.session_state["p2_rsi_sentence_preview"] = _rsi_sentence
+
+# 画面で軽く確認用（公開本文には混ぜない）
+st.caption(f"プレビュー（RSI短句）：{_rsi_sentence or '—（未選択）'}")
+# ---- /RSI短句マッピングここまで ----
+
+
+
+
+# ---- ブレークポイント（任意・共通） ----
+st.markdown("#### ブレークポイント（任意）")
+_pair_label = st.session_state.get("pair", "")
+# 円絡みは小数2桁（JPY or '円' を検出）、それ以外は小数4桁
+_decimals = 2 if (("JPY" in _pair_label) or ("円" in _pair_label)) else 4
+_step = 10 ** (-_decimals)
+_fmt = f"%.{_decimals}f"
+
+col_up, col_dn = st.columns(2)
+with col_up:
+    _bp_up_default = float(st.session_state.get("bp_up_default", 0.0))
+    bp_up = st.number_input(
+        "上側（例：155.00 など）",
+        min_value=0.0, value=_bp_up_default,
+        step=_step, format=_fmt,
+        help="未入力でもOK。入力した場合は本文に『○○付近』として使います。"
+    )
+    st.session_state["bp_up"] = bp_up if bp_up > 0 else None
+
+with col_dn:
+    _bp_dn_default = float(st.session_state.get("bp_dn_default", 0.0))
+    bp_dn = st.number_input(
+        "下側（例：153.80 など）",
+        min_value=0.0, value=_bp_dn_default,
+        step=_step, format=_fmt,
+        help="未入力でもOK。入力した場合は本文に『○○付近』として使います。"
+    )
+    st.session_state["bp_dn"] = bp_dn if bp_dn > 0 else None
+
+# --- 共通BPを段落②用キーに同期（文章が読む名前へコピー） ---
+st.session_state["p2_bp_upper"] = st.session_state.get("bp_up")
+st.session_state["p2_bp_lower"] = st.session_state.get("bp_dn")
+
+st.caption("※ 入力は“ざっくり”でOK。文章では常に『○○付近／どころ／前後』などの近似表現に整えます。")
+
+# ---- 時間軸別ブレークポイント（任意） ----
+with st.expander("時間軸別に設定（任意）", expanded=False):
+    mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+
+    col_d1_bp, col_h4_bp = st.columns(2)
+
+    # ---- D1 側 ----
+    with col_d1_bp:
+        st.markdown("**日足（D1）**")
+        st.number_input(
+            "D1 上側",
+            min_value=0.0,
+            value=float(st.session_state.get("bp_d1_up", 0.0)),
+            step=_step, format=_fmt, key="bp_d1_up",
+            disabled=(mix == "4時間足のみ"),  # H4のみ→D1のBPは操作不可
+        )
+        st.number_input(
+            "D1 下側",
+            min_value=0.0,
+            value=float(st.session_state.get("bp_d1_dn", 0.0)),
+            step=_step, format=_fmt, key="bp_d1_dn",
+            disabled=(mix == "4時間足のみ"),
+        )
+
+    # ---- H4 側 ----
+    with col_h4_bp:
+        st.markdown("**4時間足（H4）**")
+        st.number_input(
+            "H4 上側",
+            min_value=0.0,
+            value=float(st.session_state.get("bp_h4_up", 0.0)),
+            step=_step, format=_fmt, key="bp_h4_up",
+            disabled=(mix == "日足のみ"),    # 日足のみ→H4のBPは操作不可
+        )
+        st.number_input(
+            "H4 下側",
+            min_value=0.0,
+            value=float(st.session_state.get("bp_h4_dn", 0.0)),
+            step=_step, format=_fmt, key="bp_h4_dn",
+            disabled=(mix == "日足のみ"),
+        )
+
+
+
+def _compose_para2_base_from_state() -> str:
+    """段落②の冒頭ベース文（D1/H4の出し分け規律）。"""
+    pair = str(st.session_state.get("pair", "") or "")
+    mix  = st.session_state.get("tf_mix_mode", "両方（半々）")
+    d1   = st.session_state.get("d1_imp", "横ばい")
+    h4   = st.session_state.get("h4_imp", "横ばい")
+
+    if mix == "日足のみ":
+        return f"為替市場は、{pair}は日足は{d1}。"
+    if mix == "4時間足のみ":
+        return f"為替市場は、{pair}は日足は{_coarse_trend(d1)}。4時間足は{h4}。"
+    # 両方（半々）
+    return f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+
+# ---- 段落②：フロー整形（軸ごとに統合・重複抑制・順序整備）----
+def _p2_flow_polish(text: str) -> str:
+    """
+    ・「日足では…」「4時間足では…」をそれぞれ1文にまとめる（読点で接続）
+    ・軸なしRSI（例:『RSIは50前後。』）が軸ありRSIと重なるときは軸ありを優先
+    ・『為替市場は、…』→『ブレークポイント言及（〜付近〜）』→『日足では…』『4時間足では…』→その他
+    ・文の重複/空白差重複を除去、句点を正規化
+    """
+    import re
+    import unicodedata
+
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    # 文ごとに分割
+    parts = [p.strip() for p in re.split(r"。+", s) if p.strip()]
+
+    d1_frags, h4_frags, others = [], [], []
+    for p in parts:
+        if p.startswith("日足では"):
+            d1_frags.append(p.replace("日足では", "", 1).strip(" 、"))
+        elif p.startswith("4時間足では"):
+            h4_frags.append(p.replace("4時間足では", "", 1).strip(" 、"))
+        else:
+            others.append(p)
+
+    def _key(x: str) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", x or ""))
+
+    def _dedupe(seq):
+        seen, out = set(), []
+        for x in seq:
+            k = _key(x)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(x)
+        return out
+
+    d1_frags = _dedupe(d1_frags)
+    h4_frags = _dedupe(h4_frags)
+
+    # 軸ありRSIがどちらかに含まれるなら、軸なしRSIの独立文を落とす
+    def _has_axis_rsi(frags) -> bool:
+        return any(re.search(r"\bRSI(?:\s*\(14\))?\b", f) for f in frags)
+
+    if _has_axis_rsi(d1_frags) or _has_axis_rsi(h4_frags):
+        others = [p for p in others if not re.match(r"^\s*RSI(?:\s*\(14\))?\s*は", p)]
+
+    # 軸ごとに1文へ凝縮
+    grouped = []
+    if d1_frags:
+        grouped.append("日足では" + "、".join(d1_frags))
+    if h4_frags:
+        grouped.append("4時間足では" + "、".join(h4_frags))
+
+    # 並び順：為替市場は→ブレークポイント（〜付近〜）→軸文→その他
+    base = None
+    rest = []
+    for p in others:
+        if base is None and p.startswith("為替市場は、"):
+            base = p
+        else:
+            rest.append(p)
+
+    bp_parts = [x for x in rest if "付近" in x]
+    rest = [x for x in rest if x not in bp_parts]
+
+    new_parts = []
+    if base:
+        new_parts.append(base)
+    new_parts += bp_parts
+    new_parts += grouped
+    new_parts += rest
+
+    # 重複除去＋句点正規化
+    new_parts = _dedupe(new_parts)
+    out = "。".join(new_parts).strip()
+    out = re.sub(r"([。])\1+", r"\1", out).strip()
+    if out and not out.endswith("。"):
+        out += "。"
+    return out
+
+
+
+# ---- 共通の最終整形＋品質ガード（サンプル超えの体裁/語彙/重複管理）----
+def _final_polish_and_guard(text: str, para: str = "full") -> str:
+    """
+    サンプル準拠ルールを満たしつつ、重複・体裁を除去して“サンプル超え”の読み味に仕上げる最終フィルタ。
+    - 句点/読点の二重化除去、空白の正規化
+    - ボリンジャーバンド／RSI／MA 表記の統一
+    - よく出る定型文の多発を1回に圧縮
+    - 文単位の NFKC 正規化＋空白除去キーで厳密重複排除
+    - 結び文（行方を注視したい／値動きには警戒したい／方向感(性)を見極めたい／当面は静観としたい）を末尾1本に統一
+    - 段落①（para="p1"）では「米国市場は、主要3指数…」の長短二重表現を長文だけ残す
+    """
+    import re
+    import unicodedata
+
+    t = (text or "").strip()
+
+    # 1) 句読点・空白の体裁
+    t = re.sub(r"([。])\1+", r"\1", t)        # 句点の重複
+    t = re.sub(r"、{2,}", "、", t)            # 読点の重複
+    t = re.sub(r"(、|。)\s*。", r"。", t)     # 読点直後の句点など
+    t = re.sub(r"\s+", " ", t).strip()        # 余分な空白
+
+    # 2) 用語の表記ロック（BB/RSI/MA）
+    t = re.sub(r"ボリンジャーバンド\s*(?:\(20,\s*[±\+\-]?\s*2σ\))?\s*の\s*拡大", "ボリンジャーバンド(20, ±2σ)は拡大型", t)
+    t = re.sub(r"ボリンジャーバンド\s*(?:\(20,\s*[±\+\-]?\s*2σ\))?\s*の\s*収縮", "ボリンジャーバンド(20, ±2σ)は収縮気味", t)
+    t = re.sub(r"ボリンジャーバンド\s*(?:\(20,\s*[±\+\-]?\s*2σ\))?\s*は\s*拡大(?:中|傾向)?", "ボリンジャーバンド(20, ±2σ)は拡大型", t)
+    t = re.sub(r"ボリンジャーバンド\s*(?:\(20,\s*[±\+\-]?\s*2σ\))?\s*は\s*収縮(?:中|傾向)?", "ボリンジャーバンド(20, ±2σ)は収縮気味", t)
+    t = re.sub(r"\bBB\b", "ボリンジャーバンド(20, ±2σ)", t)
+    t = re.sub(r"(拡大型)型\b", r"\1", t)
+    t = re.sub(r"(収縮気味)気味\b", r"\1", t)
+
+    t = re.sub(r"RSI\s*\(?\s*14\s*\)?", "RSI(14)", t)     # RSI 14 → RSI(14)
+    t = re.sub(r"\bRSI\b\s*が\s*", "RSI(14)は", t)         # 「RSI が …」→「RSI(14)は…」
+    t = re.sub(r"RSI\(14\)\s*が\s*", "RSI(14)は", t)      # 「RSI(14) が …」→「RSI(14)は…」
+    t = re.sub(r"(\d+)\s*(接近|前後|割れ)", r"\1\2", t)   # 70 接近 → 70接近
+
+    t = re.sub(r"(?<!S)20\s*MA", "20SMA", t)
+    t = re.sub(r"(?<!S)200\s*MA", "200SMA", t)
+    t = re.sub(r"20SMA\s+", "20SMA", t)
+    t = re.sub(r"200SMA\s+", "200SMA", t)
+    # p3 専用：冗長表現の正規化（段落③のタイトル回収を1文に統一）
+    t = re.sub(r"方向感の見極めを確認したい。", "方向感を見極めたい。", t)
+
+    # 3) 段落①専用：株式3指数の長短二重表現を長い方だけ残す（ゆらぎ吸収）
+    if para == "p1":
+        pattern_long  = r"米国(?:の)?(?:株式)?市場は、?\s*主要[3３]指数が(?:そろって|揃って)(?:上昇|下落|まちまち)とな(?:り|って)[^。]*。"
+        pattern_short = r"米国(?:の)?(?:株式)?市場は、?\s*主要[3３]指数が(?:そろって|揃って)(?:上昇|下落|まちまち)となっ[たて]。"
+
+        # 長文→短文 を 長文に圧縮
+        t = re.sub(rf"({pattern_long})\s*{pattern_short}", r"\1", t)
+        # 短文→長文 を 長文に圧縮
+        t = re.sub(rf"{pattern_short}\s*({pattern_long})", r"\1", t)
+        # 長文が存在するなら残りの短文は全消去
+        if re.search(pattern_long, t):
+            t = re.sub(rf"(?:^|。)\s*{pattern_short}", "。", t)
+        # 3.1) 段落①専用：『まちまち』＋『1上昇・2下落』の重複を長文だけ残す
+    if para == "p1":
+        pat_mix = r"米国(?:の)?(?:株式)?市場は、?\s*主要[3３]指数はまちまちとなり、[^。]*。"
+        pat_12  = r"米国(?:の)?(?:株式)?市場は、?\s*主要[3３]指数のうち[０-９0-9]指数が上昇・[０-９0-9]指数が下落となった。"
+
+        # 長文→短文 の並びを長文だけに圧縮
+        t = re.sub(rf"({pat_mix})\s*{pat_12}", r"\1", t)
+        # 短文→長文 の並びを長文だけに圧縮
+        t = re.sub(rf"{pat_12}\s*({pat_mix})", r"\1", t)
+        # 長文が本文に存在するなら、残る同短文は全消去
+        if re.search(pat_mix, t):
+            t = re.sub(rf"(?:^|。)\s*{pat_12}", "。", t)
+
+    # 4) よく出る定型文の多発を圧縮（重複2連以上 → 1回）
+    boiler = r"短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。"
+    t = re.sub(rf"(?:{boiler})\s*(?:{boiler})+", boiler, t)
+
+    # 5) RSI短句の連続重複を除去（最初の1回だけ残す）
+    _rsi_seen = False
+    def _dedupe_rsi(m):
+        nonlocal _rsi_seen
+        if _rsi_seen:
+            return ""
+        _rsi_seen = True
+        return m.group(0)
+    t = re.sub(r"(?:、\s*)?RSI\(14\)は(?:70接近|60台|50前後|40〜50|30台|30接近|30割れ)(?:。|、)?", _dedupe_rsi, t)
+
+    # 6) 文単位の厳格重複排除（NFKC 正規化＋空白・句点除去キー）
+    def _key(s: str) -> str:
+        x = unicodedata.normalize("NFKC", s or "")
+        x = re.sub(r"\s+", "", x)
+        x = x.replace("。", "")
+        return x
+    parts = [p for p in re.split(r"。+", t) if p.strip()]
+    seen, uniq = set(), []
+    for p in parts:
+        k = _key(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(p.strip())
+
+        # 7) 途中に現れる結び文は一旦除去し、末尾に1本だけ戻す
+    closers = {"方向感を見極めたい", "方向性を見極めたい", "行方を注視したい", "値動きには警戒したい", "当面は静観としたい", "一段の変動に要注意としたい"}
+    closer_pat = r"(方向感を見極めたい|方向性を見極めたい|行方を注視したい|値動きには警戒したい|当面は静観としたい|一段の変動に要注意としたい)"
+    found_closers = re.findall(closer_pat, t)  # 元文中に出た順序を尊重
+    body = [p for p in uniq if p not in closers]
+    tails = [p for p in uniq if p in closers]
+
+    # ★タイトル尾語に合わせて段落②のクローザーを強制整合（para="p2" のときのみ）
+    closer_map = {
+        "注視か": "行方を注視したい",
+        "警戒か": "値動きには警戒したい",
+        "静観か": "当面は静観としたい",
+        "要注意か": "一段の変動に要注意としたい",
+        "見極めたい": "方向感を見極めたい",
+    }
+    desired_closer = ""
+    if para == "p2":
+        try:
+            tail = (st.session_state.get("title_tail") or "").strip()
+            if tail in closer_map:
+                desired_closer = closer_map[tail]
+        except Exception:
+            pass
+
+    if desired_closer:
+        # タイトル尾語に一致する1本だけを末尾へ
+        t = "。".join(body + [desired_closer]) + "。"
+    else:
+        # 従来ロジック（最後に出現したクローザー or 先頭からの tails[-1]）
+        closer_to_use = (found_closers[-1] if found_closers else (tails[-1] if tails else ""))
+        if closer_to_use:
+            t = "。".join(body + [closer_to_use]) + "。"
+        else:
+            t = "。".join(uniq) + "。"
+
+
+    # 8) 最終の句点重複と末尾句点の保証
+    t = re.sub(r"([。])\1+", r"\1", t).strip()
+    if t and not t.endswith("。"):
+        t += "。"
+    return t
+
+
+
+
+# ---- 段落②インジ短句の合流＋時間軸規律（呼び出しに flow-polish を追加）----
+def _p2_merge_indicators(txt: str) -> str:
+    """
+    段落②テキストに MA / RSI / BB の短句を合流。
+    ・サンプル準拠の語彙は既存通り（『日足では／4時間足では』『20MA 下位→上位』『ボリンジャーバンド+2σ/-2σ』『中心線に向けての回帰』『RSI が 50 前後』等）
+    ・BBが『拡大／収縮』のみでも +2σ / -2σ / 中心線 を自動補足（既存実装を維持）
+    ・最後に _p2_flow_polish() で文章を統合して自然な流れに
+    """
+    import re
+
+    def _ensure_period(s: str) -> str:
+        s = (s or "").strip()
+        return (s + "。") if (s and not s.endswith("。")) else s
+
+    def _append_once(text: str, add: str) -> str:
+        t = (text or "").strip()
+        a = (add  or "").strip()
+        if not a:
+            return t
+        if re.sub(r"\s+", "", a) in re.sub(r"\s+", "", t):
+            return t
+        t = _ensure_period(t)
+        return (t + " " + a) if t else a
+
+    out = (txt or "").strip()
+    mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+
+    # ---- 軸ラベル（末尾スペース無し）----
+    def _axis_text(raw: str, fallback_mix: str) -> str:
+        ax = str(raw or "")
+        if ("日足" in ax) or (ax.upper() == "D1"):
+            return "日足では"
+        if ("4時間" in ax) or (ax.upper() == "H4"):
+            return "4時間足では"
+        if fallback_mix == "日足のみ":
+            return "日足では"
+        if fallback_mix == "4時間足のみ":
+            return "4時間足では"
+        return ""
+
+    # ---- MA ----
+    ma_sentence = ""
+    gc = str(st.session_state.get("gc_state", "未選択") or "")
+    if gc and gc != "未選択":
+        ma_ax = st.session_state.get("p2_ma_axis_effective", "自動")
+        head  = _axis_text(ma_ax, mix)
+        if "ゴールデン" in gc:
+            core = "20MA 下位から上位へと移行。"
+        elif "デッド" in gc:
+            core = "20MA 上位から下位へと移行。"
+        else:
+            core = "20MA 近辺での推移。"
+        ma_sentence = (head + core) if head else core
+
+    # ---- RSI ----
+    rsi_sentence = ""
+    rsi_ax   = st.session_state.get("p2_rsi_axis_effective", "自動")
+    rsi_head = _axis_text(rsi_ax, mix)
+    rsi_val  = str(st.session_state.get("p2_rsi_state", "未選択") or "").strip()
+    old2new = {
+        "70以上（買われすぎ気味）": "70接近",
+        "60〜70（上向きバイアス）": "60台",
+        "50前後（中立）": "50前後",
+        "40〜50（下向きバイアス）": "40〜50",
+        "30〜40（売られ気味）": "30台",
+        "30未満（売られすぎ気味）": "30割れ",
+        "ダイバージェンスあり（価格とRSIの方向が逆）": "ダイバージェンス示唆",
+    }
+    rsi_val = old2new.get(rsi_val, rsi_val)
+    if rsi_val and rsi_val != "未選択":
+        if rsi_val == "70接近":
+            core = "RSI が 70 接近。"
+        elif rsi_val in ("60台", "40〜50", "30台"):
+            core = f"RSI が {rsi_val}。"
+        elif rsi_val == "50前後":
+            core = "RSI が 50 前後。"
+        elif rsi_val == "30接近":
+            core = "RSI が 30 接近。"
+        elif rsi_val == "30割れ":
+            core = "RSI が 30 割れ。"
+        elif rsi_val == "ダイバージェンス示唆":
+            core = "RSI にダイバージェンス示唆。"
+        else:
+            core = f"RSI が {rsi_val}。"
+        rsi_sentence = (rsi_head + core) if rsi_head else core
+
+    # ---- BB（既存：拡大/収縮のみでもシグマ補足を必ず付与）----
+    bb_sentence = ""
+    bb_ax   = st.session_state.get("p2_bb_axis_effective", "自動")
+    bb_head = _axis_text(bb_ax, mix)
+    bb_val  = str(st.session_state.get("p2_bb_state", "未選択") or "").strip()
+
+    def _bb_autofill_fragment(bb_axis_eff: str) -> str:
+        try:
+            pair_label = st.session_state.get("pair", "ドル円")
+            t1d, t4h = _tickers_for(pair_label)
+            sym = t1d
+            axu = str(bb_axis_eff or "").upper()
+            if ("H4" in axu) or ("4" in axu):
+                sym = t4h
+            h1, h4, d1 = ta_block(sym, days=120)
+            df = d1 if sym == t1d else h4
+            close = float(df["Close"].iloc[-1])
+            up    = float(df["BB_up"].iloc[-1])
+            dn    = float(df["BB_dn"].iloc[-1])
+            mid   = float(df["SMA20"].iloc[-1]) if "SMA20" in df.columns else (up + dn) / 2.0
+            width = max(1e-9, (up - dn))
+            pos = (close - mid) / width
+            if pos >= 0.40:  return "ボリンジャーバンド+2σ 付近での推移。"
+            if pos <= -0.40: return "ボリンジャーバンド-2σ 付近での推移。"
+            return "中心線に向けての回帰。"
+        except Exception:
+            return ""
+
+    if bb_val and bb_val != "未選択":
+        if "上方向のバンドウォーク" in bb_val:
+            core = "ボリンジャーバンド+3σ に沿ってのバンドウォーク。"
+        elif "下方向のバンドウォーク" in bb_val:
+            core = "ボリンジャーバンド-3σ に沿ってのバンドウォーク。"
+        elif "上限付近" in bb_val:
+            core = "ボリンジャーバンド+2σ 付近での推移。"
+        elif "下限付近" in bb_val:
+            core = "ボリンジャーバンド-2σ 付近での推移。"
+        elif "中心線付近" in bb_val:
+            core = "中心線に向けての回帰。"
+        elif "収縮" in bb_val:
+            core = "ボリンジャーバンドの収縮。"
+        elif "拡大" in bb_val:
+            core = "ボリンジャーバンドの拡大。"
+        else:
+            core = ""
+        if core:
+            bb_sentence = (bb_head + core) if bb_head else core
+        if core in ("ボリンジャーバンドの拡大。", "ボリンジャーバンドの収縮。"):
+            if all(x not in bb_sentence for x in ("+2σ", "-2σ", "中心線")):
+                extra = _bb_autofill_fragment(bb_ax)
+                if extra:
+                    bb_sentence = _append_once(bb_sentence, extra)
+
+    # 旧表現の除去（保険）
+    out = re.sub(r"(?:^|。)\s*20/200の[^。]*。", "。", out).strip()
+    out = re.sub(r"(?:^|。)\s*ボリンジャーバンド\([^。]*\)[^。]*。", "。", out).strip()
+    out = re.sub(r"\(±?2σ\)|（±?2σ）", "", out).strip()
+
+    # 合流
+    for frag in [ma_sentence, rsi_sentence, bb_sentence]:
+        out = _append_once(out, frag)
+
+    # 未選択/結び/重複の掃除（従来通り）
+    out = re.sub(r"(?:^|。)\s*[^。]*未選択[^。]*。", "。", out).strip()
+    out = re.sub(r"(?:^|。)\s*(方向性を見極めたい|方向感を見極めたい|行方を注視したい|値動きには警戒したい)[。]?", "。", out).strip()
+    parts = [p for p in re.split(r"。+", out) if p.strip()]
+    seen, uniq = set(), []
+    for p in parts:
+        k = re.sub(r"\s+", "", p)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(p.strip())
+    out = "。".join(uniq).strip()
+
+    # ---- ★NEW：ここでフロー整形をかける ----
+    out = _p2_flow_polish(out)
+
+    # 時間軸規律（従来通り）
+    if out:
+        first = re.split(r"。+", out)[0]
+        if mix == "日足のみ":
+            first = re.sub(r"、\s*4時間足は[^。]*", "", first)
+            rest  = re.sub(r"(?:^|。)\s*4時間足は[^。]*。", "。", out[len(first):]).strip("。")
+            out   = (first + "。") + (rest + "。" if rest else "")
+        elif mix == "4時間足のみ":
+            def _coarse(x: str) -> str:
+                s2 = str(x or "")
+                if "アップ" in s2: return "上向き"
+                if "ダウン" in s2: return "下向き"
+                return "横ばい"
+            first = re.sub(r"日足は([^、。]+)", lambda m: f"日足は{_coarse(m.group(1))}", first, count=1)
+            out_parts = [first] + re.split(r"。+", out)[1:]
+            out = "。".join([p for p in out_parts if p]).strip()
+            if out and not out.endswith("。"):
+                out += "。"
+
+    # 結び（従来通り1本）
+    try:
+        p1_ctx = (st.session_state.get("p1_ui_preview_text")
+                  or st.session_state.get("para1_text") or "")
+        closer = choose_para2_closer(str(p1_ctx), out)
+    except Exception:
+        closer = "方向性を見極めたい。"
+    out = re.sub(r"(?:^|。)\s*(方向性を見極めたい|方向感を見極めたい|行方を注視したい|値動きには警戒したい)[。]?\s*$", "", out).rstrip("。")
+    out = (out + "。" if out else "") + (closer if closer.endswith("。") else closer + "。")
+
+    # ========== 3) 句点の二重化などを軽く正規化 ==========
+    out = _final_polish_and_guard(out, para="p2")
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---- NEW: 段落② 専用・固定表記ロック（サンプル準拠） ----
+def _p2_style_lock(text: str) -> str:
+    """
+    段落②の最終文に対して“表記だけ”をサンプル準拠へ揃えるロック。
+    ※ 生成内容・構造は触らない。語句の表記ゆれ統一のみ。
+    - RSI: 「RSI(14)」へ統一（全角/半角やスペース・括弧ゆれを吸収）
+    - 軸表記: (日足)/(4時間足) を 全角括弧 に統一
+    - BB: どんな書き方でも「ボリンジャーバンド(20, ±2σ)」に統一
+          「…の拡大/収縮」→「…は拡大型/収縮気味」に正規化
+    """
+    import re
+
+    s = str(text or "")
+
+    # --- RSI(14) の統一（表記ゆれ吸収）
+    # 例: "RSI 14" "RSI（14）" "RSI( 14 )" など → "RSI(14)"
+    s = re.sub(r"RSI\s*[（(]?\s*14\s*[)）]?", "RSI(14)", s)
+
+    # --- 軸表記の括弧を全角へ
+    s = s.replace("(日足)", "（日足）").replace("(4時間足)", "（4時間足）")
+
+    # --- 既存のBB表記を一旦 正規形へ寄せる（(20, ±2σ) に統一）
+    # 1) すでに括弧付きだが表記ゆれしているもの
+    s = re.sub(r"ボリンジャーバンド\s*[（(]\s*20\s*[,，]?\s*±?\s*2\s*σ\s*[)）]", "ボリンジャーバンド(20, ±2σ)", s)
+    s = re.sub(r"ボリンジャーバンド\s*[（(]\s*±?\s*2\s*σ\s*[)）]",               "ボリンジャーバンド(20, ±2σ)", s)
+    s = re.sub(r"ボリンジャーバンド\s*[（(]\s*20\s*[)）]",                         "ボリンジャーバンド(20, ±2σ)", s)
+
+    # 2) 括弧が無い or 直後が括弧でないものには (20, ±2σ) を付与
+    #    （すでに括弧が続くケースは上の置換で正規化済みなので除外）
+    s = re.sub(r"ボリンジャーバンド(?!\s*[（(])", "ボリンジャーバンド(20, ±2σ)", s)
+
+    # 3) 「…の拡大/収縮」をサンプル準拠の述語に整形
+    s = re.sub(r"ボリンジャーバンド\(20, ±2σ\)の拡大", "ボリンジャーバンド(20, ±2σ)は拡大型", s)
+    s = re.sub(r"ボリンジャーバンド\(20, ±2σ\)の収縮", "ボリンジャーバンド(20, ±2σ)は収縮気味", s)
+
+    # 4) 述語の微表記ゆれ（「拡大。」→「拡大型。」等）を補正
+    s = re.sub(r"ボリンジャーバンド\(20, ±2σ\)は拡大([。])",    r"ボリンジャーバンド(20, ±2σ)は拡大型\1", s)
+    s = re.sub(r"ボリンジャーバンド\(20, ±2σ\)は収縮([。])",    r"ボリンジャーバンド(20, ±2σ)は収縮気味\1", s)
+    s = re.sub(r"ボリンジャーバンド\(20, ±2σ\)\s*拡大",         "ボリンジャーバンド(20, ±2σ)は拡大型", s)
+    s = re.sub(r"ボリンジャーバンド\(20, ±2σ\)\s*収縮",         "ボリンジャーバンド(20, ±2σ)は収縮気味", s)
+
+    # 5) 軽い重複ガード： "...(20, ±2σ)(20, ±2σ)..." のような事故の連結を1つに
+    s = re.sub(r"\(20, ±2σ\)\(20, ±2σ\)", "(20, ±2σ)", s)
+
+    return s
+
+# ---- /固定表記ロック ----
+
+
+
+# ---- 段落② 最終表示前サニタイザ（重複/フィラー/結び整理・強化版）----
+def _p2_scrub_redundancy(text: str) -> str:
+    import re
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    # 句点の軽い正規化
+    s = re.sub(r"[。]+\s*", "。", s).strip()
+
+    # 1) 本文中に紛れた「結び」系を一旦すべて除去（最後に1回だけ付け直す）
+    closer_pat = r"(?:方向感を見極めたい|方向性を見極めたい|行方を注視したい|値動きには警戒したい|当面は静観としたい)"
+    s = re.sub(rf"(?:^|。)\s*{closer_pat}[。]?", "。", s).strip()
+
+    # 2) 機械感の強い定型フィラーの重複を抑止
+    #    （同義・表記ゆれを吸収するゆるめのパターン）
+    filler_pat = (
+        r"短期は[^。]{0,120}?(?:20SMA|20SMAや|20MA|ボリンジャーバンド)[^。]{0,120}?"
+        r"(?:過度[^。]{0,40}?方向感[^。]{0,40}?決めつけない[^。]{0,40}?構えとしたい)"
+    )
+    had_filler = bool(re.search(filler_pat, s))
+    # いったん全文から当該フィラーを除去（複数あっても全部消す）
+    s = re.sub(rf"(?:^|。)\s*(?:{filler_pat})[。]?", "。", s).strip()
+
+    # 3) 文単位の重複削除（空白差無視・順序保持）
+    parts = [p for p in re.split(r"。+", s) if p.strip()]
+    seen, uniq = set(), []
+    for p in parts:
+        key = re.sub(r"\s+", "", p)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p.strip())
+    s = "。".join(uniq).strip()
+
+    # 4) もしフィラーが元文に存在していた場合のみ、規定文面で1回だけ末尾へ再配置
+    #    （結び文の直前に置く／同文が既にあれば何もしない）
+    canonical_filler = "短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。"
+    if had_filler and (re.sub(r"\s+", "", canonical_filler) not in re.sub(r"\s+", "", s)):
+        s = s.rstrip("。")
+        s = (s + "。") if s else ""
+        s += canonical_filler
+
+    # 5) 最後に結びを1本だけ付与（サンプル準拠：既存ヘルパを利用）
+    try:
+        p1_ctx = (st.session_state.get("p1_ui_preview_text")
+                  or st.session_state.get("para1_text") or "")
+        closer = choose_para2_closer(str(p1_ctx), s)  # 内部で安全フォールバック
+    except Exception:
+        closer = "方向感を見極めたい。"
+
+    # 念のため、末尾に残っている結び系を落としてから付け直す
+    s = re.sub(rf"(?:^|。)\s*{closer_pat}[。]?\s*$", "", s).rstrip("。")
+    s = (s + "。") if s else ""
+    s += closer if closer.endswith("。") else closer + "。"
+
+    # 6) 句点の二重化など最終正規化
+    s = re.sub(r"([。])\1+", r"\1", s).strip()
+    # ← ここで表記ゆれをサンプル準拠にロック
+    try:
+        s = _p2_style_lock(s)
+    except Exception:
+        # 万一エラーでも本文生成を止めない
+        pass
+    return s
+# ---- /サニタイザここまで ----
+
+def _final_para2_sanitize(s: str) -> str:
+    """
+    段落②の最終直前でだけかけるサニタイザ。
+    - 「短期は20SMA…構えとしたい。」の多発を1回に圧縮
+    - 「RSI(14)は50前後。」や「ボリンジャーバンド(20, ±2σ)は拡大型。」等の重複行を除去
+    - 文単位で NFKC 正規化＋空白除去キーによる厳格重複排除
+    - 結び（行方を注視したい／値動きには警戒したい／方向感(性)を見極めたい／当面は静観としたい）を末尾に1本だけ残す
+    """
+    import re, unicodedata
+    if not s:
+        return s
+
+    s = s.strip()
+
+    # 軽い句点統一
+    s = re.sub(r"([。])\1+", r"\1", s)
+
+    # よく重複する定型文を1回に圧縮
+    boiler = r"短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。"
+    s = re.sub(rf"(?:{boiler})\s*(?:{boiler})+", boiler, s)
+
+    # RSI / BB の同内容重複を後勝ちで抑制（前方の重複を削除）
+    s = re.sub(
+        r"(?:、\s*)?RSI\(14\)は(?:70接近|60台|50前後|40〜50|30台|30接近|30割れ)(?:。|、)?(?=.*RSI\(14\)は)",
+        "",
+        s,
+    )
+    s = re.sub(
+        r"(?:、\s*)?ボリンジャーバンド\(20,\s*±2σ\)は(?:拡大型|収縮気味)(?:。|、)?(?=.*ボリンジャーバンド\(20,\s*±2σ\)は)",
+        "",
+        s,
+    )
+
+    # 文単位の厳格重複排除（NFKC→空白除去→句点除去で同一判定）
+    parts = [p for p in re.split(r"。+", s) if p.strip()]
+    seen, uniq = set(), []
+    for p in parts:
+        key = unicodedata.normalize("NFKC", re.sub(r"\s+", "", p))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p.strip())
+
+    # 結びを末尾に1本だけ残す
+    closers = (
+        "方向感を見極めたい",
+        "方向性を見極めたい",
+        "行方を注視したい",
+        "値動きには警戒したい",
+        "当面は静観としたい",
+    )
+    body = [p for p in uniq if p not in closers]
+    tail = next((p for p in reversed(uniq) if p in closers), None)
+    if tail:
+        uniq = body + [tail]
+
+    s = "。".join(uniq) + "。"
+
+    # 最終の句読点整形
+    s = re.sub(r"([。])\1+", r"\1", s).strip()
+    return s
+
+
+def _compose_para2_preview_mix() -> str:
+    """
+    段落②プレビューの確定文（UI選択＋手入力＋BP短句を統合、重複は抑制）。
+    - ベース: _compose_para2_preview_from_ui()
+    - 追記: MA(20/200), BB(20,±2σ), RSI(14)（UI/手入力のどちらでも拾う）
+    - BP短句: 上/下のいずれか（両方あれば両方）を1本だけ追加
+    - 既に含まれる表現は二重にしない（簡易デデュープ）
+    """
+    import re
+
+    # ---------- 1) ベース（UIプレビュー素文） ----------
+    try:
+        base = _compose_para2_preview_from_ui()
+    except Exception:
+        pair = str(st.session_state.get("pair", "") or "")
+        d1   = st.session_state.get("d1_imp", "横ばい")
+        h4   = st.session_state.get("h4_imp", "横ばい")
+        base = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+    base = (base or "").strip()
+
+    # ---------- 2) session_state から柔軟に値を拾うユーティリティ ----------
+    def _ss_pick(keys=None, substrings=None, default=""):
+        """
+        keys: 優先して見るキーの配列（順番重視）
+        substrings: 見当たらない時に、キー名に含まれる部分文字列で総当り検索
+        """
+        ss = st.session_state
+        # 第一優先: 明示キー
+        if keys:
+            for k in keys:
+                v = ss.get(k)
+                if v is None: 
+                    continue
+                if isinstance(v, (list, tuple)) and v:
+                    v = v[0]
+                s = str(v).strip()
+                if s:
+                    return s
+        # 第二優先: 部分一致検索
+        if substrings:
+            subs = [s.lower() for s in substrings]
+            for k, v in ss.items():
+                if not isinstance(k, str):
+                    continue
+                kl = k.lower()
+                if all(sub in kl for sub in subs):
+                    if v is None:
+                        continue
+                    if isinstance(v, (list, tuple)) and v:
+                        v = v[0]
+                    s = str(v).strip()
+                    if s:
+                        return s
+        return default
+
+    def _axis_label(raw: str) -> str:
+        s = str(raw or "").upper()
+        if "H4" in s or "4" in s:
+            return "4時間足"
+        return "日足"  # 既定はD1扱い
+
+        # ---------- 3) MA / BB / RSI を拾って短句を作る（UI・手入力両対応） ----------
+    # 軸の解決（自動→D1/H4）
+    ma_axis  = _resolve_axis("p2_ma_axis",  category="MA")
+    bb_axis  = _resolve_axis("p2_bb_axis",  category="BB")
+    rsi_axis = _resolve_axis("p2_rsi_axis", category="RSI")
+
+    def _axis_label_jp(ax: str) -> str:
+        return "日足" if ax.upper() == "D1" else "4時間足"
+
+    # === MA(20↔200)
+    ma_state = _ss_pick(
+        keys=["p2_ma_state","ma_state","ma_cross_state","p2_ma_manual","ma_state_select","ma_manual","gc_state"],
+        substrings=["gc","ma","state","cross"],
+        default=""
+    )
+    # 自動補完（未選択なら推定）
+    if not ma_state and st.session_state.get("p2_auto_complete", True):
+        try:
+            pair_label = st.session_state.get("pair", "ドル円")
+            t1d, t4h = _tickers_for(pair_label)
+            sym = t1d if ma_axis == "D1" else t4h
+            h1, h4, d1 = ta_block(sym, days=180)
+            df = d1 if ma_axis == "D1" else h4
+            s20 = df["SMA20"].iloc[-60:]
+            s200 = df["SMA200"].iloc[-60:]
+            diff = (s20 - s200)
+            sign = (diff > 0).astype(int) - (diff < 0).astype(int)
+            cross_points = (sign.diff().fillna(0) != 0)
+            last_cross_idx = diff.index[cross_points][-1] if cross_points.any() else None
+            if last_cross_idx is not None:
+                recent_bars = (len(diff) - list(diff.index).index(last_cross_idx))
+                if diff.iloc[-1] > 0:
+                    ma_state = "ゴールデンクロス（短期20MAが長期200MAを上抜け）"
+                elif diff.iloc[-1] < 0:
+                    ma_state = "デッドクロス（短期20MAが長期200MAを下抜け）"
+                else:
+                    ma_state = ""
+            # 時制（直近/少し前/過去）は短句に含めず、本文のマクロ側で吸収
+        except Exception:
+            pass
+
+    ma_sentence = ""
+    if ma_state:
+        ma_sentence = f"20/200の{('ゴールデンクロス' if 'ゴールデン' in ma_state else 'デッドクロス') if ('ゴールデン' in ma_state or 'デッド' in ma_state) else '関係'}を{_axis_label_jp(ma_axis)}で確認。"
+
+    # === RSI(14)
+    rsi_state = _ss_pick(
+        keys=["p2_rsi_state","rsi_state","p2_rsi_manual","rsi_manual","rsi_state_select"],
+        substrings=["rsi","state"],
+        default=""
+    )
+    if not rsi_state and st.session_state.get("p2_auto_complete", True):
+        try:
+            pair_label = st.session_state.get("pair", "ドル円")
+            t1d, t4h = _tickers_for(pair_label)
+            sym = t1d if rsi_axis == "D1" else t4h
+            h1, h4, d1 = ta_block(sym, days=120)
+            df = d1 if rsi_axis == "D1" else h4
+            val = float(df["RSI"].iloc[-1])
+            if val >= 67:   rsi_state = "70接近"
+            elif val <= 33: rsi_state = "30接近"
+            else:           rsi_state = "50前後"
+        except Exception:
+            pass
+    rsi_sentence = f"RSI(14)は{rsi_state}。" if rsi_state else ""
+
+    # === ボリンジャーバンド(20, ±2σ)
+    bb_state = _ss_pick(
+        keys=["p2_bb_state","bb_state","p2_bb_manual","bb_manual","bb_state_select"],
+        substrings=["bb","state"],
+        default=""
+    )
+    if not bb_state and st.session_state.get("p2_auto_complete", True):
+        try:
+            pair_label = st.session_state.get("pair", "ドル円")
+            t1d, t4h = _tickers_for(pair_label)
+            sym = t1d if bb_axis == "D1" else t4h
+            h1, h4, d1 = ta_block(sym, days=120)
+            df = d1 if bb_axis == "D1" else h4
+            close = df["Close"].iloc[-1]; up = df["BB_up"].iloc[-1]; dn = df["BB_dn"].iloc[-1]; mid = df["SMA20"].iloc[-1]
+            width = (up - dn) / mid if mid else 0.0
+            pos = (close - mid) / (up - dn) if (up != dn) else 0.0
+            if width < 0.01:              bb_state = "収縮（バンド幅が狭い＝ボラ低下）"
+            elif pos >= 0.40:             bb_state = "上限付近（価格が上バンドに接近）"
+            elif pos <= -0.40:            bb_state = "下限付近（価格が下バンドに接近）"
+            else:                         bb_state = "中心線付近（価格がミドルバンド付近）"
+        except Exception:
+            pass
+    bb_sentence = f"ボリンジャーバンド(±2σ)は{('拡大型' if '拡大' in bb_state else '収縮気味' if '収縮' in bb_state else '中心線付近' if '中心線' in bb_state else '上限付近' if '上限' in bb_state else '下限付近' if '下限' in bb_state else '観測')}（{_axis_label_jp(bb_axis)}）。" if bb_state else ""
+
+
+    # ---------- 4) 重複を避けながら base に付け足す ----------
+    def _append_once(text: str, add: str) -> str:
+        t = (text or "").strip()
+        a = (add or "").strip()
+        if not a:
+            return t
+        # 空白を無視した包含チェックで重複を抑止
+        if a.replace(" ", "") in t.replace(" ", ""):
+            return t
+        if t and not t.endswith("。"):
+            t += "。"
+        return t + a
+
+    base = _append_once(base, ma_sentence)
+    base = _append_once(base, rsi_sentence)
+    base = _append_once(base, bb_sentence)
+
+    # ---------- 5) ブレークポイント短句を1本だけ追加 ----------
+    bp_sentence = ""
+    try:
+        # 既存の _bp_sentence_mix を利用（あなたの環境のキー優先順に対応）
+        _bp_sent, dbg = _bp_sentence_mix()
+        bp_sentence = _bp_sent or ""
+        # デバッグ表示（任意）
+        if st.session_state.get("show_debug", False):
+            st.write("DEBUG_BP_PICK:", dbg)
+    except Exception:
+        pass
+
+    base = _append_once(base, bp_sentence)
+
+    # ---------- 6) 仕上げ：句点正規化＋簡易デデュープ ----------
+    base = base.strip()
+    # 連続句点を1つに
+    base = re.sub(r"。{2,}", "。", base)
+
+    # 文単位の重複削除（順序保持）
+    parts = [p for p in re.split(r"。+", base) if p]
+    seen = set()
+    uniq = []
+    for p in parts:
+        key = p.replace(" ", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    base = "。".join(uniq).strip() + "。"
+
+    return _p2_merge_indicators(base)
+
+
+
+# --- D1/H4 の数値も段落②用キーに同期（文章が読む名前へコピー） ---
+st.session_state["p2_bp_d1_upper"] = st.session_state.get("bp_d1_up")
+st.session_state["p2_bp_d1_lower"] = st.session_state.get("bp_d1_dn")
+st.session_state["p2_bp_h4_upper"] = st.session_state.get("bp_h4_up")
+st.session_state["p2_bp_h4_lower"]  = st.session_state.get("bp_h4_dn")
+
+# ---- どの時間軸の値を本文で使うか（既存ラジオの選択を読む） ----
+_choice = st.session_state.get("bp_apply_mode", "自動（基準に合わせる）")
+_axis_map = {"自動（基準に合わせる）": "AUTO", "日足のみを使う": "D1", "4時間足のみを使う": "H4"}
+st.session_state["p2_bp_axis"] = _axis_map.get(_choice, "AUTO")
+
+st.write("DEBUG:", {
+    "p2_bp_upper": st.session_state.get("p2_bp_upper"),
+    "p2_bp_lower": st.session_state.get("p2_bp_lower"),
+    "p2_bp_axis":  st.session_state.get("p2_bp_axis"),
+})
+# --- FIX: _compose_para2_preview_mix を呼ぶ前に必ず定義しておく（未定義時のみ） ---
+if "_decimals_from_pair" not in globals():
+    def _decimals_from_pair(pair_label: str) -> int:
+        s = (pair_label or "")
+        return 2 if ("JPY" in s.upper() or "円" in s) else 4
+
+if "_first_num" not in globals():
+    def _first_num(*vals):
+        """先に見つかった有効な数値を返す（0以下やNaNは除外）。list/tuple/文字列/NumPyにも耐性。"""
+        import math
+        for v in vals:
+            try:
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple)) and v:
+                    v = v[0]
+                x = float(str(v).replace(",", "").strip())
+                if math.isfinite(x) and x > 0:
+                    return x
+            except Exception:
+                pass
+        return None
+
+if "_bp_sentence_mix" not in globals():
+    def _bp_sentence_mix():
+        """
+        プレビュー用のBP文を作る。
+        優先（上）: D1 -> H4 -> 共通
+        優先（下）: H4 -> D1 -> 共通
+        """
+        mix = st.session_state.get("tf_mix_mode", "両方（半々）")
+
+        def _allow_d1() -> bool:
+            return mix in ("日足のみ", "両方（半々）")
+
+        def _allow_h4() -> bool:
+            return mix in ("4時間足のみ", "両方（半々）")
+
+        ss = st.session_state
+        up_val = _first_num(
+            ss.get("p2_bp_d1_upper"), ss.get("bp_d1_up"),
+            ss.get("p2_bp_h4_upper"), ss.get("bp_h4_up"),
+            ss.get("p2_bp_upper"),    ss.get("bp_up"),
+        )
+        dn_val = _first_num(
+            ss.get("p2_bp_h4_lower"), ss.get("bp_h4_dn"),
+            ss.get("p2_bp_d1_lower"), ss.get("bp_d1_dn"),
+            ss.get("p2_bp_lower"),    ss.get("bp_dn"),
+        )
+
+        pair = str(ss.get("pair", "") or "")
+        decimals = _decimals_from_pair(pair)
+        fmt = f"{{:.{decimals}f}}"
+
+        debug = {
+            "up": up_val, "dn": dn_val, "pair": pair, "decimals": decimals,
+            "used_order_up":  ["p2_bp_d1_upper","bp_d1_up","p2_bp_h4_upper","bp_h4_up","p2_bp_upper","bp_up"],
+            "used_order_down":["p2_bp_h4_lower","bp_h4_dn","p2_bp_d1_lower","bp_d1_dn","p2_bp_lower","bp_dn"],
+        }
+
+        if up_val is None and dn_val is None:
+            return "", debug
+        if up_val is not None and dn_val is not None:
+            sent = f"{fmt.format(up_val)}付近の上抜け／{fmt.format(dn_val)}付近割れのどちらに傾くかを見極めたい。"
+        elif up_val is not None:
+            sent = f"{fmt.format(up_val)}付近の上抜けの有無をまず確かめたい。"
+        else:
+            sent = f"{fmt.format(dn_val)}付近割れの可否をまず確認したい。"
+        return sent, debug
+
+if "_compose_para2_preview_mix" not in globals():
+    def _compose_para2_preview_mix() -> str:
+        """UIプレビューの素文 + BP短句（必要なら）を返し、session_stateにも保存。"""
+        # 1) UI生成のベース文
+        try:
+            base = _compose_para2_preview_from_ui()
+        except Exception:
+            pair = str(st.session_state.get("pair", "") or "")
+            d1   = st.session_state.get("d1_imp", "横ばい")
+            h4   = st.session_state.get("h4_imp", "横ばい")
+            base = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+
+        # 2) BP短句（数値）を必要なら付与
+        bp_sentence, dbg = _bp_sentence_mix()
+        if st.session_state.get("show_debug", False):
+            st.write("DEBUG_BP_PICK:", dbg)
+        if bp_sentence and (bp_sentence not in base):
+            base = (base.rstrip("。") + "。" if base else "") + bp_sentence
+
+        # 3) Step6 でも同じ文を使えるよう保存（ヘルパーがあれば合流）
+        merged = _p2_merge_indicators(base) if "_p2_merge_indicators" in globals() else base
+        st.session_state["p2_ui_preview_text"] = merged
+        return merged
+
+# --- /FIX ---
+
+# ---- / 段落②（プレビュー：新ロジック） ----
+# --- 段落②（プレビュー：新ロジック）SOTエクスポート ---
+try:
+    _p2_preview = _compose_para2_preview_mix()  # ※ここはBP短句も含む“最終に近いプレビュー文”
+except Exception:
+    try:
+        _p2_preview = _compose_para2_preview_from_ui()  # フォールバック：素文
+    except Exception:
+        pair = str(st.session_state.get("pair", "") or "")
+        d1   = st.session_state.get("d1_imp", "横ばい")
+        h4   = st.session_state.get("h4_imp", "横ばい")
+        _p2_preview = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+
+# 句点を1つに正規化
+_p2_preview = (_p2_preview or "").strip().rstrip("。") + "。"
+
+# ← 以降どのセクションからも“同じ文”にアクセスできるよう固定
+st.session_state["p2_ui_preview_text"] = _p2_preview  # 推奨：session_state
+globals()["_para2_preview"] = _p2_preview            # 互換：既存コードが見る可能性に対応
+
+# === 段落②プレビュー（確定文をSOTに保存して、以後のSOTに統一）===
+preview_text = _compose_para2_preview_mix()
+# 句点を1つに正規化
+preview_text = (preview_text or "").strip().rstrip("。") + "。"
+
+# SOTへ保存（Step6/編集欄の初期値がこれを参照）
+st.session_state["p2_ui_preview_text"] = preview_text
+globals()["_para2_preview"] = preview_text
+
+# 表示（読み取り専用）
+st.text_area(
+    "生成結果（読み取り専用・BP反映版）",
+    value=preview_text,
+    height=140,
+    disabled=True
+)
+
+
+# SOTに保存（句点は1つに正規化）
+st.session_state["p2_ui_preview_text"] = (preview_text or "").strip().rstrip("。") + "。"
+globals()["_para2_preview"] = st.session_state["p2_ui_preview_text"]
+
+
+
+st.radio(
+    "本文に反映するブレークポイントの時間軸",
+    ["自動（基準に合わせる）", "日足のみを使う", "4時間足のみを使う"],
+    horizontal=True,
+    key="bp_apply_mode",
+    help="時間軸別に値を入れたときの反映対象。『自動』は上の『時間軸の使い方』に合わせます。未入力なら共通ブレークポイントを使います。"
+)
+
+# --- bridge: ラジオ選択を段落②用の軸キーに同期 ---
+_axis_map = {"自動（基準に合わせる）": "AUTO", "日足のみを使う": "D1", "4時間足のみを使う": "H4"}
+st.session_state["p2_bp_axis"] = _axis_map.get(st.session_state.get("bp_apply_mode"), "AUTO")
+
+
+# ==== 文体仕上げ：句頭の連続回避 & 連続文の簡易重複除去 ====
+import re
+
+_OPENERS_ROTATION = ("短期は", "目先は", "当面は", "直近では")
+
+def _avoid_repeated_openers(text: str) -> str:
+    """
+    - 隣接する同一文を除去
+    - 文頭の「短期は」が連続する場合、2回目以降をローテーションで言い換え
+    - 句点の直後だけでなく改行や空白を挟んだケースも検知
+    """
+    t = (text or "").strip().replace("。。", "。")
+
+    # 1) 隣接する同一文の除去（句点/ピリオド/改行でざっくり分割）
+    sents = [s.strip() for s in re.split(r"[。\.]\s*", t) if s.strip()]
+    dedup = []
+    for s in sents:
+        if dedup and dedup[-1] == s:
+            continue
+        dedup.append(s)
+    t = "。".join(dedup)
+    if not t.endswith("。"):
+        t += "。"
+
+    # 2) 「短期は」の句頭連発をローテーションで置換
+    idx = 0
+    def repl(m):
+        nonlocal idx
+        idx += 1  # 1回目はそのまま、2回目以降はローテ
+        word = _OPENERS_ROTATION[min(idx - 1, len(_OPENERS_ROTATION) - 1)]
+        return f"{m.group(1)}{word}"
+
+    # 句頭（行頭）/ 句点 / 改行の直後に空白を挟んでもマッチ
+    pattern = re.compile(r'(^|[。\n\r])\s*短期は')
+    t = pattern.sub(repl, t)
+
+    return t.replace("。。", "。")
+
+
+
+# 文字数ガード（180〜210字に収める）
+# 文字数ガード（締めを1つだけ残しつつ、180〜210字に収める）
+def _enforce_length_bounds(text: str, min_len: int = 180, max_len: int = 210) -> str:
+    t = (text or "").replace("。。", "。").strip()
+    if not t:
+        return t
+    if not t.endswith("。"):
+        t += "。"
+
+    # 文に分割
+    sents = [s for s in t.split("。") if s]
+    # 末尾の「締め」候補（_CLOSE_STEMS に合致）を検出
+    close_idx = -1
+    for i, s in enumerate(sents):
+        if any(stem in s for stem in _CLOSE_STEMS):
+            close_idx = i
+    # 末尾の締めを最後に1つだけ残す（存在しない場合はそのまま）
+    if close_idx != -1:
+        closer = sents[close_idx]
+        sents = [s for j, s in enumerate(sents) if not any(stem in s for stem in _CLOSE_STEMS)]
+        sents.append(closer)
+
+    def join(ss):
+        out = "。".join(ss)
+        if not out.endswith("。"):
+            out += "。"
+        return out
+
+    # 180字未満なら、締めの"直前"にだけ安全な補助文を差し込む（最大2文）
+    fillers = [
+        "移動平均線周辺の反応を確かめつつ様子を見たい",
+        "節目水準の手前では反応がぶれやすい",
+        "指標通過後の方向性を見極めたい",
+        "短期は値動きの粗さに留意したい",
+    ]
+    # 決定論的な開始位置（同じ日×同じペアで同じ順になり機械感を抑制）
+    start = 0
+    try:
+        start_pick = _stable_pick(list(range(len(fillers))), category="pad")
+        start = fillers.index(start_pick) if isinstance(start_pick, str) and (start_pick in fillers) else 0
+    except Exception:
+        start = 0
+
+    add_cnt = 0
+    while len(join(sents)) < min_len and add_cnt < 2:
+        # まだ入れていない候補を順に
+        cand = fillers[(start + add_cnt) % len(fillers)]
+        if cand not in sents:
+            # 締めの直前に差し込み（締めを押し下げる）
+            if close_idx != -1 or (sents and any(stem in sents[-1] for stem in _CLOSE_STEMS)):
+                sents.insert(len(sents) - 1, cand)
+            else:
+                sents.append(cand)
+            add_cnt += 1
+        else:
+            add_cnt += 1  # 念のためループ前進
+
+    out = join(sents)
+
+    # 長すぎる場合は、締め以外の末尾文から落として調整
+    if len(out) > max_len:
+        trimmed = [s for s in sents]
+        # 締め文を退避
+        closer_final = None
+        if trimmed and any(stem in trimmed[-1] for stem in _CLOSE_STEMS):
+            closer_final = trimmed.pop()
+        # 末尾から1文ずつ間引き
+        while trimmed and len(join(trimmed + ([closer_final] if closer_final else []))) > max_len:
+            trimmed.pop()
+        if closer_final:
+            trimmed.append(closer_final)
+        out = join(trimmed) if trimmed else out[:max_len] + "。"
+
+    return out
+
+# ==== 語彙バリエーション（導入文専用 v1） ====
+def _stable_pick(cands, category="intro"):
+    """
+    候補リストから『通貨ペア×日付×カテゴリ』で決定論的に1つ選ぶ。
+    同じ日・同じペアなら同じ表現になる（機械感を抑えつつ再現性を確保）。
+    """
+    try:
+        pair = str(st.session_state.get("pair", "") or "")
+    except Exception:
+        pair = ""
+    # 日付は session_state の asof（あれば）を優先、無ければ今日
+    try:
+        asof = str(st.session_state.get("asof_date", "")) or __import__("datetime").date.today().isoformat()
+    except Exception:
+        asof = "1970-01-01"
+    seed = f"{pair}|{asof}|{category}"
+    import hashlib
+    h = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16)
+    return cands[h % len(cands)] if cands else ""
+
+# D1/H4の組合せごとの導入文バリエーション
+# キケンな断定・売買助言は一切含めません
+_LEX_INTRO = {
+    ("up", "up"): [
+        "日足・4時間足とも上方向が優勢。",
+        "日足・4時間足そろって上向きが意識される。",
+        "日足・4時間足ともに上値を試しやすい。",
+        "日足・4時間足で上向きが続きやすい流れ。"
+    ],
+    ("down", "down"): [
+        "日足・4時間足とも下方向が優勢。",
+        "日足・4時間足そろって下押しが意識される。",
+        "日足・4時間足ともに戻り売りが入りやすい。",
+        "日足・4時間足で下向きが続きやすい流れ。"
+    ],
+    ("flat", "flat"): [
+        "日足・4時間足ともレンジ色が濃い。",
+        "日足・4時間足とも方向感が限定的。",
+        "日足・4時間足とも様子見の展開。",
+        "日足・4時間足とも見極め待ちの局面。"
+    ],
+    ("up", "flat"): [
+        "日足は上向きが意識されやすい一方、4時間足はもみ合い。",
+        "日足は持ち直し基調、4時間足はレンジ気味。",
+        "日足は上向きが意識される半面、4時間足は方向感が乏しい。"
+    ],
+    ("down", "flat"): [
+        "日足は下押しが意識されやすい一方、4時間足はもみ合い。",
+        "日足は上値の重さが意識される半面、4時間足はレンジ気味。",
+        "日足は戻り売りが入りやすいなか、4時間足は方向感が乏しい。"
+    ],
+    ("flat", "up"): [
+        "日足は方向感を探る局面、4時間足は上向きを試す。",
+        "日足は見極め待ち、4時間足は上値トライが入りやすい。",
+        "日足はレンジ気味、4時間足は上方向がやや優勢。"
+    ],
+    ("flat", "down"): [
+        "日足は方向感を探る局面、4時間足は下押しを試す。",
+        "日足は見極め待ち、4時間足は下方向がやや優勢。",
+        "日足はレンジ気味、4時間足は戻り売りが入りやすい。"
+    ],
+    ("up", "down"): [
+        "日足は上向きが意識されやすいなか、4時間足は戻り売りが入りやすい。",
+        "日足は上向き基調、4時間足は戻りを抑えられやすい。",
+        "日足は上方向、4時間足は重さが残る。"
+    ],
+    ("down", "up"): [
+        "日足は下押しが意識されやすいなか、4時間足は戻りを試す動き。",
+        "日足は重さが意識される一方、4時間足は持ち直しを試す。",
+        "日足は下方向、4時間足は戻りが入りやすい。"
+    ],
+}
+
+# しつこさを取る整形：重複文を除去し、締め文は最大1つ、文数は最大4文に制限
+_CLOSE_STEMS = ["反応を確かめたい", "行方を見極めたい", "値動きには警戒したい", "過度な一方向は決めつけにくい"]
+
+def _tidy_para2(text: str, max_sents: int = 4) -> str:
+    t = (text or "").replace("。。", "。").strip()
+    if not t:
+        return t
+
+    # 文に分割して順序を保ったまま重複排除
+    sents = [s.strip() for s in t.split("。") if s.strip()]
+    seen = set()
+    ordered = []
+    for s in sents:
+        if s not in seen:
+            seen.add(s)
+            ordered.append(s)
+
+    # 締め文（_CLOSE_STEMS を含む文）はいったん除去し、最後に1つだけ残す
+    closer_buf = [s for s in ordered if any(stem in s for stem in _CLOSE_STEMS)]
+    body = [s for s in ordered if not any(stem in s for stem in _CLOSE_STEMS)]
+    if closer_buf:
+        body.append(closer_buf[-1])  # 最後に選ばれた締めだけ残す
+
+    # 文数の上限
+    if len(body) > max_sents:
+        body = body[:max_sents]
+
+    out = "。".join(body)
+    if not out.endswith("。"):
+        out += "。"
+    return out
+
+# ==== 為替市場リード文（FXは「為替市場は、…」/ BTC・金は従来） ====
+
+def _is_crypto_or_gold(pair_label: str) -> bool:
+    pl = (pair_label or "")
+    plu = pl.upper()
+    return (
+        ("ビットコイン" in pl) or ("仮想通貨" in pl) or ("暗号" in pl) or
+        ("BTC" in plu) or
+        ("金" in pl) or ("ゴールド" in pl) or ("XAU" in plu) or ("GOLD" in plu)
+    )
+
+# D1/H4組み合わせ別：FX向けの「為替市場は、〜」のリード候補
+_LEX_LEAD = {
+    ("up", "up"): [
+        "為替市場は、{PAIR}は上方向が優勢。",
+        "為替市場は、{PAIR}は上向きが意識される。",
+    ],
+    ("down", "down"): [
+        "為替市場は、{PAIR}は下方向が優勢。",
+        "為替市場は、{PAIR}は下押しが意識される。",
+    ],
+    ("flat", "flat"): [
+        "為替市場は、{PAIR}は方向感が限定的。",
+        "為替市場は、{PAIR}はレンジ色が濃い。",
+    ],
+    ("up", "flat"): [
+        "為替市場は、{PAIR}は上向き基調ながら短期はもみ合い。",
+    ],
+    ("down", "flat"): [
+        "為替市場は、{PAIR}は上値が重い一方で短期はもみ合い。",
+    ],
+    ("flat", "up"): [
+        "為替市場は、{PAIR}は方向感探りつつ短期は上向き。",
+    ],
+    ("flat", "down"): [
+        "為替市場は、{PAIR}は方向感探りつつ短期は下押し。",
+    ],
+    ("up", "down"): [
+        "為替市場は、{PAIR}は上値試しと戻り売りが交錯。",
+    ],
+    ("down", "up"): [
+        "為替市場は、{PAIR}は下押しのなか戻りを試す局面。",
+    ],
+}
+
+# ==== 語彙バリエーション：RSI（決定論ローテーション） ====
+_LEX_RSI = {
+    "70+": [
+        "RSIは70超で過熱感に留意",
+        "RSIは70台で短期の一服に注意",
+        "RSIは高止まりで逆方向の揺り戻しに警戒",
+    ],
+    "60-70": [
+        "RSIは60台で上向きバイアス",
+        "RSIは60台に乗せ気味で上値を試しやすい",
+        "RSIはやや強めの推移",
+    ],
+    "50": [
+        "RSIは50近辺で中立",
+        "RSIは50どころで方向感は限定的",
+        "RSIはニュートラル圏で様子見",
+    ],
+    "40-50": [
+        "RSIは40〜50台で下向きバイアス",
+        "RSIはやや弱めの推移",
+        "RSIは戻りが抑えられやすい",
+    ],
+    "30-40": [
+        "RSIは30〜40台で売られ気味",
+        "RSIは低下気味で戻りは鈍い",
+        "RSIは弱含みで上値の重さ",
+    ],
+    "30-": [
+        "RSIは30割れで売られすぎ気味",
+        "RSIは極端な低位で過熱感に留意",
+        "RSIは行き過ぎ感もあり反動には注意",
+    ],
+    "div": [
+        "RSIのダイバージェンスも意識したい",
+        "RSIが価格と逆行する兆しに留意",
+        "RSIの逆行シグナルは参考材料",
+    ],
+}
+# ==== 語彙バリエーション：ボリンジャーバンド（決定論ローテーション） ====
+_LEX_BB = {
+    "上限付近": [
+        "ボリンジャーバンド上限付近は勢いの確認材料",
+        "上バンド接近は伸びの持続性を測る材料",
+        "上側のバンドタッチは強さの裏付けに"
+    ],
+    "下限付近": [
+        "ボリンジャーバンド下限付近は勢いの確認材料",
+        "下バンド接近は下押しの強さの測りどころ",
+        "下側のバンドタッチは弱さの裏付けに"
+    ],
+    "中心線付近": [
+        "ボリンジャーバンドの中心線付近で基調を見極めたい",
+        "ミドルバンド付近で傾きの確認をしたい",
+        "中心線どころの反応をまず確かめたい"
+    ],
+    "収縮": [
+        "ボリンジャーバンドの収縮は次の振れに注意",
+        "バンドの収縮は方向性の出直しに備えたい",
+        "収縮局面はブレークの方向を見極めたい"
+    ],
+    "拡大": [
+        "ボリンジャーバンドの拡大はボラ上昇のサイン",
+        "バンド幅の拡大は値動きの荒さに留意",
+        "拡大型は一方向の行き過ぎに注意したい"
+    ],
+    "上方向のバンドウォーク": [
+        "ボリンジャーバンドの上方向バンドウォークが続くかを確認",
+        "上バンド沿いの推移が続くか注視",
+        "上側へ張り付く動きの持続性を見極めたい"
+    ],
+    "下方向のバンドウォーク": [
+        "ボリンジャーバンドの下方向バンドウォークが続くかを確認",
+        "下バンド沿いの推移が続くか注視",
+        "下側へ張り付く動きの持続性を見極めたい"
+    ],
+}
+
+# ==== 語彙バリエーション：ゴールデンクロス／デッドクロス（決定論ローテーション） ====
+_LEX_GC = {
+    "D1": {
+        "GC": [
+            "日足では20SMAが200SMAを上回り上向き基調",
+            "日足では短期20SMAが長期200SMAを上抜けるゴールデンクロス後の推移",
+            "日足はゴールデンクロス後の地合い"
+        ],
+        "DC": [
+            "日足では20SMAが200SMAを下回り下向き基調",
+            "日足では短期20SMAが長期200SMAを下抜けるデッドクロス後の推移",
+            "日足はデッドクロス後の地合い"
+        ],
+    },
+    "H4": {
+        "GC": [
+            "4時間足では20SMAが200SMAを上回り上向き基調",
+            "4時間足では短期20SMAが長期200SMAを上抜けるゴールデンクロス後の推移",
+            "4時間足はゴールデンクロス後の地合い"
+        ],
+        "DC": [
+            "4時間足では20SMAが200SMAを下回り下向き基調",
+            "4時間足では短期20SMAが長期200SMAを下抜けるデッドクロス後の推移",
+            "4時間足はデッドクロス後の地合い"
+        ],
+    },
+    "GENERIC": {
+        "GC": [
+            "20SMAが200SMAを上回り上向き基調",
+            "短期20SMAが長期200SMAを上抜けるゴールデンクロス後の推移",
+        ],
+        "DC": [
+            "20SMAが200SMAを下回り下向き基調",
+            "短期20SMAが長期200SMAを下抜けるデッドクロス後の推移",
+        ],
+    },
+}
+
+# ==== 語彙バリエーション：ブレークポイント（決定論ローテーション） ====
+_LEX_BP = {
+    "UP_ONLY": [
+        "上値{U}の上抜けを試す動きには留意したい",
+        "{U}の上抜けなら基調と整合的とみたい",
+        "{U}突破の反応をまず確かめたい",
+        "{U}をしっかり上抜けられるか注視したい",
+    ],
+    "DN_ONLY": [
+        "下値{L}の下抜けには警戒したい",
+        "{L}割れの可否をまず確認したい",
+        "{L}を維持できるかに留意したい",
+        "{L}の割れなら下押しが強まりやすい",
+    ],
+    "BOTH_NEUTRAL": [
+        "{U}の上抜け／{L}の割れのいずれに振れるか反応を確かめたい",
+        "まずは{U}の上抜けと{L}割れのどちらに傾くか見極めたい",
+        "{U}突破か{L}割れか、方向感の手掛かりを探りたい",
+    ],
+    "BOTH_UP_BIAS": [
+        "{U}の上抜けを試す動きに注目したい（下は{L}を意識）",
+        "基調に沿えば{U}上抜けの確認が焦点（{L}は下支えの目安）",
+    ],
+    "BOTH_DOWN_BIAS": [
+        "{L}の割れに警戒したい（上は{U}で戻りの強さを測りたい）",
+        "下方向に傾くなら{L}割れの可否が焦点（{U}は上値の目安）",
+    ],
+}
+
+# ==== 時間軸配分：単一時間軸用の導入文生成（既存のままでOKならそのまま） ====
+def _intro_single_frame(tf_label: str, imp: str) -> str:
+    if not isinstance(imp, str):
+        imp = "横ばい"
+    if "横ばい" in imp:
+        return f"{tf_label}はもみ合い"
+    if "強いアップ" in imp or ("アップ" in imp and "緩やか" not in imp):
+        return f"{tf_label}は上方向が優勢"
+    if "緩やかなアップ" in imp:
+        return f"{tf_label}はじり高基調"
+    if "強いダウン" in imp or ("ダウン" in imp and "緩やか" not in imp):
+        return f"{tf_label}は下方向が優勢"
+    if "緩やかなダウン" in imp:
+        return f"{tf_label}はじり安基調"
+    return f"{tf_label}は方向感が限定的"
+
+# ==== 導入文（配分反映版）: H4のみでもD1を必ず含める ====
+def _intro_from_impressions_weighted(d1_imp: str, h4_imp: str, tf_mix_mode: str) -> str:
+    # 日足のみ → 日足だけ
+    if tf_mix_mode == "日足のみ":
+        return _intro_single_frame("日足", d1_imp)
+    # 4時間足のみ → 「日足〜一方、4時間足〜」の複合（=必ずD1を含める）
+    if tf_mix_mode == "4時間足のみ":
+        return _intro_from_impressions(d1_imp, h4_imp)
+    # 両方（半々） → 従来の複合導入
+    return _intro_from_impressions(d1_imp, h4_imp)
+
+# ==== リード文（配分反映版）: 為替は「為替市場は、…」を維持 ====
+def _lead_sentence_weighted(pair_label: str, d1_imp: str, h4_imp: str, tf_mix_mode: str) -> str:
+    if _is_crypto_or_gold(pair_label):
+        return f"{pair_label}のテクニカルでは、"
+
+    def _pick(cands, key):
+        return _stable_pick(cands, category=key)
+
+    if tf_mix_mode == "日足のみ":
+        cat = _cat_trend(d1_imp)
+        table = {
+            "up":   ["為替市場は、{PAIR}は日足で上向きが意識される。", "為替市場は、{PAIR}は日足で上方向が優勢。"],
+            "down": ["為替市場は、{PAIR}は日足で下押しが意識される。", "為替市場は、{PAIR}は日足で下方向が優勢。"],
+            "flat": ["為替市場は、{PAIR}は日足で方向感が限定的。",     "為替市場は、{PAIR}は日足でレンジ色が濃い。"],
+        }
+        templ = _pick(table.get(cat, table["flat"]), f"lead:D1:{cat}")
+        return templ.replace("{PAIR}", pair_label or "主要通貨")
+
+    if tf_mix_mode == "4時間足のみ":
+        # リードは短期フォーカス、導入でD1+H4の複合を続けて補完
+        cat = _cat_trend(h4_imp)
+        table = {
+            "up":   ["為替市場は、{PAIR}は短期は上向きが意識される。", "為替市場は、{PAIR}は短期は上方向が優勢。"],
+            "down": ["為替市場は、{PAIR}は短期は下押しが意識される。", "為替市場は、{PAIR}は短期は下方向が優勢。"],
+            "flat": ["為替市場は、{PAIR}は短期は方向感が限定的。",     "為替市場は、{PAIR}は短期はレンジ色が濃い。"],
+        }
+        templ = _pick(table.get(cat, table["flat"]), f"lead:H4:{cat}")
+        return templ.replace("{PAIR}", pair_label or "主要通貨")
+
+    # 両方（半々）
+    return _lead_sentence(pair_label, d1_imp, h4_imp)
+
+
+
+def _trend_bias(d1_imp: str, h4_imp: str) -> str:
+    """D1/H4の印象から上げ/下げ/中立のバイアスを判定（超安全版）"""
+    def sc(x: str) -> int:
+        if not isinstance(x, str):
+            return 0
+        if "アップ" in x:  # 強い/緩やか含む
+            return 1
+        if "ダウン" in x:
+            return -1
+        return 0
+    s = sc(d1_imp) + sc(h4_imp)
+    if s > 0:
+        return "up"
+    if s < 0:
+        return "down"
+    return "neutral"
+
+def _bp_phrase(up_txt, dn_txt, pair_label=None, bias_tag=None) -> str:
+    """
+    ブレークポイント文を固定形に統一（語彙ローテーション/括弧付き文を廃止）。
+    - 両方あり:  "{U}付近の上抜け／{L}付近割れのどちらに傾くかを見極めたい。"
+    - 上だけ:    "{U}付近の上抜けの有無をまず確かめたい。"
+    - 下だけ:    "{L}付近割れの可否をまず確認したい。"
+    - どちらも無: 空文字
+    """
+    u = (up_txt.strip() if isinstance(up_txt, str) and up_txt else None)
+    d = (dn_txt.strip() if isinstance(dn_txt, str) and dn_txt else None)
+
+    if u and d:
+        return f"{u}付近の上抜け／{d}付近割れのどちらに傾くかを見極めたい。"
+    if u:
+        return f"{u}付近の上抜けの有無をまず確かめたい。"
+    if d:
+        return f"{d}付近割れの可否をまず確認したい。"
+    return ""
+
+
+
+def _lead_sentence(pair_label: str, d1_imp: str, h4_imp: str) -> str:
+    # BTC・金は従来の導入
+    if _is_crypto_or_gold(pair_label):
+        return f"{pair_label}のテクニカルでは、"
+
+    # FXは「為替市場は、…」で簡潔に
+    key = (_cat_trend(d1_imp), _cat_trend(h4_imp))
+    cands = _LEX_LEAD.get(key) or ["為替市場は、{PAIR}は方向感が限定的。"]
+    templ = _stable_pick(cands, category=f"lead:{key[0]}-{key[1]}")
+    return templ.replace("{PAIR}", pair_label or "主要通貨")
+
+    # ==== 文体仕上げ：句頭の連続回避 & 連続文の簡易重複除去 ====
+import re
+
+def _avoid_repeated_openers(text: str) -> str:
+    """
+    - 同一文の連続重複を除去
+    - 「短期は」が文頭で連続する場合、2回目以降を「目先は」「当面は」「直近では」に置換
+    """
+    t = (text or "").strip().replace("。。", "。")
+
+    # 1) 隣接する同一文を除去
+    sents = [s for s in t.split("。") if s != ""]
+    dedup = []
+    for s in sents:
+        if dedup and dedup[-1].strip() == s.strip():
+            continue
+        dedup.append(s)
+    t = "。".join(dedup)
+    if not t.endswith("。"):
+        t += "。"
+
+    # 2) 「短期は」の連発を言い換え
+    pattern = re.compile(r'(^|。)短期は')
+    idx = 0
+    def repl(m):
+        nonlocal idx
+        idx += 1
+        if idx == 1:
+            word = "短期は"
+        elif idx == 2:
+            word = "目先は"
+        elif idx == 3:
+            word = "当面は"
+        else:
+            word = "直近では"
+        return f"{m.group(1)}{word}"
+    t = pattern.sub(repl, t)
+
+    return t
+
+
+# ==== 段落② 最終整形（for_build 同期用） ====
+def _finalize_para2_for_build(text: str) -> str:
+    """
+    段落②を公開体裁に合わせて最終整形する。
+    手順:
+    1) 事前整形（重複/句点整理）
+    2) 句頭連発の言い換え（「短期は」→2回目以降はローテ）
+    3) 規定文字数(180–210)に収める
+    4) 仕上げの整形
+    """
+    tmp = _tidy_para2((text or "").strip())        # 1) 下ごしらえ
+    tmp = _avoid_repeated_openers(tmp)             # 2) 句頭言い換え ★重要
+    tmp = _enforce_length_bounds(tmp, 180, 210)    # 3) 文字数ガード
+    return _tidy_para2(tmp)                        # 4) 最終仕上げ
+
+
+# ==== / 段落② 最終整形 =====================================================
+
+# ==== 整合性バッジ（UIのみ表示／本文には出さない） ====
+def _trend_sign_from_label(label: str) -> int:
+    s = str(label or "")
+    if "アップ" in s: return 1
+    if "ダウン" in s: return -1
+    return 0
+
+def _cross_sign(gc_state: str) -> int | None:
+    s = str(gc_state or "")
+    if "ゴールデンクロス" in s: return 1
+    if "デッドクロス" in s:   return -1
+    return None
+
+def _consistency_judge(d1_imp: str, h4_imp: str, gc_axis: str, gc_state: str) -> tuple[str, str]:
+    ax = str(gc_axis or "")
+    cs = _cross_sign(gc_state)
+    if cs is None or ax == "未選択":
+        return ("", "")
+    if "日足" in ax:
+        ts, axis_name = _trend_sign_from_label(d1_imp), "日足"
+    elif "4" in ax:
+        ts, axis_name = _trend_sign_from_label(h4_imp), "4時間足"
+    else:
+        return ("", "")
+    if ts == 0:
+        return ("🟡 整合性：参考", f"{axis_name}の印象が横ばいのため、クロス方向は参考扱い。")
+    if ts == cs:
+        return ("🟢 整合性：良好", f"{axis_name}の印象とクロス方向は整合的。")
+    return ("🟠 整合性：注意", f"{axis_name}の印象とクロス方向が逆方向です。本文には書かずUIで注意表示。")
+
+
+# ==== 整合性ジャッジ（人の印象 × 20/200の向き）====
+def _consistency_judge(d1_imp: str, h4_imp: str, gc_axis: str, gc_state: str):
+    """
+    戻り値: (badge_md:str, tip_md:str) どちらか空文字なら非表示
+    - 人の印象（D1/H4）と、選択された時間軸のGC/DCの“向き”が矛盾していないかを軽く表示
+    - 本文には一切含めない（UIのみに表示）
+    """
+    def _norm_imp(x: str) -> str:
+        if not isinstance(x, str): return "flat"
+        if "横ばい" in x: return "flat"
+        if "アップ" in x: return "up"
+        if "ダウン" in x: return "down"
+        return "flat"
+
+    def _cross_dir(gc_state: str) -> str | None:
+        if not isinstance(gc_state, str): return None
+        if "ゴールデンクロス" in gc_state: return "up"
+        if "デッドクロス"  in gc_state: return "down"
+        return None
+
+    axis = (gc_axis or "未選択")
+    cdir = _cross_dir(gc_state or "未選択")
+    if axis == "未選択" or cdir is None:
+        return "", ""  # 比較材料なし → 非表示
+
+    d1 = _norm_imp(d1_imp or "横ばい")
+    h4 = _norm_imp(h4_imp or "横ばい")
+    imp = d1 if ("日足" in axis) else (h4 if "4" in axis else None)
+    if imp is None:
+        return "", ""
+
+    if imp == "flat":
+        badge = "**🟡 整合性△**"
+        tip   = "人の印象は『横ばい』、一方で20/200は方向性が示唆。強くは踏み込まず“確認優先”が無難です。"
+    elif imp == cdir:
+        badge = "**🟢 整合性◯**"
+        tip   = "人の印象と20/200の基調がおおむね整合。断定は避けつつも、流れの確認がしやすい局面です。"
+    else:
+        badge = "**🟠 整合性⚠**"
+        tip   = "人の印象と20/200の基調が逆行気味。本文は人の選択を優先しつつ、過度な決めつけを避けたいところ。"
+
+    return badge, tip
+
+
+
+# ==== NEW: 段落②NEW: 段落②（プレビュー：新ロジック==================================
+
+def _fmt_price(val: float, decimals: int) -> str:
+    try:
+        if val is None or val <= 0:
+            return ""
+        return f"{val:.{decimals}f}"
+    except Exception:
+        return ""
+
+def _detect_decimals_from_pair(pair_label: str) -> int:
+    return 2 if (("JPY" in pair_label) or ("円" in pair_label)) else 4
+
+def _cat_trend(x: str) -> str:
+    if not isinstance(x, str):
+        return "flat"
+    if "横ばい" in x:
+        return "flat"
+    if "アップ" in x:
+        return "up"
+    if "ダウン" in x:
+        return "down"
+    return "flat"
+
+def _intro_from_impressions(d1_imp: str, h4_imp: str) -> str:
+    def _cat(x: str) -> str:
+        if not isinstance(x, str): return "flat"
+        if "横ばい" in x: return "flat"
+        if "アップ" in x: return "up"
+        if "ダウン" in x: return "down"
+        return "flat"
+
+    key = (_cat(d1_imp), _cat(h4_imp))
+    cands = _LEX_INTRO.get(key)
+    if not cands:
+        # フォールバック（万一辞書漏れがあっても安全）
+        if key == ("flat","flat"): return "日足・4時間足ともレンジ色が濃い。"
+        if key == ("up","up"):     return "日足・4時間足とも上方向が優勢。"
+        if key == ("down","down"): return "日足・4時間足とも下方向が優勢。"
+        return "日足と4時間足で見方が分かれる。"
+    return _stable_pick(cands, category=f"intro:{key[0]}-{key[1]}")
+
+
+def _gc_phrase(gc_axis: str, gc_state: str) -> str:
+    """
+    gc_axis: UIの「時間軸」ラベル（例：'日足', '4時間足', '未選択'）
+    gc_state: UIの「状態」ラベル（例：'ゴールデンクロス（短期20MAが長期200MAを上抜け）', 'デッドクロス（…）', '未選択'）
+    戻り値は句点なしの短句（組み立て側で「。」を付与）
+    """
+    axis = (gc_axis or "").strip()
+    state = (gc_state or "").strip()
+    if not axis or axis == "未選択" or not state or state == "未選択":
+        return ""
+
+    # 軸の正規化
+    ax_key = "D1" if "日足" in axis else ("H4" if "4" in axis else "GENERIC")
+
+    # 状態の正規化
+    if "ゴールデンクロス" in state:
+        st_key = "GC"
+    elif "デッドクロス" in state:
+        st_key = "DC"
+    else:
+        return ""
+
+    # 候補の取得（軸別 → 汎用の順でフォールバック）
+    cands = _LEX_GC.get(ax_key, {}).get(st_key) or _LEX_GC.get("GENERIC", {}).get(st_key, [])
+    if not cands:
+        return ""
+
+    return _stable_pick(cands, category=f"gc:{ax_key}:{st_key}")
+
+
+
+# ==== ボリンジャーバンド：文言ローテ（トレンド/レンジで使い分け） ====
+def _bb_phrase(bb_state: str, d1_imp: str, h4_imp: str) -> str:
+    """
+    bb_state: UIの『状態（ボリンジャーバンド(20, ±2σ)）』の文字列（例：'拡大', '縮小', '未選択' など）
+    d1_imp, h4_imp: 印象（'アップ' / 'ダウン' / '横ばい' など）
+    戻り値：句点なしの短句（組み立て側で句点付与）
+
+    ルール：
+    - D1/H4のどちらかにトレンド（アップ/ダウン）があれば『勢い/サイン』系を優先
+    - D1/H4の両方が横ばい（＝完全レンジ）のときは『振れ/荒さに留意』系を優先
+    - '縮小' は共通の穏当表現
+    """
+    state = (bb_state or "").strip()
+    if not state or state == "未選択":
+        return ""
+
+    # 印象の簡易カテゴリ化（既存の _cat_trend を利用）
+    d1_cat = _cat_trend(d1_imp)   # 'up' / 'down' / 'flat'
+    h4_cat = _cat_trend(h4_imp)
+
+    trending = (d1_cat in ("up", "down")) or (h4_cat in ("up", "down"))
+    full_range = (d1_cat == "flat") and (h4_cat == "flat")
+
+    if "拡大" in state:
+        if trending:
+            # トレンドがある → 前向き（勢い/サイン）系
+            cands = [
+                "ボリンジャーバンドの拡大は勢いの確認材料",
+                "ボリンジャーバンドの拡大はボラ上昇のサイン",
+            ]
+            return _stable_pick(cands, category="bb:expand:trend")
+        elif full_range:
+            # 完全レンジ → 慎重（振れ/荒さ）系
+            cands = [
+                "ボリンジャーバンドの拡大は振れが出やすい",
+                "バンド拡大は値動きの荒さに留意",
+            ]
+            return _stable_pick(cands, category="bb:expand:range")
+        else:
+            # 混在（例：D1＝flat/H4＝flat以外）→ 中立寄り（勢い/サイン と 留意 表現の中庸）
+            cands = [
+                "ボリンジャーバンドの拡大はボラ上昇のサイン",
+                "バンド幅の拡大は値動きの振れに注意",
+            ]
+            return _stable_pick(cands, category="bb:expand:mixed")
+
+    if "縮小" in state or "収れん" in state:
+        cands = [
+            "ボリンジャーバンドの縮小はエネルギー蓄積のサイン",
+            "バンドの収れんは様子見の局面",
+        ]
+        return _stable_pick(cands, category="bb:contract")
+
+    # その他（明示されない状態）は出力なし
+    return ""
+
+
+
+
+
+def _rsi_phrase(rsi_state: str) -> str:
+    s = rsi_state or "未選択"
+    if s == "未選択":
+        return ""
+
+    # 状態→カテゴリ判定
+    key = None
+    if "70以上" in s:
+        key = "70+"
+    elif "60〜70" in s:
+        key = "60-70"
+    elif "50前後" in s or "中立" in s:
+        key = "50"
+    elif "40〜50" in s:
+        key = "40-50"
+    elif "30〜40" in s:
+        key = "30-40"
+    elif "30未満" in s:
+        key = "30-"
+    elif "ダイバージェンス" in s:
+        key = "div"
+
+    if not key:
+        return ""
+
+    cands = _LEX_RSI.get(key, [])
+    return _stable_pick(cands, category=f"rsi:{key}") if cands else ""
+
+# ==== RSI未選択時の自動補完（語尾ローテ対応） ====
+_RSI_AUTO_POOL = [
+    "RSIは50近辺で中立",
+    "RSIは50前後で中立",
+    "RSIは概ね中立圏",
+]
+
+def _rsi_with_auto(rsi_state: str, d1_imp: str, h4_imp: str) -> str:
+    """
+    rsi_state が '未選択' なら、中立系の定型句をローテで返す。
+    既に選択されている場合は従来の _rsi_phrase の結果を返す。
+    """
+    s = (rsi_state or "").strip()
+    if not s or s == "未選択":
+        # ※必要なら D1/H4 を見て強含み/弱含みも拡張可能だが、まずは中立系で安定運用
+        return _stable_pick(_RSI_AUTO_POOL, category="rsi:auto")
+    return _rsi_phrase(s)
+
+
+def _choose_breakpoints():
+    """
+    UIのブレークポイント入力を吸い上げて、(up_txt, dn_txt, axis) を返す。
+    - 軸: AUTO / D1 / H4（st.session_state["p2_bp_axis"] から読む）
+    - 値: 共通（p2_bp_upper/lower）, D1専用, H4専用 を状況に応じて選ぶ
+    - 上下とも、優先順は axis に厳密に揃える（不整合防止）
+    """
+    ss = st.session_state
+
+    def to_num(x):
+        try:
+            x = float(str(x).strip())
+            return x if x > 0 else None
+        except Exception:
+            return None
+
+    axis = ss.get("p2_bp_axis", "AUTO")  # "AUTO" / "D1" / "H4"
+
+    # 共通欄
+    com_up = to_num(ss.get("p2_bp_upper"))
+    com_dn = to_num(ss.get("p2_bp_lower"))
+
+    # D1専用
+    d1_up = to_num(ss.get("p2_bp_d1_upper"))
+    d1_dn = to_num(ss.get("p2_bp_d1_lower"))
+
+    # H4専用
+    h4_up = to_num(ss.get("p2_bp_h4_upper"))
+    h4_dn = to_num(ss.get("p2_bp_h4_lower"))
+
+    # 旧ロジック由来の補助（存在しなければ None）
+    vals = {
+        "bp_up":      to_num(ss.get("bp_up")),
+        "bp_dn":      to_num(ss.get("bp_dn")),
+        "bp_d1_up":   to_num(ss.get("bp_d1_up")),
+        "bp_d1_dn":   to_num(ss.get("bp_d1_dn")),
+        "bp_h4_up":   to_num(ss.get("bp_h4_up")),
+        "bp_h4_dn":   to_num(ss.get("bp_h4_dn")),
+        "p2_bp_upper":    com_up,
+        "p2_bp_lower":    com_dn,
+        "p2_bp_d1_upper": d1_up,
+        "p2_bp_d1_lower": d1_dn,
+        "p2_bp_h4_upper": h4_up,
+        "p2_bp_h4_lower": h4_dn,
+    }
+
+    def order(axis: str, kind: str):  # kind: "upper" or "lower"
+        if axis == "D1":
+            return [f"p2_bp_d1_{kind}", f"bp_d1_{'up' if kind=='upper' else 'dn'}",
+                    f"p2_bp_h4_{kind}", f"bp_h4_{'up' if kind=='upper' else 'dn'}",
+                    f"p2_bp_{'upper' if kind=='upper' else 'lower'}", f"bp_{'up' if kind=='upper' else 'dn'}"]
+        elif axis == "H4":
+            return [f"p2_bp_h4_{kind}", f"bp_h4_{'up' if kind=='upper' else 'dn'}",
+                    f"p2_bp_d1_{kind}", f"bp_d1_{'up' if kind=='upper' else 'dn'}",
+                    f"p2_bp_{'upper' if kind=='upper' else 'lower'}", f"bp_{'up' if kind=='upper' else 'dn'}"]
+        else:  # AUTO
+            return [f"p2_bp_d1_{kind}", f"bp_d1_{'up' if kind=='upper' else 'dn'}",
+                    f"p2_bp_h4_{kind}", f"bp_h4_{'up' if kind=='upper' else 'dn'}",
+                    f"p2_bp_{'upper' if kind=='upper' else 'lower'}", f"bp_{'up' if kind=='upper' else 'dn'}"]
+
+    def pick(keys):
+        for k in keys:
+            v = vals.get(k)
+            if v is not None:
+                return v
+        return None
+
+    up_num = pick(order(axis, "upper"))
+    dn_num = pick(order(axis, "lower"))
+
+    # JPY系は小数2桁、それ以外は4桁
+    pair_label = (ss.get("pair") or "")
+    decimals = 2 if ("JPY" in pair_label.upper() or "円" in pair_label) else 4
+    fmt = f"{{:.{decimals}f}}"
+
+    up_txt = fmt.format(up_num) if up_num is not None else None
+    dn_txt = fmt.format(dn_num) if dn_num is not None else None
+
+    # （必要なら）デバッグ表示の整合性もここで揃えられます
+    ss["__bp_debug_used_order_up__"] = order(axis, "upper")
+    ss["__bp_debug_used_order_down__"] = order(axis, "lower")
+
+    return up_txt, dn_txt, axis
+
+
+# ==== 結び語尾：状況に応じた安全ローテ ====
+def _closing_sentence(d1_imp: str, h4_imp: str) -> str:
+    """
+    句点なしで返す（呼び出し側で句点を付与）
+    - D1/H4とも横ばい: 決めつけ回避寄り
+    - D1/H4が逆方向（どちらもトレンド）: 警戒・反応確認寄り
+    - それ以外: 中立〜注視寄り
+    """
+    def _cat(x: str) -> str:
+        s = str(x or "")
+        if "横ばい" in s:
+            return "flat"
+        if "アップ" in s:
+            return "up"
+        if "ダウン" in s:
+            return "down"
+        return "flat"
+
+    d1c = _cat(d1_imp)
+    h4c = _cat(h4_imp)
+
+    # 候補セットの選択
+    if d1c == "flat" and h4c == "flat":
+        cands = [
+            "過度な一方向は決めつけにくい",
+            "様子を見極めたい",
+            "反応を確かめたい",
+        ]
+        category = "close:flat-flat"
+    elif d1c != h4c and ("flat" not in (d1c, h4c)):
+        # 互いに逆方向（どちらもトレンド）
+        cands = [
+            "いずれの方向にも振れやすい",
+            "値動きには警戒したい",
+            "反応を確かめたい",
+        ]
+        category = f"close:conflict:{d1c}-{h4c}"
+    else:
+        # 片方トレンド or 方向感はあるが強すぎない
+        cands = [
+            "行方を注視したい",
+            "方向感を見極めたい",
+            "過度な一方向は決めつけにくい",
+        ]
+        category = f"close:normal:{d1c}-{h4c}"
+
+    # 安定ローテ（存在しなければ先頭採用）
+    try:
+        return _stable_pick(cands, category=category)
+    except Exception:
+        return cands[0]
+
+# ==== 長さ下限フィラー（安全文のみ、重複回避） ====
+def _pad_to_min_length(text: str, min_len: int = 180) -> str:
+    """
+    - 180字未満のときだけ、短い中立フレーズを重複なしで末尾に挿入
+    - 余計な重複や句点の連続を避ける
+    """
+    base = (text or "").strip().replace("。。", "。")
+    fillers = [
+        "反応を確かめたい。",
+        "行方を注視したい。",
+        "方向感を見極めたい。",
+        "値動きには警戒したい。",
+        "20SMAやボリンジャーバンド周辺の反応を確かめたい。",
+    ]
+    # 既出の文は入れない
+    for f in fillers:
+        if len(base) >= min_len:
+            break
+        if f.rstrip("。") not in base:
+            if not base.endswith("。"):
+                base += "。"
+            base += f
+            base = base.replace("。。", "。").strip()
+    return base
+
+# ==== PREVIEW用・不足分を安全に埋める最小ヘルパー（180字保証＋BPを優先反映） ====
+def _pad_para2_to_min(text: str, min_len: int = None) -> str:
+    t = (text or "").strip().replace("。。", "。")
+    if min_len is None:
+        min_len = int(CFG.get("text_guards", {}).get("p2_min_chars", 180))
+
+    d1_imp = st.session_state.get("d1_imp", "横ばい")
+    h4_imp = st.session_state.get("h4_imp", "横ばい")
+    bb_state = st.session_state.get("bb_state", "未選択")
+    try:
+        up_txt, dn_txt, _axis = _choose_breakpoints()
+    except Exception:
+        up_txt, dn_txt = ("", "")
+
+    fillers: list[str] = []
+
+    # --- 0) ブレークポイントを“最優先”で反映（重複は回避） ---
+    bp_candidates = []
+    if up_txt and up_txt != "0.00":
+        bp_candidates.append(f"上値{up_txt}付近の上抜けの有無をまずは見極めたい。")
+    if dn_txt and dn_txt != "0.00":
+        bp_candidates.append(f"下値{dn_txt}付近の下抜けには警戒したい。")
+    for bp in bp_candidates:
+        if bp and bp not in t:
+            if not t.endswith("。") and t != "":
+                t += "。"
+            t += bp
+            t = t.replace("。。", "。")
+
+    # --- 1) レンジ補足（なければ） ---
+    if "レンジ" not in t and "持ち合い" not in t:
+        fillers.append("短期は持ち合い（レンジ）を前提とした値動きが意識されやすい。")
+
+    # --- 2) BB補足（UIで選択済みなら本文に無ければ） ---
+    if bb_state and bb_state != "未選択" and "ボリンジャーバンド" not in t:
+        if "拡大" in bb_state:
+            fillers.append("ボリンジャーバンド(20, ±2σ)の拡大はボラ上昇のサイン。")
+        elif "縮小" in bb_state:
+            fillers.append("ボリンジャーバンド(20, ±2σ)の縮小は値動きの収れんを示唆。")
+
+    # --- 3) SMA補強（足りなければ） ---
+    if "20SMA" not in t and "200SMA" not in t:
+        fillers.append("20SMAや200SMAとの位置関係を確認しつつ、過度な方向感は決めつけない構えとしたい。")
+
+    # 必要分だけ追加して 180 字を必ず確保
+    for add in fillers:
+        if len(t) >= min_len:
+            break
+        if add not in t:
+            if not t.endswith("。") and t != "":
+                t += "。"
+            t += add
+            t = t.replace("。。", "。")
+
+    return t
+
+# ==== 根拠句の取り合わせ最適化（RSIが中立ならBBを優先） ====
+def _choose_grounds_sentences(gc: str, rsi: str, bb: str) -> list[str]:
+    """
+    最大2句を返す。優先度は以下の通り：
+    - まずGCがあれば採用
+    - RSIとBBの両方がある場合、RSIが『中立』系ならBBを優先、それ以外はRSIを優先
+    - どちらか一方ならその一方
+    """
+    picks: list[str] = []
+    if gc:
+        picks.append(gc)
+
+    has_rsi = bool(rsi)
+    has_bb  = bool(bb)
+    if has_rsi and has_bb:
+        # “RSIは…中立” っぽいとき → BBを優先
+        if ("RSI" in rsi) and ("中立" in rsi):
+            picks.append(bb)
+        else:
+            picks.append(rsi)
+    elif has_rsi or has_bb:
+        picks.append(rsi or bb)
+
+    # 最大2句に制限
+    return picks[:2]
+
+
+# ==== 段落② プレビュー本体（統一版） ======================================
+def _compose_para2_preview_from_ui() -> str:
+    # 印象 → 導入文
+    d1_imp = st.session_state.get("d1_imp", "横ばい")
+    h4_imp = st.session_state.get("h4_imp", "横ばい")
+    intro = _intro_from_impressions(d1_imp, h4_imp)
+
+    # 主役ペアとリード文
+    pair_label = str(st.session_state.get("pair", "") or "")
+    lead = _lead_sentence(pair_label, d1_imp, h4_imp)
+
+    # 先頭文の組み立て
+    parts: list[str] = []
+    if _is_crypto_or_gold(pair_label):
+        parts.append(f"{lead}{intro}")
+    else:
+        parts.append(lead)
+        parts.append(intro)
+
+    # 根拠（最大2句）
+    gc = _gc_phrase(
+        st.session_state.get("gc_axis", "未選択"),
+        st.session_state.get("gc_state", "未選択"),
+    )
+    rsi = _rsi_phrase(st.session_state.get("rsi_state", "未選択"))
+    bb  = _bb_phrase(st.session_state.get("bb_state", "未選択"), d1_imp, h4_imp)
+    grounds = [p for p in (gc, rsi, bb) if p]
+    if grounds:
+        parts.append("。".join(grounds[:2]))
+
+    # ブレークポイント（任意）— 空なら保険で自作
+    up_txt, dn_txt, _ = _choose_breakpoints()
+    bp_txt = _bp_phrase(up_txt, dn_txt, d1_imp, h4_imp)
+    if not bp_txt:
+        if dn_txt:
+            bp_txt = f"下値{dn_txt}付近割れの可否をまず確認したい"
+        elif up_txt:
+            bp_txt = f"上値{up_txt}付近の上抜けの有無をまず見極めたい"
+    if bp_txt:
+        parts.append(bp_txt)
+
+    # 締め
+    closing = _closing_sentence(d1_imp, h4_imp)
+    parts.append(closing)
+
+    # 文末句点を補完しながら連結
+    text = "".join(p if str(p).endswith("。") else (str(p) + "。") for p in parts)
+    text = text.replace("。。", "。").strip()
+
+    # 句頭の重複回避（失敗しても無視）
+    try:
+        text = _avoid_repeated_openers(text)
+    except Exception:
+        pass
+
+    # 仕上げ
+    try:
+        return _finalize_para2_for_build(text)
+    except Exception:
+        return text
+
+
+
+
+# ==== / 段落② プレビュー本体（統一版） ====================================
+
+
+
+# ==== 段落②（プレビュー：新ロジック） ====
+st.markdown("#### 段落②（プレビュー：新ロジック）")
+
+def _num_or_none(x):
+    """文字列/None/配列/NumPyスカラーにも耐性。0以下・非数は None。"""
+    import math
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (list, tuple)) and x:
+            x = x[0]
+        v = float(str(x).replace(",", "").strip())
+        if not math.isfinite(v):
+            return None
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+def _pick_first_valid(*keys):
+    """最初に見つかった有効数値と、そのキー名を返す。"""
+    ss = st.session_state
+    for k in keys:
+        v = _num_or_none(ss.get(k))
+        if v is not None:
+            return v, k
+    return None, None
+
+def _bp_sentence_mix() -> tuple[str, dict]:
+    """
+    上側: D1 → H4 → 共通
+    下側: H4 → D1 → 共通
+    （片方だけでも文章を作る）
+    """
+    up, up_src = _pick_first_valid(
+        "p2_bp_d1_upper", "bp_d1_up",
+        "p2_bp_h4_upper", "bp_h4_up",
+        "p2_bp_upper",    "bp_up"
+    )
+    dn, dn_src = _pick_first_valid(
+        "p2_bp_h4_lower", "bp_h4_dn",
+        "p2_bp_d1_lower", "bp_d1_dn",
+        "p2_bp_lower",    "bp_dn"
+    )
+
+    pair = str(st.session_state.get("pair", "") or "")
+    decimals = 2 if ("JPY" in pair.upper() or "円" in pair) else 4
+    fmt = f"{{:.{decimals}f}}"
+
+    if up is None and dn is None:
+        return "", {"up": None, "dn": None, "up_src": up_src, "dn_src": dn_src}
+
+    if up is not None and dn is not None:
+        return f"{fmt.format(up)}付近の上抜け／{fmt.format(dn)}付近割れのどちらに傾くかを見極めたい。", {
+            "up": up, "dn": dn, "up_src": up_src, "dn_src": dn_src
+        }
+    if up is not None:
+        return f"{fmt.format(up)}付近の上抜けの有無をまず確かめたい。", {
+            "up": up, "dn": None, "up_src": up_src, "dn_src": dn_src
+        }
+    # dn のみ
+    return f"{fmt.format(dn)}付近割れの可否をまず確認したい。", {
+        "up": None, "dn": dn, "up_src": up_src, "dn_src": dn_src
+    }
+
+# ==== 段落②（プレビュー：新ロジック）・BP反映ミックス ====
+
+def _decimals_from_pair(pair_label: str) -> int:
+    s = (pair_label or "")
+    return 2 if ("JPY" in s.upper() or "円" in s) else 4
+
+def _first_num(*vals):
+    """先に見つかった有効な数値を返す（0以下やNaNは除外）。list/tuple/文字列/NumPyにも耐性。"""
+    import math
+    for v in vals:
+        try:
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)) and v:
+                v = v[0]
+            x = float(str(v).replace(",", "").strip())
+            if math.isfinite(x) and x > 0:
+                return x
+        except Exception:
+            pass
+    return None
+
+def _bp_sentence_mix() -> tuple[str, dict]:
+    """
+    プレビュー用のBP文を作る。
+    優先順位（上側）: D1 -> H4 -> 共通
+    優先順位（下側）: H4 -> D1 -> 共通
+    """
+    ss = st.session_state
+
+    up_candidates = []
+    if _allow_d1():
+            up_candidates += [ss.get("p2_bp_d1_upper"), ss.get("bp_d1_up")]
+    if _allow_h4():
+            up_candidates += [ss.get("p2_bp_h4_upper"), ss.get("bp_h4_up")]
+    up_candidates += [ss.get("p2_bp_upper"), ss.get("bp_up")]
+    up_val = _first_num(*up_candidates)
+
+    dn_candidates = []
+    if _allow_h4():
+            dn_candidates += [ss.get("p2_bp_h4_lower"), ss.get("bp_h4_dn")]
+    if _allow_d1():
+            dn_candidates += [ss.get("p2_bp_d1_lower"), ss.get("bp_d1_dn")]
+    dn_candidates += [ss.get("p2_bp_lower"), ss.get("bp_dn")]
+    dn_val = _first_num(*dn_candidates)
+
+
+    pair = str(ss.get("pair", "") or "")
+    decimals = _decimals_from_pair(pair)
+    fmt = f"{{:.{decimals}f}}"
+
+    debug = {
+        "up": up_val, "dn": dn_val,
+        "pair": pair, "decimals": decimals,
+        "used_order_up":  ["p2_bp_d1_upper","bp_d1_up","p2_bp_h4_upper","bp_h4_up","p2_bp_upper","bp_up"],
+        "used_order_down":["p2_bp_h4_lower","bp_h4_dn","p2_bp_d1_lower","bp_d1_dn","p2_bp_lower","bp_dn"],
+    }
+
+    if up_val is None and dn_val is None:
+        return "", debug
+
+    if up_val is not None and dn_val is not None:
+        sent = f"{fmt.format(up_val)}付近の上抜け／{fmt.format(dn_val)}付近割れのどちらに傾くかを見極めたい。"
+    elif up_val is not None:
+        sent = f"{fmt.format(up_val)}付近の上抜けの有無をまず確かめたい。"
+    else:
+        sent = f"{fmt.format(dn_val)}付近割れの可否をまず確認したい。"
+
+    return sent, debug
+
+def _compose_para2_preview_mix_legacy() -> str:
+    """
+    段落②プレビューの確定文（UI選択＋手入力＋BP短句を統合、重複は抑制）。
+    - ベース: _compose_para2_preview_from_ui()
+    - 追記: MA(20/200), BB(20,±2σ), RSI(14)（UI/手入力のどちらでも拾う）
+    - BP短句: 上/下のいずれか（両方あれば両方）を1本だけ追加
+    - 既に含まれる表現は二重にしない
+    """
+    import re
+
+    # ---------- 1) ベース（UIプレビュー素文） ----------
+    try:
+        base = _compose_para2_preview_from_ui()
+    except Exception:
+        pair = str(st.session_state.get("pair", "") or "")
+        d1   = st.session_state.get("d1_imp", "横ばい")
+        h4   = st.session_state.get("h4_imp", "横ばい")
+        base = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+    base = (base or "").strip()
+
+    # ---------- 2) session_state から柔軟に値を拾う ----------
+    def _ss_pick(keys=None, substrings=None, default=""):
+        ss = st.session_state
+        # 明示キーを優先
+        if keys:
+            for k in keys:
+                v = ss.get(k)
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple)) and v:
+                    v = v[0]
+                s = str(v).strip()
+                if s:
+                    return s
+        # 見当たらなければ部分一致検索（保険）
+        if substrings:
+            subs = [s.lower() for s in substrings]
+            for k, v in ss.items():
+                if not isinstance(k, str):
+                    continue
+                kl = k.lower()
+                if all(sub in kl for sub in subs):
+                    if v is None:
+                        continue
+                    if isinstance(v, (list, tuple)) and v:
+                        v = v[0]
+                    s = str(v).strip()
+                    if s:
+                        return s
+        return default
+
+    def _axis_label(raw: str) -> str:
+        s = str(raw or "").upper()
+        if "H4" in s or "4" in s:
+            return "4時間足"
+        return "日足"  # 既定はD1
+
+    # ---------- 3) MA / BB / RSI の短句 ----------
+    # MA(20↔200)
+    ma_axis  = _ss_pick(
+        keys=["p2_ma_axis","ma_axis","ma_cross_axis","ma_timeframe","p2_ma_timeframe","ma_axis_select"],
+        substrings=["ma","axis"], default="D1"
+    )
+    ma_state = _ss_pick(
+        keys=["p2_ma_state","ma_state","ma_cross_state","p2_ma_manual","ma_state_select","ma_manual"],
+        substrings=["ma","state"], default=""
+    )
+    ma_sentence = ""
+    if ma_state:
+        axis_txt = _axis_label(ma_axis)
+        if "ゴールデンクロス" in ma_state:
+            ma_sentence = f"{axis_txt}では20SMAが200SMAを上回り上向き基調。"
+        elif ("デッドクロス" in ma_state) or ("デスクロ" in ma_state):
+            ma_sentence = f"{axis_txt}では20SMAが200SMAを下回り上向きは鈍い。"
+        else:
+            ma_sentence = f"{axis_txt}の20/200SMAは{ma_state}。"
+
+    # ボリンジャーバンド(20, ±2σ)
+    bb_state = _ss_pick(
+        keys=["p2_bb_state","bb_state","p2_bb_manual","bb_manual","bb_state_select"],
+        substrings=["bb","state"], default=""
+    )
+    bb_sentence = f"ボリンジャーバンド(20, ±2σ)は{bb_state}。" if bb_state else ""
+
+    # RSI(14)
+    rsi_state = _ss_pick(
+        keys=["p2_rsi_state","rsi_state","p2_rsi_manual","rsi_manual","rsi_state_select"],
+        substrings=["rsi","state"], default=""
+    )
+    rsi_sentence = ""
+    if rsi_state:
+        if any(ch.isdigit() for ch in str(rsi_state)):
+            rsi_sentence = f"RSIは{rsi_state}。"
+        else:
+            rsi_sentence = f"RSIは{rsi_state}気味。"
+
+    # ---------- 4) 重複を避けつつ付け足し ----------
+    def _append_once(text: str, add: str) -> str:
+        t = (text or "").strip()
+        a = (add  or "").strip()
+        if not a:
+            return t
+        if a.replace(" ", "") in t.replace(" ", ""):
+            return t
+        if t and not t.endswith("。"):
+            t += "。"
+        return t + a
+
+    base = _append_once(base, ma_sentence)
+    base = _append_once(base, rsi_sentence)
+    base = _append_once(base, bb_sentence)
+
+    # ---------- 5) ブレークポイント短句 ----------
+    bp_sentence = ""
+    try:
+        _bp_sent, dbg = _bp_sentence_mix()
+        bp_sentence = _bp_sent or ""
+        if st.session_state.get("show_debug", False):
+            st.write("DEBUG_BP_PICK:", dbg)
+    except Exception:
+        pass
+    base = _append_once(base, bp_sentence)
+
+    # ---------- 6) 仕上げ（句点/重複整理） ----------
+    base = base.strip()
+    base = re.sub(r"。{2,}", "。", base)
+    parts = [p for p in re.split(r"。+", base) if p]
+    seen, uniq = set(), []
+    for p in parts:
+        key = p.replace(" ", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    return "。".join(uniq).strip() + "。"
+
+
+
+def _first_num(*vals):
+    """
+    先に見つかった有効な数値を返す（0以下やNaNは除外）。
+    list/tuple/文字列/NumPyにも耐性。
+    """
+    import math
+    for v in vals:
+        try:
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)) and v:
+                v = v[0]
+            x = float(str(v).replace(",", "").strip())
+            if math.isfinite(x) and x > 0:
+                return x
+        except Exception:
+            pass
+    return None
+
+
+def _bp_sentence_mix():
+    """
+    プレビュー用のBP文を作る。
+    優先順位（上側）: D1 -> H4 -> 共通
+    優先順位（下側）: H4 -> D1 -> 共通
+    どちらか片方だけでも文を作る。
+    """
+    ss = st.session_state
+
+    # 候補（それぞれの優先順で先に取れたものを採用）
+    up_val = _first_num(
+        ss.get("p2_bp_d1_upper"), ss.get("bp_d1_up"),
+        ss.get("p2_bp_h4_upper"), ss.get("bp_h4_up"),
+        ss.get("p2_bp_upper"),    ss.get("bp_up"),
+    )
+    dn_val = _first_num(
+        ss.get("p2_bp_h4_lower"), ss.get("bp_h4_dn"),
+        ss.get("p2_bp_d1_lower"), ss.get("bp_d1_dn"),
+        ss.get("p2_bp_lower"),    ss.get("bp_dn"),
+    )
+
+    pair = str(ss.get("pair", "") or "")
+    decimals = _decimals_from_pair(pair)
+    fmt = f"{{:.{decimals}f}}"
+
+    debug = {
+        "up": up_val, "dn": dn_val,
+        "pair": pair, "decimals": decimals,
+        "used_order_up":  ["p2_bp_d1_upper","bp_d1_up","p2_bp_h4_upper","bp_h4_up","p2_bp_upper","bp_up"],
+        "used_order_down":["p2_bp_h4_lower","bp_h4_dn","p2_bp_d1_lower","bp_d1_dn","p2_bp_lower","bp_dn"],
+    }
+
+    if up_val is None and dn_val is None:
+        return "", debug
+
+    if up_val is not None and dn_val is not None:
+        sent = f"{fmt.format(up_val)}付近の上抜け／{fmt.format(dn_val)}付近割れのどちらに傾くかを見極めたい。"
+    elif up_val is not None:
+        sent = f"{fmt.format(up_val)}付近の上抜けの有無をまず確かめたい。"
+    else:
+        sent = f"{fmt.format(dn_val)}付近割れの可否をまず確認したい。"
+
+    return sent, debug
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==== / 段落② UIブロック（置き換え版） ===================================
+
+
+
+def _vol_score(df: pd.DataFrame | None, ind: dict | None) -> float:
+    """変化の大きさスコア：直近20本のBB幅/20SMAの平均（大きいほど変化が激しい）"""
+    try:
+        bbw = (ind["bb_upper"] - ind["bb_lower"]).tail(20).mean()
+        mid = ind["sma20"].tail(20).mean()
+        if mid is None or np.isnan(mid) or mid == 0:
+            return -1.0
+        return float(bbw / abs(mid))
+    except Exception:
+        return -1.0
+# --- 指標計算（SMA/BB/RSI + クロス判定）: DataFrameの揺れに強い版 ---
+def _close_series(df: _pd.DataFrame) -> _pd.Series:
+    """
+    df["Close"] が DataFrame になってしまう/列名の大小混在/重複などのケースを吸収し、
+    必ず float の Series を返す。
+    """
+    if df is None or getattr(df, "empty", True):
+        return _pd.Series(dtype="float64")
+
+    # "Close" をケースインセンシティブで探索
+    col_name = None
+    for c in df.columns:
+        if str(c).lower() == "close":
+            col_name = c
+            break
+    if col_name is None:
+        # 近い名前もないなら空Series
+        return _pd.Series(dtype="float64", index=df.index)
+
+    col = df[col_name]
+    # 万一 DataFrame なら先頭列を採用
+    if isinstance(col, _pd.DataFrame):
+        col = col.iloc[:, 0]
+
+    return _pd.to_numeric(col, errors="coerce").astype("float64")
+
+
+def _sma_s(df_close: _pd.Series, n: int) -> _pd.Series:
+    return df_close.rolling(n, min_periods=1).mean()
+
+
+def _bbands_s(df_close: _pd.Series, n: int = 20, k: float = 2.0):
+    ma = df_close.rolling(n, min_periods=1).mean()
+    sd = df_close.rolling(n, min_periods=1).std(ddof=0)
+    return ma + k * sd, ma - k * sd
+
+
+def _rsi_s(close: _pd.Series, n: int = 14) -> _pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    ema_up = up.ewm(alpha=1 / n, adjust=False).mean()
+    ema_dn = dn.ewm(alpha=1 / n, adjust=False).mean()
+    rs = ema_up / ema_dn.replace(0, _np.nan)
+    return (100 - (100 / (1 + rs))).clip(0, 100)
+
+
+def _indicators(df: _pd.DataFrame) -> dict:
+    """
+    返り値：
+      {
+        "close": Series, "sma20": Series, "sma200": Series,
+        "bb_u": Series, "bb_l": Series, "rsi14": Series,
+        "gc_recent": bool, "dc_recent": bool
+      }
+    """
+    if df is None or getattr(df, "empty", True):
+        return {
+            "close": None, "sma20": None, "sma200": None,
+            "bb_u": None, "bb_l": None, "rsi14": None,
+            "gc_recent": False, "dc_recent": False,
+        }
+
+    close = _close_series(df)
+    sma20 = _sma_s(close, 20)
+    sma200 = _sma_s(close, 200)
+    bb_u, bb_l = _bbands_s(close, 20, 2.0)
+    rsi14 = _rsi_s(close, 14)
+
+    # ゴールデン/デッドクロス（直近20本のどこかで発生していれば True）
+    diff = sma20 - sma200
+    gc = (diff.shift(1) <= 0) & (diff > 0)
+    dc = (diff.shift(1) >= 0) & (diff < 0)
+
+    return {
+        "close": close,
+        "sma20": sma20, "sma200": sma200,
+        "bb_u": bb_u, "bb_l": bb_l,
+        "rsi14": rsi14,
+        "gc_recent": bool(gc.tail(20).any()),
+        "dc_recent": bool(dc.tail(20).any()),
+    }
+
+# === 段落② 用：ベース足の決定 + ヘルパ群 + 本文生成 ===
+
+# 1) ベース足の決定（自動/手動）。ついでに d1_ind / h4_ind を必ず用意して互換にする
+tf_base_choice = st.session_state.get("tf_base_choice", "自動")
+
+
+if tf_base_choice == "自動":
+    d1_ind = _indicators(_d1) if ('_d1' in globals() and _d1 is not None) else None
+    h4_ind = _indicators(_h4) if ('_h4' in globals() and _h4 is not None) else None
+
+    # volスコア（=直近20本のBB幅/20SMA）。キー表記の差異に両対応
+    def _vol_score_auto(ind: dict | None) -> float:
+        try:
+            if not ind:
+                return -1.0
+            bb_hi = ind.get("bb_u", ind.get("bb_upper"))
+            bb_lo = ind.get("bb_l", ind.get("bb_lower"))
+            s20   = ind.get("sma20")
+            if bb_hi is None or bb_lo is None or s20 is None:
+                return -1.0
+            bbw = (bb_hi - bb_lo).tail(20).mean()
+            mid = s20.tail(20).mean()
+            if mid is None or _np.isnan(mid) or mid == 0:
+                return -1.0
+            return float(bbw / abs(mid))
+        except Exception:
+            return -1.0
+
+    s_d1 = _vol_score_auto(d1_ind)
+    s_h4 = _vol_score_auto(h4_ind)
+    # どちらかが欠落している場合のフォールバック
+    if s_d1 < 0.0 and s_h4 >= 0.0:
+        tf_base_effective = "4時間足"
+    elif s_h4 < 0.0 and s_d1 >= 0.0:
+        tf_base_effective = "日足"
+    else:
+        tf_base_effective = "4時間足" if s_h4 > s_d1 else "日足"
+else:
+    # 手動選択：必ず両方のインジ計算を持っておく（後工程の互換目的）
+    d1_ind = _indicators(_d1) if ('_d1' in globals() and _d1 is not None) else None
+    h4_ind = _indicators(_h4) if ('_h4' in globals() and _h4 is not None) else None
+    tf_base_effective = tf_base_choice
+
+# 2) 表現ヘルパ
+def _mv_rel_text(s20: float | None, s200: float | None) -> str:
+    if s20 is None or s200 is None:
+        return ""
+    return "短期20SMAは200SMAを上回り基調は上向き" if s20 > s200 else "短期20SMAは200SMAを下回り基調は下向き"
+
+def _rsi_label(v: float | None) -> str:
+    if v is None or _np.isnan(v):
+        return ""
+    if v >= 60:
+        return "RSIは60台で上向きバイアス"
+    if v < 40:
+        return "RSIは40割れで上値の重さ"
+    return "RSIは中立圏"
+
+def _intro_from_impressions(d1_imp: str, h4_imp: str) -> str:
+    def _cat(x: str) -> str:
+        if not isinstance(x, str): return "flat"
+        if "横ばい" in x: return "flat"
+        if "アップ" in x: return "up"
+        if "ダウン" in x: return "down"
+        return "flat"
+
+    key = (_cat(d1_imp), _cat(h4_imp))
+    cands = _LEX_INTRO.get(key)
+    if not cands:
+        # フォールバック（万一辞書漏れがあっても安全）
+        if key == ("flat","flat"): return "日足・4時間足ともレンジ色が濃い。"
+        if key == ("up","up"):     return "日足・4時間足とも上方向が優勢。"
+        if key == ("down","down"): return "日足・4時間足とも下方向が優勢。"
+        return "日足と4時間足で見方が分かれる。"
+    return _stable_pick(cands, category=f"intro:{key[0]}-{key[1]}")
+
+
+# 3) 段落② 本文生成（v2.1）— 修正版（この関数をそのまま置き換えてください）
+# 3) 段落② 本文生成（v2.1）
+def _compose_para2_v21() -> str:
+    # --- 安全取得（UIの印象） ---
+    d1_imp = st.session_state.get("d1_imp", st.session_state.get("imp_d1", "横ばい"))
+    h4_imp = st.session_state.get("h4_imp", st.session_state.get("imp_h4", "横ばい"))
+
+    # --- 末端値ヘルパ ---
+    def _last_float(s):
+        try:
+            if s is None:
+                return None
+            tail = s.iloc[-1:]
+            return None if tail.isna().any() else float(tail.iloc[-1])
+        except Exception:
+            return None
+
+    # グローバルの指標がある前提（無ければ None で続行）
+    d1_s20  = _last_float(globals().get("d1_ind", {}).get("sma20"))   if globals().get("d1_ind") else None
+    d1_s200 = _last_float(globals().get("d1_ind", {}).get("sma200"))  if globals().get("d1_ind") else None
+    d1_rsi  = _last_float(globals().get("d1_ind", {}).get("rsi14"))   if globals().get("d1_ind") else None
+    h4_s20  = _last_float(globals().get("h4_ind", {}).get("sma20"))   if globals().get("h4_ind") else None
+    h4_s200 = _last_float(globals().get("h4_ind", {}).get("sma200"))  if globals().get("h4_ind") else None
+    h4_rsi  = _last_float(globals().get("h4_ind", {}).get("rsi14"))   if globals().get("h4_ind") else None
+
+    # 導入
+    bits = [_intro_from_impressions(d1_imp, h4_imp)]
+
+    # ベース足
+    tf_base_effective = globals().get("tf_base_effective", "日足")  # "日足" / "4時間足"
+    if tf_base_effective == "4時間足":
+        mv = _mv_rel_text(h4_s20, h4_s200)
+        rs = _rsi_label(h4_rsi)
+        if mv: bits.append(mv + "。")
+        if rs: bits.append(rs + "。")
+        mv_d1 = _mv_rel_text(d1_s20, d1_s200)
+        if mv_d1:
+            trend = "上向き基調" if (h4_s20 is not None and h4_s200 is not None and h4_s20 > h4_s200) else "下向き基調"
+            bits.append(f"日足は{trend}の確認を意識。")
+    else:
+        mv = _mv_rel_text(d1_s20, d1_s200)
+        rs = _rsi_label(d1_rsi)
+        if mv: bits.append(mv + "。")
+        if rs: bits.append(rs + "。")
+        mv_h4 = _mv_rel_text(h4_s20, h4_s200)
+        if mv_h4: bits.append("4時間足の動意も併せて確認したい。")
+
+    # ---------- ブレークポイントを本文②へ反映 ----------
+    try:
+        ss = st.session_state if 'st' in globals() else {}
+
+        # 全角->半角などを吸収して数値化
+        def _to_float(x):
+            if x is None: return None
+            s = str(x).strip()
+            if not s: return None
+            # 全角数字・記号を半角へ
+            z2h = str.maketrans(
+                "０１２３４５６７８９．，－＋",
+                "0123456789.,-+"
+            )
+            s = s.translate(z2h).replace(",", "")
+            try:
+                v = float(s)
+            except Exception:
+                return None
+            # 0.00 は「未入力」と解釈
+            if abs(v) == 0.0:
+                return None
+            return v
+
+        def _decimals_for_ticker(tkr: str) -> int:
+            t = (tkr or "").upper()
+            if "JPY" in t:  # USDJPY=X, EURJPY=X など
+                return 2
+            return 4
+
+        # 代表ティッカー（小数桁判定用）
+        tkr = ss.get("ticker_1d") or ss.get("ticker_4h") or ss.get("ticker") or ss.get("symbol") or ""
+
+        # 明示キー優先で拾う → 見つからなければ fuzzy で拾う
+        def _pick_exact(keys):
+            for k in keys:
+                if k in ss and ss.get(k) not in (None, "", []):
+                    return ss.get(k)
+            return None
+
+        def _pick_fuzzy(include_tokens, exclude_tokens=None):
+            inc = [tok.lower() for tok in include_tokens]
+            exc = [tok.lower() for tok in (exclude_tokens or [])]
+            for k in ss.keys():
+                kl = str(k).lower()
+                if all(tok in kl for tok in inc) and not any(tok in kl for tok in exc):
+                    v = ss.get(k)
+                    if v not in (None, "", []):
+                        return v
+            return None
+
+        # 共通
+        raw_u_common = _pick_exact(["bp_upper", "breakpoint_upper", "bpUp", "ui_bp_upper"]) \
+                       or _pick_fuzzy(["bp", "upper"])
+        raw_l_common = _pick_exact(["bp_lower", "breakpoint_lower", "bpDown", "ui_bp_lower"]) \
+                       or _pick_fuzzy(["bp", "lower"])
+
+        # 時間軸別（D1/H4）
+        raw_u_d1 = _pick_exact(["d1_bp_upper", "bp_d1_upper", "ui_d1_bp_upper"]) \
+                   or _pick_fuzzy(["d1", "bp", "upper"])
+        raw_l_d1 = _pick_exact(["d1_bp_lower", "bp_d1_lower", "ui_d1_bp_lower"]) \
+                   or _pick_fuzzy(["d1", "bp", "lower"])
+
+        raw_u_h4 = _pick_exact(["h4_bp_upper", "bp_h4_upper", "ui_h4_bp_upper"]) \
+                   or _pick_fuzzy(["h4", "bp", "upper"])
+        raw_l_h4 = _pick_exact(["h4_bp_lower", "bp_h4_lower", "ui_h4_bp_lower"]) \
+                   or _pick_fuzzy(["h4", "bp", "lower"])
+
+        # 文字列→数値（0 扱いは None）
+        u_common = _to_float(raw_u_common)
+        l_common = _to_float(raw_l_common)
+        u_d1     = _to_float(raw_u_d1)
+        l_d1     = _to_float(raw_l_d1)
+        u_h4     = _to_float(raw_u_h4)
+        l_h4     = _to_float(raw_l_h4)
+
+        # どの時間軸の値を本文に使うか
+        axis_pref = ss.get("bp_axis_for_text") or ss.get("bp_axis") or ss.get("bp_tf_for_text") or ss.get("breakpoint_axis_for_text") or "自動（基準に合わせる）"
+
+        # 自動：本文ベース足に合わせて D1/H4 を優先し、無ければ共通
+        def _choose_pair():
+            if axis_pref == "日足のみ":
+                return (u_d1, l_d1, "（日足）")
+            if axis_pref == "4時間足のみ":
+                return (u_h4, l_h4, "（4時間足）")
+            # 自動
+            base = tf_base_effective
+            if base == "日足":
+                uu, ll = (u_d1, l_d1)
+                tfp = "（日足）"
+            else:
+                uu, ll = (u_h4, l_h4)
+                tfp = "（4時間足）"
+            # なければ共通へフォールバック
+            if uu is None and ll is None:
+                return (u_common, l_common, "")
+            return (uu, ll, tfp)
+
+        u_val, l_val, tf_phrase = _choose_pair()
+
+        # 共通にも何も無ければ、本文へは書かない
+        if (u_val is not None) or (l_val is not None):
+            dec = _decimals_for_ticker(tkr)
+            fmt_u = (f"{u_val:.{dec}f}" if u_val is not None else None)
+            fmt_l = (f"{l_val:.{dec}f}" if l_val is not None else None)
+
+            import random
+            around = random.choice(["付近", "前後", "どころ"])
+            if fmt_u and fmt_l:
+                bits.append(f"上値は{fmt_u}{around}、下値は{fmt_l}{around}{tf_phrase}。")
+            elif fmt_u:
+                bits.append(f"上値は{fmt_u}{around}{tf_phrase}。")
+            elif fmt_l:
+                bits.append(f"下値は{fmt_l}{around}{tf_phrase}。")
+
+    except Exception:
+        # いかなる例外も本文生成を止めない
+        pass
+
+    # 結び
+    bits.append("過度な一方向は決めつけにくく、まずは反応を確かめたい。")
+
+    text = "".join(bits).replace("。。", "。").strip()
+    return text
+
+
+
+
+
+para2_seed_v21 = _compose_para2_v21()
+default_para2_seed = para2_seed_v21
+
+# === ここまで（常時2枚表示 & ベース足選択 & 自動選択 & H4ベース時にD1所見を必ず挿入） ===
 
 
 st.markdown("### ステップ1：参照PDFの確認")
@@ -1217,6 +5478,72 @@ def _fetch_1h_metrics(pair: str, days: int = 30) -> LiveMetrics | None:
             continue
     return None
 
+# ==== 段落①用：市場データユーティリティ（重複定義しない） ====
+from datetime import datetime, timezone, timedelta
+
+# JST文字列（as of 用）
+if "_jst_now_str" not in globals():
+    def _jst_now_str() -> str:
+        try:
+            JST = timezone(timedelta(hours=9))
+            return datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+        except Exception:
+            # タイムゾーンが使えない環境でも落ちない
+            return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+# 終値ベース：直近(t0)と一つ前(t-1)の終値を返す（週末・休場は period で吸収）
+if "_yf_last_two_daily" not in globals():
+    def _yf_last_two_daily(ticker: str):
+        """
+        戻り値: (prev_close, last_close)
+        取得失敗時は None
+        """
+        try:
+            import yfinance as yf
+        except Exception:
+            return None
+        try:
+            df = yf.download(ticker, period="15d", interval="1d", auto_adjust=False, progress=False)
+            if df is None or df.empty or "Close" not in df:
+                return None
+            close = df["Close"].dropna()
+            if len(close) < 2:
+                return None
+            prev_close = float(close.iloc[-2])
+            last_close = float(close.iloc[-1])
+            return (prev_close, last_close)
+        except Exception:
+            return None
+
+# ％変化（小数→％表示用）
+if "_pct" not in globals():
+    def _pct(prev: float, last: float) -> float:
+        try:
+            return (float(last) / float(prev) - 1.0) * 100.0
+        except Exception:
+            return 0.0
+
+# ％のフォーマット（±X.X%）
+if "_fmt_pct" not in globals():
+    def _fmt_pct(p: float) -> str:
+        try:
+            return f"{float(p):+,.1f}%"
+        except Exception:
+            return "+0.0%"
+
+# bpのフォーマット（^TNX用：差×10がbp）
+if "_fmt_bp" not in globals():
+    def _fmt_bp(prev: float, last: float) -> int:
+        try:
+            return int(round((float(last) - float(prev)) * 10))
+        except Exception:
+            return 0
+
+
+
+
+
+
 def _classify_regime(m: LiveMetrics, cfg: dict) -> str:
     """
     戻り値：'trend_up' / 'trend_down' / 'range'
@@ -1311,240 +5638,140 @@ def _get_secret(name: str) -> str | None:
         pass
     return os.environ.get(name)
 
-def _load_events_csv(path: Path) -> list[dict]:
-    """CSV: 列は『時刻, 指標, 地域, カテゴリ』想定。存在しなければ [] を返す。"""
-    try:
-        df = pd.read_csv(path, encoding="utf-8")
-        req = {"時刻","指標","地域","カテゴリ"}
-        if not req.issubset(df.columns):
-            st.warning(f"CSV列名が不足: 必要{req} / 実際{set(df.columns)}")
-            return []
-        df["時刻"] = df["時刻"].astype(str).str.strip()
-        df["指標"] = df["指標"].astype(str).str.strip()
-        df["地域"] = df["地域"].astype(str).str.strip()
-        df["カテゴリ"] = df["カテゴリ"].astype(str).str.strip()
-        return df[["時刻","指標","地域","カテゴリ"]].to_dict("records")
-    except FileNotFoundError:
-        return []
-    except Exception as e:
-        st.warning(f"CSV読込エラー: {e}")
-        return []
 
-
-# ===== TE API: シークレット取得 / JST / 国コード変換 / 本体 =====
-import requests
-from datetime import datetime as _dt, date as _date_cls, timezone as _tz, timedelta as _td
-
-# JSTタイムゾーン
-JST = _tz(_td(hours=9))
-
-def _get_secret_value(name: str) -> str | None:
-    """secrets → [general] → 環境変数 の順で安全に読む。"""
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-        if "general" in st.secrets and name in st.secrets["general"]:
-            return st.secrets["general"][name]
-    except Exception:
-        pass
-    import os
-    return os.environ.get(name)
-
-# 互換: もし既存コードに _get_secret(...) 呼び出しが残っていても動くようエイリアスを用意
-def _get_secret(name: str) -> str | None:
-    return _get_secret_value(name)
-
-
+# ===== FxON専用：地域略称 / 時刻整形 / 取得→本文（段落③）・本日のポイント生成 =====
+from datetime import date as _date_cls, datetime as _dt
+import re
 
 def _region_code_to_jp_prefix(code: str) -> str:
-    """地域コード→日本語接頭辞（米・日・欧・英・豪・南ア など）。なければそのままコード。"""
+    """地域コード→日本語接頭辞（米・日・欧・英・豪・NZ・中・南ア・独・仏・伊・加・西・スイス）。なければそのままコード。"""
     code = (code or "").upper()
-    jp = {
-        "US": "米",
-        "JP": "日",
-        "EU": "欧",
-        "UK": "英",
-        "AU": "豪",
-        "NZ": "NZ",   # 慣例上そのまま表記でもOK
-        "CN": "中",
-        "ZA": "南ア",
-        "DE": "独",
-        "FR": "仏",
-        "IT": "伊",
-        "CA": "加",
-        "ES": "西",
-        "CH": "スイス",
+    m = {
+        "US": "米", "JP": "日", "EU": "欧", "UK": "英", "AU": "豪", "NZ": "NZ",
+        "CN": "中", "ZA": "南ア", "DE": "独", "FR": "仏", "IT": "伊", "CA": "加",
+        "ES": "西", "CH": "スイス",
     }
-    return jp.get(code, code)
+    return m.get(code, code)
 
-def _parse_te_datetime_to_jst_hhmm(date_str: str) -> str:
-    """TEの日時文字列を JST の 'H:MM' へ。失敗時は空文字。"""
-    if not date_str:
-        return ""
-    # 例: "2025-08-13T09:00:00Z" / "2025-08-13T09:00:00"
-    try:
-        ts = date_str.replace("Z", "+00:00")
-        dt = _dt.fromisoformat(ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_tz.utc)
-        j = dt.astimezone(JST)
-        return f"{j.hour}:{j.minute:02d}"
-    except Exception:
-        pass
-    # 例: "2025-08-13 09:00:00"
-    try:
-        dt = _dt.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
-        j = dt.astimezone(JST)
-        return f"{j.hour}:{j.minute:02d}"
-    except Exception:
-        return ""
+def _fmt_hhmm_any(val) -> tuple[str, int]:
+    """
+    値を 'H:MM' に正規化。並べ替え用に total_minutes も返す（不明は大きな数）。
+    受け入れ：'21:30' / '09:05' / ISO文字列 / datetime / dict{'hour','minute'} など。
+    """
+    if val is None:
+        return "--:--", 10**9
 
-# ---- TradingEconomics 当日イベント取得（診断つき）----
-from datetime import datetime, date, timedelta, timezone
-import requests
-
-JST = timezone(timedelta(hours=9))
-
-def _get_secret(name: str, default: str | None = None) -> str | None:
-    # secrets.toml → 環境変数 → default の順で探す
-    try:
-        import streamlit as st
-        v = st.secrets.get(name)
-        if v:
-            return v
-    except Exception:
-        pass
-    import os
-    return os.environ.get(name, default)
-
-
-    c = (country or "").lower()
-    if "united states" in c or c in {"us","u.s.","usa","u.s.a."}: return "US"
-    if "japan" in c or c in {"jp","jpn"}: return "JP"
-    if "euro" in c or c in {"eu","euro area","eurozone"}: return "EU"
-    if "united kingdom" in c or c in {"uk","gb","gbr"}: return "UK"
-    if "australia" in c or c in {"au","aus"}: return "AU"
-    if "new zealand" in c or c in {"nz","nzl"}: return "NZ"
-    if "china" in c or c in {"cn","chn"}: return "CN"
-    if "south africa" in c or c in {"za","zaf"}: return "ZA"
-    return (country or "")[:2].upper()
-
-def _parse_te_datetime(s: str) -> datetime | None:
-    if not s: return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
+    # 文字列 'HH:MM'
+    if isinstance(val, str):
+        s = val.strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+        if m:
+            h, mm = int(m.group(1)), int(m.group(2))
+            return f"{h}:{mm:02d}", h * 60 + mm
+        # ISO日時を一応救済
         try:
-            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+            h, mm = dt.hour, dt.minute
+            return f"{h}:{mm:02d}", h * 60 + mm
         except Exception:
-            return None
+            return "--:--", 10**9
 
-from datetime import datetime, timezone, timedelta, date
-import requests
+    # datetime
+    if isinstance(val, _dt):
+        h, mm = val.hour, val.minute
+        return f"{h}:{mm:02d}", h * 60 + mm
 
-JST = timezone(timedelta(hours=9))
-
-def _get_secret(name: str) -> str | None:
-    # 既にある同名の補助関数があればそれを使ってOK
+    # dict など
     try:
-        import os, streamlit as st
-        return st.secrets.get(name) or os.environ.get(name)
+        h, mm = int(val.get("hour", 0)), int(val.get("minute", 0))
+        return f"{h}:{mm:02d}", h * 60 + mm
     except Exception:
-        import os
-        return os.environ.get(name)
+        return "--:--", 10**9
 
-
-def _fetch_events_tradingeconomics(target_date: date, cfg: dict):
+def _fxon_call_list(d1: str, d2: str) -> list[dict]:
     """
-    TradingEconomics カレンダーAPIから target_date のイベントを取得。
-    時刻が取れない行も捨てずに '時刻' は '--:--' として返す。
-    返り値: (rows, diag)
-      - rows: [{"時刻","指標","地域","カテゴリ"}, ...]
-      - diag: 診断情報（UIの expander に表示）
+    既存の FxON リストAPI関数を呼ぶための薄いラッパ。
+    環境により関数名が異なる可能性を吸収する。
     """
-    prov = (cfg.get("providers") or {}).get("tradingeconomics") or {}
-    if not prov.get("enabled"):
-        return [], {"enabled": False}
-
-    endpoint = prov.get("endpoint") or "https://api.tradingeconomics.com/calendar"
-    key_env  = prov.get("key_env")  or "TE_API_KEY"
-    timeout  = prov.get("timeout_sec", 12)
-
-    api_key = _get_secret(key_env)
-    if not api_key:
-        api_key = "guest:guest"  # 無料ゲストでまずは動かす
-
-    # APIの日付はUTC基準ですが、まずは素直に target_date の1日を指定
-    d1 = target_date.strftime("%Y-%m-%d")
-    d2 = d1
-    params = {"c": api_key, "d1": d1, "d2": d2, "format": "json"}
-
-    url = endpoint
-    http_status = None
-    err_msg = None
-    data = []
+    # 既存のどれかが定義されている前提（プロジェクトに合わせて優先順）
+    for fn in ("_fxon_fetch_list", "fxon_fetch_list", "fetch_fxon_events"):
+        f = globals().get(fn)
+        if callable(f):
+            return f(d1, d2)
+    # キャッシュを使っている場合の救済
     try:
-        r = requests.get(url, params=params, timeout=timeout)
-        http_status = r.status_code
-        r.raise_for_status()
-        data = r.json() if r.content else []
-    except Exception as e:
-        err_msg = str(e)
-        return [], {
-            "enabled": True, "endpoint": endpoint, "key_env": key_env,
-            "has_key": bool(api_key), "d1": d1, "d2": d2,
-            "http_status": http_status, "error": err_msg, "api_raw_count": 0,
-        }
+        return list(st.session_state.get("_fxon_cached_rows", []) or [])
+    except Exception:
+        return []
 
-    rows = []
-    filtered_blank_time = 0
-    for it in (data or []):
-        # 代表的なフィールド名に対応
-        indicator = (it.get("Event") or it.get("Indicator") or "").strip()
-        country   = (it.get("Country") or "").strip()
-        category  = (it.get("Category") or "").strip()
-        date_str  = it.get("Date") or it.get("DateUTC") or it.get("DateISO") or ""
+def _events_from_fxon_for_date(target_date: _date_cls) -> list[dict]:
+    """
+    FxON API から target_date のイベントを取り出し、
+    {time, minute_sort, name, region, category, score} に正規化した行の配列を返す。
+    """
+    d1 = d2 = target_date.strftime("%Y-%m-%d")
+    raw = _fxon_call_list(d1, d2)
 
-        # JSTの H:MM を生成（うまく読めなければ 空 → 後で '--:--' に置換）
-        hhmm = ""
-        if date_str:
-            dt = None
-            try:
-                dt = datetime.fromisoformat(date_str.replace("Z","+00:00"))
-            except Exception:
-                try:
-                    dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                except Exception:
-                    dt = None
-            if dt:
-                j = dt.astimezone(JST)
-                hhmm = f"{j.hour}:{j.minute:02d}"
-
-        if not indicator:
+    out: list[dict] = []
+    for it in (raw or []):
+        # 代表的なキー名のゆらぎを吸収
+        # 日付一致チェック（ある場合のみ）
+        day = (it.get("date") or it.get("日付") or "").strip()
+        if day and day[:10] != d1:
             continue
 
-        # ★ここがポイント：時刻が空でも捨てない（'--:--' にする）
-        if not hhmm:
-            filtered_blank_time += 1
-            hhmm = "--:--"
+        name   = (it.get("name")   or it.get("指標") or it.get("title") or "").strip()
+        region = (it.get("region") or it.get("地域") or it.get("country_code") or it.get("country") or "").strip()
+        score  = it.get("score")   or it.get("スコア") or 0
 
-        rows.append({
-            "時刻": hhmm,
-            "指標": indicator,
-            "地域": CANON_map_country_to_region(country),
-            "カテゴリ": category or "",
+        # 時刻
+        hhmm, minute_sort = _fmt_hhmm_any(it.get("time") or it.get("時刻") or it.get("datetime") or it.get("dt"))
+        if not name:
+            continue
+
+        out.append({
+            "time": hhmm,
+            "minute_sort": minute_sort,
+            "name": name,
+            "region": region,
+            "category": (it.get("category") or it.get("カテゴリ") or "").strip(),
+            "score": int(score) if str(score).isdigit() else 0,
         })
 
-    diag = {
-        "enabled": True, "endpoint": endpoint, "key_env": key_env,
-        "has_key": bool(api_key), "d1": d1, "d2": d2,
-        "http_status": http_status, "error": err_msg,
-        "api_raw_count": len(data or []),
-        "returned_rows": len(rows),
-        "blank_time_to_dash": filtered_blank_time,  # 空時刻を '--:--' にした件数
-        "requested_url": r.url if 'r' in locals() else url,
-    }
-    return rows, diag
+    # 時刻順（不明 '--:--' は最後）
+    out.sort(key=lambda r: r["minute_sort"])
+    return out
+
+def compose_calendar_line_from_fxon(target_date: _date_cls) -> str:
+    """
+    本文③の1行テキストを FxON のみで生成：
+    例）'本日の指標は、21:30 に米・◯◯、23:00 に米・◯◯。'
+    """
+    rows = _events_from_fxon_for_date(target_date)
+    if not rows:
+        return ""
+
+    lines = [f'{r["time"]} に{_region_code_to_jp_prefix(r["region"])}・{r["name"]}' for r in rows]
+    return "本日の指標は、" + "、".join(lines) + "。"
+
+def refresh_calendar_from_fxon(target_date: _date_cls, top_n: int = 2) -> None:
+    """
+    - st.session_state['calendar_line'] を FxONのみで更新
+    - st.session_state['points_tags_v2'] に“本日のポイント”用の2件を格納
+      （スコア降順→時刻昇順で抽出、スコアが無い場合は時刻順）
+    """
+    rows = _events_from_fxon_for_date(target_date)
+    st.session_state["calendar_line"] = compose_calendar_line_from_fxon(target_date)
+
+    if not rows:
+        st.session_state["points_tags_v2"] = []
+        return
+
+    ranked = sorted(rows, key=lambda r: (-int(r.get("score", 0)), r["minute_sort"]))
+    points = [f'{r["time"]} に{_region_code_to_jp_prefix(r["region"])}・{r["name"]}'
+            for r in ranked[:max(0, top_n)]]
+    st.session_state["points_tags_v2"] = points
+
 
 
 
@@ -1673,7 +5900,210 @@ def ta_block(symbol: str = "GBPJPY=X", days: int = 90):
 
 
 # ====== ステップ3：本文の下書き（編集可） ======
+
+# ==== 段落①（市況サマリー）自動生成ヘルパー ====
+from datetime import datetime, timezone, timedelta
+
+def _jst_now_str():
+    jst = timezone(timedelta(hours=9))
+    return datetime.now(jst).strftime("%Y-%m-%d %H:%M")
+
+def _yf_last_two_daily(ticker: str):
+    try:
+        import yfinance as yf
+        df = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
+        if df is None or df.empty or "Close" not in df:
+            return None
+        close = df["Close"].dropna()
+        if len(close) < 2:
+            return None
+        return float(close.iloc[-2]), float(close.iloc[-1])
+    except Exception:
+        return None
+
+def _pct_change(prev: float, last: float) -> float:
+    if prev == 0 or prev is None or last is None:
+        return 0.0
+    return (last / prev - 1.0) * 100.0
+
+def _fmt_pct(p: float) -> str:
+    sign = "+" if p >= 0 else ""
+    return f"{sign}{p:.1f}%"
+
+# ==== 段落① 本体：市場スナップショットから1文を生成 ====
+def _build_para1_from_market() -> str:
+    """
+    直近の有効終値(t0) と その一つ前(t-1) で比較し、段落①の1文を組み立てる。
+    - 株: ^DJI / ^GSPC / ^IXIC（3指数すべて％を明示）
+    - 金利: ^TNX（差×10=bp）→ ±3bp で三分岐
+    - 商品: CL=F / NG=F / GC=F のうち “動いた順に上位2つ”
+    - 文末に as of JST を付ける
+    """
+
+    # 既存ユーティリティが無い場合の軽いフォールバック
+    _yf = globals().get("_yf_last_two_daily")
+    if not callable(_yf):
+        return ""
+
+    _pct_fn = globals().get("_pct")
+    if not callable(_pct_fn):
+        def _pct_fn(a, b):
+            try:
+                return (b / a - 1.0) * 100.0
+            except Exception:
+                return 0.0
+
+    _fmt_pct_fn = globals().get("_fmt_pct")
+    if not callable(_fmt_pct_fn):
+        def _fmt_pct_fn(p):
+            return f"{p:+.1f}%"
+
+    # 1) 株価指数（ダウ / S&P500 / ナスダック）
+    dji = _yf("^DJI")
+    spx = _yf("^GSPC")
+    nas = _yf("^IXIC")
+
+    # ％変化
+    dji_pct = _pct_fn(*dji) if dji else None
+    spx_pct = _pct_fn(*spx) if spx else None
+    nas_pct = _pct_fn(*nas) if nas else None
+
+    # 文頭（営業日想定）判定用カウント（±0.1%未満は FLAT で除外）
+    ups = downs = 0
+    for p in (dji_pct, spx_pct, nas_pct):
+        if p is None:
+            continue
+        if abs(p) < 0.1:
+            continue
+        ups += (p > 0)
+        downs += (p < 0)
+
+    if ups == 3:
+        head = "米国市場は、主要3指数がそろって上昇となった。"
+    elif downs == 3:
+        head = "米国市場は、主要3指数がそろって下落となった。"
+    elif ups == 2 and downs == 1:
+        head = "米国市場は、主要3指数のうち2指数が上昇・1指数が下落となった。"
+    elif ups == 1 and downs == 2:
+        head = "米国市場は、主要3指数のうち1指数が上昇・2指数が下落となった。"
+    else:
+        head = "米国市場は、指標ごとに強弱が分かれた。"
+
+    # 株3指数はすべて％を明示
+    parts_idx = []
+    if dji_pct is not None:
+        parts_idx.append(f"ダウは{_fmt_pct_fn(dji_pct)}")
+    if spx_pct is not None:
+        parts_idx.append(f"S&P500は{_fmt_pct_fn(spx_pct)}")
+    if nas_pct is not None:
+        parts_idx.append(f"ナスダックは{_fmt_pct_fn(nas_pct)}")
+    part_idx = ("、".join(parts_idx) + "。") if parts_idx else ""
+
+    # 2) 米10年金利（^TNX → bp）
+    part_tnx = ""
+    delta_bp = None
+    tnx = _yf("^TNX")
+    if tnx:
+        try:
+            delta_bp = (tnx[1] - tnx[0]) * 10.0
+            if delta_bp > 3:
+                part_tnx = f"米10年金利は+{int(round(delta_bp))}bpと上昇。"
+            elif delta_bp < -3:
+                part_tnx = f"米10年金利は{int(round(delta_bp))}bpと低下。"
+            else:
+                part_tnx = "米10年金利は概ね横ばい。"
+        except Exception:
+            part_tnx = "米10年金利は概ね横ばい。"
+
+    # 3) 地合いの小結（株×金利）
+    if ups == 3 and (delta_bp is not None) and (delta_bp < -3):
+        mood = "株高・金利安の流れが意識されやすい。"
+    elif downs == 3 and (delta_bp is not None) and (delta_bp > 3):
+        mood = "株安・金利高のムードが意識されやすい。"
+    else:
+        mood = "方向性は限定的。"
+
+    # 4) 商品：動いた順に上位2つ（WTI / 天然ガス / 金）
+    movers = []
+    wti = _yf("CL=F")
+    ng = _yf("NG=F")
+    gold = _yf("GC=F")
+
+    if wti:
+        movers.append(("原油WTI", _pct_fn(*wti), wti[1]))
+    if ng:
+        movers.append(("天然ガス", _pct_fn(*ng), None))
+    if gold:
+        movers.append(("金", _pct_fn(*gold), gold[1]))
+
+    movers = [(n, p, last) for (n, p, last) in movers if p is not None]
+    movers.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    part_com = ""
+    if movers:
+        chunks = []
+        for name, p, last in movers[:2]:
+            if name == "原油WTI" and (last is not None):
+                chunks.append(f"{name}は{last:.1f}ドル付近（{_fmt_pct_fn(p)}）")
+            else:
+                chunks.append(f"{name}は{_fmt_pct_fn(p)}")
+        part_com = " " + "、".join(chunks) + "。"
+
+    # 5) 本日のポイント（Step5の2件があれば軽く言及）
+    part_pts = ""
+    try:
+        pts = list(st.session_state.get("points_tags_v2", []) or [])[:2]
+        if len(pts) == 2:
+            part_pts = f"本日は{pts[0]}と{pts[1]}が控えており、短期の振れに留意したい。"
+    except Exception:
+        part_pts = ""
+
+    # 6) as of（JST）
+    asof_fn = globals().get("_jst_now_str")
+    if callable(asof_fn):
+        asof = asof_fn()
+    else:
+        from datetime import datetime, timezone, timedelta
+        jst = timezone(timedelta(hours=9))
+        asof = datetime.now(jst).strftime("%Y-%m-%d %H:%M JST")
+
+    # 連結（句点の重複を避けて安全に）
+    text = " ".join([head, part_idx, part_tnx, mood]).strip()
+    if text and not text.endswith("。"):
+        text += "。"
+    text += part_com
+    text = text.replace("。。", "。").strip()
+    if part_pts:
+        if not text.endswith("。"):
+            text += "。"
+        text += " " + part_pts
+    text += f"（as of {asof}）"
+    return text
+
+
+from datetime import date as _date_cls
+refresh_calendar_from_fxon(_date_cls.today())
+
 st.markdown("### ステップ3：本文の下書き（編集可）")
+
+
+# ---- 文章クリーン（安全フォールバック）-----------------------------
+if "_clean_text_jp_safe" not in globals():
+    import re
+    def _clean_text_jp_safe(text: str) -> str:
+        s = str(text or "")
+        # 全角スペース→半角、タブ/連続空白の圧縮
+        s = s.replace("\u3000", " ")
+        s = re.sub(r"[ \t]+", " ", s)
+        # 句読点の前の余分な空白を除去
+        s = re.sub(r"\s+([、。])", r"\1", s)
+        s = s.strip()
+        # 末尾が句点で終わらない場合は句点を付ける（断定にならない範囲）
+        if s and not s.endswith(("。", "！", "？")):
+            s += "。"
+        return s
+# -------------------------------------------------------------------
+
 
 import re, unicodedata
 
@@ -1686,18 +6116,6 @@ except Exception:
     P1_MIN, P2_MIN = 220, 180
 
 # ---- ヘルパ ----
-def _clean_text_jp_safe(s):
-    try:
-        if "_clean_text_jp" in globals():
-            return _clean_text_jp(s)
-    except Exception:
-        pass
-    if not isinstance(s, str):  # 簡易版
-        return s
-    s = s.replace("\u3000", " ")
-    for a, b in [("  ", " "), (" 、", "、"), (" 。", "。"), ("、、", "、"), ("。。", "。")]:
-        s = s.replace(a, b)
-    return s.strip()
 
 def _pair_to_symbol(p):
     m = {
@@ -1731,27 +6149,538 @@ def _mentions_points(s, items):
     return False
 
 def _pad_para2_base(para2, min_chars):
-    base = str(para2 or "").strip()
-    if len(base) >= min_chars:
-        return base
-    addon = "短期は過度に方向感を決めつけず、節目やボリンジャーバンド周辺の反応を確かめつつ、値動きには警戒したい。"
-    if base and not base.endswith("。"):
-        base += " "
-    base += addon
-    return base
+    """段落②が短いとき、中立で安全な補助文を締めの直前に挿入して必ず min_chars 以上にする。"""
+    try:
+        s = _clean_text_jp_safe(str(para2 or "").strip())
+    except Exception:
+        s = str(para2 or "").strip()
+
+    if s and not s.endswith("。"):
+        s += "。"
+
+    def L(x: str) -> int:
+        return len(str(x).replace("\n", ""))
+
+    if L(s) >= min_chars:
+        return s
+
+    # 補助文（非断定・中立／締め文ではない）
+    fillers = [
+        "移動平均線周辺の反応を確かめつつ様子を見たい。",
+        "節目水準の手前では反応がぶれやすい。",
+        "指標通過後の方向性を見極めたい。",
+        "短期は値動きの粗さに留意したい。",
+    ]
+
+    # 決定論的に開始位置をずらす（同じ日×同じペアでは同じ順）
+    try:
+        pair = str(st.session_state.get("pair", "") or "")
+        asof = str(st.session_state.get("asof_date", "")) or __import__("datetime").date.today().isoformat()
+        import hashlib
+        start_idx = int(hashlib.md5(f"{pair}|{asof}|pad".encode("utf-8")).hexdigest(), 16) % len(fillers)
+    except Exception:
+        start_idx = 0
+
+    used = set()
+    i = 0
+    # 最大2文まで追加して必ず180字以上に到達させる
+    while L(s) < min_chars and i < len(fillers) * 2:
+        cand = fillers[(start_idx + i) % len(fillers)]
+        i += 1
+        if cand in s or cand in used:
+            continue
+        # 締め文の手前に入れるのが理想だが、ここでは文末に自然に追加（締めは別段で整形される）
+        if s and not s.endswith("。"):
+            s += "。"
+        s += cand
+        used.add(cand)
+
+    try:
+        s = _clean_text_jp_safe(s)
+    except Exception:
+        pass
+    return s
+
 
 # ---- Step5で選んだポイント（最大2件）----
 points_items = list(st.session_state.get("points_tags_v2", []) or [])[:2]
 
 # ===== 段落① =====
-default_para1 = (
-    "昨日は、米国市場で主要株価指数3銘柄のうち2銘柄が上昇となり、株高・金利安・原油横ばいの相場展開となった。"
-    "原油WTIは65.5ドル付近にて停滞。一方の天然ガスは、前日から0.78%下落。3.29ドル台まで落ち込んだ。"
-    "主要貴金属5銘柄はプラチナ以外が上昇となり、唯一下落したプラチナは、前日から1.01%低下。1,482ドル台で推移した。"
-    "米株はセクターごとに強弱が分かれ、指数全体の方向性は限定的だった。金利と商品市況は材料待ちのムードが続き、"
-    "決定的な手掛かりは乏しかった。海外勢のフローは時間帯によってばらつきがあり、イベント前の見送り姿勢が意識された。"
-)
+# 段落①の初期文を“実データで自動生成”。失敗/空なら安全テンプレにフォールバック
+try:
+    default_para1 = _build_para1_from_market()
+except Exception:
+    default_para1 = ""
+# --- NEW: 段落①の as-of を本文から取り外し、別保管（UI用） ---
+import re
+m = re.search(r"（as of ([^)]+)）$", str(default_para1))
+if m:
+    st.session_state["p1_asof_jst"] = m.group(1)      # 例: "2025-08-21 01:14"
+    default_para1 = str(default_para1)[:m.start()].rstrip()
+else:
+    st.session_state["p1_asof_jst"] = None
+# --- ここまで ---
+
+# 万一、取得に失敗して空なら簡易テンプレを使用（空のテキストエリアを防止）
+if not default_para1:
+    default_para1 = (
+        "米国市場は、指標ごとに強弱が分かれた。米10年金利は概ね横ばい。"
+        "方向性は限定的。"
+    )
+
+# === Step5: 祝日/休場の自動注記を段落①の本文先頭に1行だけ合成 ===
+# ここでは Step2 で保存した st.session_state["intro_overlay_text"] を使います。
+# 合成先の変数名が default_para1 でない場合は、下の2行の変数名だけ合わせてください。
+_overlay = (st.session_state.get("intro_overlay_text") or "").strip()
+if _overlay:
+    # 句点で終わっていなければ付ける（日本語の自然さを担保）
+    if not _overlay.endswith("。"):
+        _overlay += "。"
+    # 既存の段落①本文の先頭に重ねる（1行だけ）
+    default_para1 = (_overlay + default_para1.lstrip())
+# === Step5 ここまで ===
+
+# ---- Step5で選んだポイント（最大2件）----
+points_items = list(st.session_state.get("points_tags_v2", []) or [])[:2]
+
+
+# === Step6: 段落①の最低文字数ガード（220字未満ならやさしく補完） ===
+_MIN_P1 = 220
+
+def _pad_para1(text: str, target: int = _MIN_P1) -> str:
+    """事実を追加せず、一般的で非断定の一文を重ねて規定字数に到達させる。"""
+    base = (text or "").strip()
+    if len(base) >= target:
+        return base
+    # 句点でいったん整える
+    if base and not base.endswith("。"):
+        base += "。"
+    # 機械臭を抑えた汎用の追記候補（事実を断定しない・売買示唆なし）
+    fillers = [
+        "指標ごとに強弱が分かれるなか、過度な一方向は決めつけにくい。",
+        "短期的にはヘッドラインや時刻要因による振れに留意したい。",
+        "エネルギーや貴金属の動きも含めて全体の方向感は当面限定的となりやすい。",
+    ]
+    i = 0
+    while len(base) < target and i < len(fillers):
+        base += fillers[i]
+        if not base.endswith("。"):
+            base += "。"
+        i += 1
+    # まだ足りなければ、極めて穏当な一文で埋める
+    while len(base) < target:
+        base += "続く値動きの反応を確かめたい。"
+    return base
+
+
+default_para1 = _pad_para1(default_para1, _MIN_P1)
+# === Step6 ここまで ===
+# === Step8: 「株・金利・原油」の三点まとめを自動生成し、冒頭1文を差し替え ===
+import re as _re  # 既にimport済みでもOK
+
+def _pick_sign(val_str: str | None) -> int | None:
+    """'+1'上昇 / '-1'下落 / '0'横ばい / None=判定不可"""
+    if val_str is None:
+        return None
+    try:
+        v = float(val_str)
+        return 1 if v > 0 else (-1 if v < 0 else 0)
+    except Exception:
+        return None
+
+def _label_from_sign(maj: int, pos_word: str, neg_word: str, flat_word: str) -> str:
+    if maj > 0:
+        return pos_word
+    if maj < 0:
+        return neg_word
+    return flat_word
+
+def _majority_label(signs: list[int | None], tie_label: str) -> int:
+    """+1/-1/0 の多数決（Noneは無視）。同数・全Noneなら0（横ばい）"""
+    s = [x for x in signs if x is not None]
+    if not s:
+        return 0
+    pos = sum(1 for x in s if x > 0)
+    neg = sum(1 for x in s if x < 0)
+    if pos > neg:
+        return 1
+    if neg > pos:
+        return -1
+    return 0
+
+def _build_three_points_line(p1_text: str) -> str:
+    """段落①本文（既存の列挙）から、冒頭の要約1文を作る。"""
+    text = p1_text or ""
+
+    # 1) 株価（ダウ／S&P500／ナスダック）の±%を拾う
+    m_dj  = _re.search(r"ダウは([+\-]?\d+(?:\.\d+)?)%", text)
+    m_sp  = _re.search(r"S&P500は([+\-]?\d+(?:\.\d+)?)%", text)
+    m_ndx = _re.search(r"ナスダックは([+\-]?\d+(?:\.\d+)?)%", text)
+    s_stock = [
+        _pick_sign(m_dj.group(1) if m_dj else None),
+        _pick_sign(m_sp.group(1) if m_sp else None),
+        _pick_sign(m_ndx.group(1) if m_ndx else None),
+    ]
+    # 全て上昇/下落のときは「主要3指数がそろって…」
+    lead = ""
+    if all(x == 1 for x in s_stock if x is not None) and any(x is not None for x in s_stock):
+        lead = "主要3指数がそろって上昇となり、"
+    elif all(x == -1 for x in s_stock if x is not None) and any(x is not None for x in s_stock):
+        lead = "主要3指数がそろって下落となり、"
+    elif any(x is not None for x in s_stock):
+        lead = "主要3指数はまちまちとなり、"
+
+    stock_maj = _majority_label(s_stock, tie_label="横ばい")
+    stock_label = _label_from_sign(stock_maj, "株高", "株安", "株価横ばい")
+
+    # 2) 金利（テキストから語で判定：上昇/低下/横ばい）
+    rate_label = "金利横ばい"
+    if _re.search(r"金利.*?(上昇|高)", text):
+        rate_label = "金利高"
+    elif _re.search(r"金利.*?(低下|下落|安)", text):
+        rate_label = "金利安"
+    elif _re.search(r"金利.*?横ばい", text):
+        rate_label = "金利横ばい"
+
+    # 3) 原油WTI（±%を拾う→高/安/横ばい）
+    m_wti = _re.search(r"原油WTIは.*?([+\-]?\d+(?:\.\d+)?)%", text)
+    wti_sign = _pick_sign(m_wti.group(1) if m_wti else None)
+    wti_label = _label_from_sign(
+        0 if wti_sign is None else wti_sign, "原油高", "原油安", "原油横ばい"
+    )
+
+    # 文の組み立て（サンプル文体）
+    line = f"米国市場は、{lead}{stock_label}・{rate_label}・{wti_label}の流れ。"
+    return line
+
+def _inject_three_points_line(p1_text: str) -> str:
+    """本文の先頭1文を、三点まとめに差し替え or 先頭に付加"""
+    base = (p1_text or "").strip()
+    summary = _build_three_points_line(base)
+
+    # 先頭が「米国市場は」で始まるなら、最初の句点までを置き換え
+    if base.startswith("米国市場は"):
+        idx = base.find("。")
+        if idx != -1:
+            return summary + base[idx+1:]
+        return summary
+    # それ以外なら先頭に付ける
+    return summary + base
+
+default_para1 = _inject_three_points_line(default_para1)
+# === Step8 ここまで ===
+
+# === Step7: 日本語の句読点後の半角スペースを自動で詰める（見た目の自然さ向上） ===
+import re as _re  # 既に上で import 済みでも問題ありません
+def _jp_tighten_spaces(s: str) -> str:
+    if not s:
+        return s
+    s = _re.sub(r'([。、「」])\s+', r'\1', s)  # 句読点の直後の半角スペースを除去
+    s = _re.sub(r'\s{2,}', ' ', s)            # 連続スペースは1つに
+    return s
+default_para1 = _jp_tighten_spaces(default_para1)
+# === Step7 ここまで ===
+# === Step9: 段落①の重複フレーズを1回に揃える（機械臭の低減） ===
+def _dedupe_p1_lines(s: str) -> str:
+    if not s:
+        return s
+    # 繰り返しがちで意味が重複する注意文をターゲットにする（事実文には触れない）
+    phrases = [
+        "短期の振れに留意したい。",
+        "過度な一方向は決めつけにくい。",
+        "短期的にはヘッドラインや時刻要因による振れに留意したい。",
+        "続く値動きの反応を確かめたい。",  # ← 追加
+    ]
+    # 連続スペースの正規化（安全策）
+    s = s.replace("  ", " ")
+    for p in phrases:
+        first = s.find(p)
+        if first == -1:
+            continue
+        # 先頭の1回は残し、それ以降の同一文は削除
+        tail = s[first + len(p):].replace(p, "")
+        s = s[:first + len(p)] + tail
+    return s
+
+default_para1 = _dedupe_p1_lines(default_para1)
+# === Step9 ここまで ===
+
+# === Step10: 商品フレーズの微整形（「商品は …」にまとめる） ===
+import re as _re  # 既にimport済みならそのまま
+
+def _format_commodities_line(s: str) -> str:
+    if not s:
+        return s
+    text = s
+
+    # 1) 「天然ガスはA%、金はB%。」 → 「商品は天然ガスがA%、金がB%。」
+    #   - 末尾が句点で終わらない場合も考慮して安全に置換
+    pattern_ng_gold = _re.compile(r"(天然ガスは([+\-]?\d+(?:\.\d+)?)%、金は([+\-]?\d+(?:\.\d+)?)%)(。)?")
+    def _repl_ng_gold(m):
+        a = m.group(2); b = m.group(3)
+        return f"商品は天然ガスが{a}%、金が{b}%。"
+    text = pattern_ng_gold.sub(_repl_ng_gold, text)
+
+    # 2) 逆順「金はB%、天然ガスはA%。」にも対応
+    pattern_gold_ng = _re.compile(r"(金は([+\-]?\d+(?:\.\d+)?)%、天然ガスは([+\-]?\d+(?:\.\d+)?)%)(。)?")
+    def _repl_gold_ng(m):
+        b = m.group(2); a = m.group(3)
+        return f"商品は天然ガスが{a}%、金が{b}%。"
+    text = pattern_gold_ng.sub(_repl_gold_ng, text)
+
+    # 3) 不要な二重句点を防止
+    text = _re.sub(r"。。", "。", text)
+    return text
+
+default_para1 = _format_commodities_line(default_para1)
+# === Step10 ここまで ===
+# === Step11: 冒頭の導入句「昨日は/先週末は」を自動で付与（祝日注記がある日はスキップ） ===
+from datetime import datetime, timezone, timedelta
+
+def _prepend_lead_phrase_to_p1(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+
+    # すでに祝日/休場の自動注記を合成済みなら、その文頭を尊重して何もしない
+    overlay = (st.session_state.get("intro_overlay_text") or "").strip()
+    if overlay:
+        return text
+
+    now_jst = datetime.now(timezone(timedelta(hours=9)))
+    lead = "先週末は" if now_jst.weekday() == 0 else "昨日は"  # 月曜のみ「先週末は」、それ以外は「昨日は」
+
+    # 典型の文頭「米国市場は、」を「昨日は米国市場は、」に変換
+    # すでに「昨日は」「先週末は」で始まっている場合は何もしない
+    if text.startswith(("昨日は", "先週末は")):
+        return text
+
+    import re as _re
+    pattern = _re.compile(r"^(米国市場は[、，])")
+    new_text, n = pattern.subn(lead + r"\1", text, count=1)
+    return new_text if n > 0 else (lead + text)
+
+default_para1 = _prepend_lead_phrase_to_p1(default_para1)
+# === Step11 ここまで ===
+# === Step12: 導入句（二重化）を強制的に1文へ統一 ===
+import re as _re  # 既にimport済みでもOK
+
+def _collapse_double_lead(s: str) -> str:
+    if not s:
+        return s
+    text = s
+
+    # ケースA: 「米国市場は…。」の直後に「昨日は米国市場は…」or「先週末は米国市場は…」
+    # -> 先頭の「米国市場は…。」を削除し、導入句つきだけを残す
+    text = _re.sub(
+        r'^米国市場は[、，][^。]*。(?:\s*)(?=(?:昨日は|先週末は)米国市場は[、，])',
+        '',
+        text
+    )
+
+    # ケースB: 逆に、冒頭が「昨日は米国市場は…」の直後にもう一度「米国市場は…」が続く
+    # -> 2つ目の「米国市場は…」を削除
+    text = _re.sub(
+        r'^(?:昨日は|先週末は)米国市場は[、，][^。]*。(?:\s*)米国市場は[、，]',
+        lambda m: m.group(0).split('。')[0] + '。',  # 1つ目の文だけ残す
+        text
+    )
+
+    # 仕上げ：句読点直後スペースなどの体裁を再調整（既存関数があれば使う）
+    try:
+        text = _jp_tighten_spaces(text)
+    except Exception:
+        pass
+    return text
+
+default_para1 = _collapse_double_lead(default_para1)
+# === Step12 ここまで ===
+# === Step13: 商品の水準を簡潔に追記（WTI=XX.Xドル、金=X,XXXドル台） ===
+import math
+import yfinance as yf
+
+@st.cache_data(ttl=1800)
+def _yf_last_close(ticker: str) -> float | None:
+    try:
+        h = yf.Ticker(ticker).history(period="10d", interval="1d")
+        if h is None or h.empty:
+            return None
+        close = h["Close"].dropna()
+        return float(close.iloc[-1]) if not close.empty else None
+    except Exception:
+        return None
+
+def _gold_band(v: float) -> str:
+    # 100ドル刻みで「X,XXXドル台」表現
+    band = int(math.floor(v / 100.0) * 100)
+    return f"{band:,}ドル台"
+
+def _append_commodity_levels(text: str) -> str:
+    if not text:
+        return text
+    # すでに水準文が入っているなら何もしない
+    if ("ドル台" in text) or ("WTIは" in text and "ドル" in text):
+        return text
+
+    # 取得（失敗時は None）
+    wti = _yf_last_close("CL=F")   # 原油WTI先物
+    gold = _yf_last_close("GC=F")  # 金先物（$/oz）
+
+    if wti is None and gold is None:
+        return text
+
+    parts = []
+    if wti is not None:
+        parts.append(f"WTIは{wti:.1f}ドル")
+    if gold is not None:
+        parts.append(f"金は{_gold_band(gold)}")
+
+    return text.rstrip() + " " + "、".join(parts) + "。"
+
+default_para1 = _append_commodity_levels(default_para1)
+# === Step13 ここまで ===
+
+
+import re as _re  # 既にimport済みならそのまま
+
+_FLAT_TH = 0.1  # %単位（必要なら設定に出せます）
+
+def _apply_flat_label_to_text(s: str, th: float = _FLAT_TH) -> str:
+    """±th%未満を「横ばい」に言い換える。該当しなければ原文のまま。"""
+    if not s:
+        return s
+    def _rep(m):
+        name, val = m.group(1), float(m.group(2))
+        return f"{name}は横ばい" if abs(val) < th else m.group(0)
+    # 株3指数
+    s = _re.sub(r"(ダウ|S&P500|ナスダック)は([+\-]?\d+(?:\.\d+)?)%", _rep, s)
+    # コモディティ（本文に%が出るケース）
+    s = _re.sub(r"(原油WTI|天然ガス|金)は([+\-]?\d+(?:\.\d+)?)%", _rep, s)
+    return s
+
+def _sign_from_token(text: str, name: str) -> int | None:
+    """+1/-1/0(None=不明)。横ばい語も検出。"""
+    # 数値%優先
+    m = _re.search(fr"{_re.escape(name)}は([+\-]?\d+(?:\.\d+)?)%", text)
+    if m:
+        v = float(m.group(1))
+        if abs(v) < _FLAT_TH:
+            return 0
+        return 1 if v > 0 else -1
+    # 「横ばい」語
+    if _re.search(fr"{_re.escape(name)}は横ばい", text):
+        return 0
+    return None
+
+def _majority_label(signs: list[int | None]) -> int:
+    vals = [x for x in signs if x is not None]
+    if not vals:
+        return 0
+    pos = sum(1 for x in vals if x > 0)
+    neg = sum(1 for x in vals if x < 0)
+    if pos > neg:
+        return 1
+    if neg > pos:
+        return -1
+    return 0
+
+def _rebuild_three_points_flat(p1_text: str) -> str:
+    """三点まとめをFLAT対応で作り直し、先頭1文に反映。"""
+    import re as _re  # 念のためローカルimport（上でimport済みでもOK）
+
+    base = (p1_text or "").strip()
+
+    # ★自己参照回避：既に入っている要約文「（昨日は/先週末は）米国市場は、…の流れ。」を
+    #   判定用テキストから一度だけ除去し、純粋に本文の記述だけで再判定する
+    scan_base = _re.sub(r'^(?:昨日は|先週末は)?米国市場は[、，][^。]*。', '', base)
+
+    # 1) 株（本文の実数/横ばい語から判定）
+    s_stock = [
+        _sign_from_token(scan_base, "ダウ"),
+        _sign_from_token(scan_base, "S&P500"),
+        _sign_from_token(scan_base, "ナスダック"),
+    ]
+    lead = ""
+    if all(x == 1 for x in s_stock if x is not None) and any(x is not None for x in s_stock):
+        lead = "主要3指数がそろって上昇となり、"
+    elif all(x == -1 for x in s_stock if x is not None) and any(x is not None for x in s_stock):
+        lead = "主要3指数がそろって下落となり、"
+    elif any(x is not None for x in s_stock):
+        lead = "主要3指数はまちまちとなり、"
+
+    stock_maj = _majority_label(s_stock)
+    stock_label = "株高" if stock_maj > 0 else ("株安" if stock_maj < 0 else "株価横ばい")
+
+    # 2) 金利（まず本文の「米10年金利は…」系を優先して判定、なければ語ベース）
+    rate_label = "金利横ばい"
+    if _re.search(r"米?10年金利.*?(低下|下落|-?\d+\s?bp|−?\d+\s?bp)", scan_base):
+        # 低下語や -Nbp があれば「金利安」
+        rate_label = "金利安"
+    elif _re.search(r"米?10年金利.*?(上昇|\+?\d+\s?bp|＋?\d+\s?bp)", scan_base):
+        rate_label = "金利高"
+    elif _re.search(r"米?10年金利.*?横ばい|概ね横ばい", scan_base):
+        rate_label = "金利横ばい"
+    else:
+        # フォールバック（一般語）：高/安/横ばい を拾う
+        if _re.search(r"金利.*?(上昇|高)", scan_base):
+            rate_label = "金利高"
+        elif _re.search(r"金利.*?(低下|下落|安)", scan_base):
+            rate_label = "金利安"
+        elif _re.search(r"金利.*?横ばい|概ね横ばい", scan_base):
+            rate_label = "金利横ばい"
+
+    # 3) 原油WTI（%または横ばい語）
+    wti_sign = _sign_from_token(scan_base, "原油WTI")
+    if wti_sign is None:
+        wti_label = "原油横ばい"
+    else:
+        wti_label = "原油高" if wti_sign > 0 else ("原油安" if wti_sign < 0 else "原油横ばい")
+
+    summary = f"米国市場は、{lead}{stock_label}・{rate_label}・{wti_label}の流れ。"
+
+    # 置換ルール：
+    # A) 先頭が「米国市場は」で始まる → 最初の句点まで差し替え
+    if base.startswith("米国市場は"):
+        idx = base.find("。")
+        return (summary + base[idx+1:]) if idx != -1 else summary
+
+    # B) 先頭が「昨日は/先週末は」+「米国市場は」で始まる → 導入句を保持したまま差し替え
+    m = _re.match(r"^(昨日は|先週末は)(米国市場は[、，])", base)
+    if m:
+        prefix = m.group(1)  # 「昨日は」or「先週末は」
+        core = summary.replace("米国市場は、", "", 1)  # summary のコア部分
+        idx = base.find("。")  # 先頭文の終わり
+        tail = base[idx+1:] if idx != -1 else ""
+        return f"{prefix}米国市場は、{core}{tail}"
+
+    # C) それ以外 → 先頭に要約を付加
+    return summary + base
+
+
+
+# 1) 本文の±0.1%未満を「横ばい」に
+default_para1 = _apply_flat_label_to_text(default_para1, _FLAT_TH)
+# 2) 先頭の三点まとめをFLAT対応で作り直す
+default_para1 = _rebuild_three_points_flat(default_para1)
+# 3) 仕上げに句読点スペースを再調整（既存の関数を再利用）
+try:
+    default_para1 = _jp_tighten_spaces(default_para1)
+except Exception:
+    pass
+# === Step11 ここまで ===
+
+# ★★★ ここに1行だけ追加 ★★★
+default_para1 = _apply_flat_label_to_text(default_para1, _FLAT_TH)
+
+# 段落①の入力欄（この行は既に入っていてOK）
 para1_input = st.text_area("段落①（市況サマリー）", value=default_para1, height=160, key="p1")
+
+# --- 段落① as-of の小さな表示（本文外） ---
+_asof = st.session_state.get("p1_asof_jst")
+if _asof:
+    st.caption(f"※ このレポートの市場データは、日本時間{_asof} 時点の情報です。")
+# --- ここまで ---
+
+
 
 # ①にポイントの“完全一致”が混入していれば軽く除去
 def _dedup_points_in_para(text, points):
@@ -1776,7 +6705,6 @@ use_live = st.checkbox(
 )
 
 pair_name = str(globals().get("pair", "") or "ポンド円")
-default_para2_seed = _default_para2_for_safe(pair_name)
 live_diag = {}
 
 if use_live:
@@ -1818,7 +6746,13 @@ if use_live:
                 except Exception:
                     pass
     except Exception as e:
+
+
         st.warning(f"テクニカル計算でエラー: {e}")
+# ▼ NEW: 下書きv2.1を入力欄に反映（未生成なら従来seedを維持）
+# SOT: プレビュー確定文 > v21 を優先し、句点を1つに正規化してクリーン
+default_para2_seed = _clean_text_jp_safe(str((globals().get("_para2_preview") or para2_seed_v21)).strip().rstrip("。") + "。")
+
 
 # テキストエリア（ユーザー編集を受ける）
 para2_raw = st.text_area("段落②（為替テクニカル）",
@@ -1837,6 +6771,61 @@ try:
             para2_raw = fixed
 except Exception:
     pass
+# === StepP2-1: 段落②の整形（重複フレーズ削除＋句読点スペース詰め） ===
+def _dedupe_p2_lines(s: str) -> str:
+    if not s:
+        return s
+    # 繰り返しやすい締め文は先頭の1回だけ残す
+    phrases = [
+        "過度な方向感は決めつけない構えとしたい。",
+        "行方を注視したい。",
+        "値動きには警戒したい。",
+        "方向感を見極めたい。",
+        "反応を確かめたい。",
+    ]
+    s = s.replace("  ", " ")
+    for p in phrases:
+        first = s.find(p)
+        if first == -1:
+            continue
+        tail = s[first + len(p):].replace(p, "")
+        s = s[:first + len(p)] + tail
+    # 句読点直後スペースの除去（Step7で定義済み）
+    try:
+        s = _jp_tighten_spaces(s)
+    except Exception:
+        pass
+    return s
+
+# 段落②の最終整形
+para2_raw = _dedupe_p2_lines(str(para2_raw or ""))
+# === StepP2-1 ここまで ===
+# === StepP2-1b: ブレークポイント注記の追加（任意） ===
+try:
+    # UI側で設定された値を利用（0やNoneは無視）
+    bp_up_input = st.session_state.get("bp_up")
+    bp_dn_input = st.session_state.get("bp_dn")
+    apply_mode  = st.session_state.get("bp_axis") or "auto"
+
+    # どちらか片側でも設定があれば試す
+    if (bp_up_input or bp_dn_input):
+        if callable(globals().get("_choose_breakpoints")) and callable(globals().get("_bp_phrase")):
+        # ★ 引数なしで呼ぶ（戻り値は"付近"まで整形済みの文字列2つ）
+            up_txt, dn_txt, _ = _choose_breakpoints()
+
+        # ★ RSIやGC等の印象（なければ中立に）を渡す
+        d1_imp = st.session_state.get("d1_imp", "横ばい")
+        h4_imp = st.session_state.get("h4_imp", "横ばい")
+
+        # ★ 日本語の定型文へ（片側のみでもOK）
+        bp_line = _bp_phrase(up_txt, dn_txt, d1_imp, h4_imp)
+
+        # ★ 既に同趣旨の文がないときだけ追記（重複防止）
+        if bp_line and (bp_line not in para2_raw):
+            para2_raw = (para2_raw.rstrip("。") + " " + bp_line).strip()
+except Exception:
+    pass
+# === StepP2-1b ここまで ===
 
 # 句点で終わるよう整形
 para2 = str(para2_raw or "").strip()
@@ -1864,24 +6853,96 @@ def _default_title_for_safe(p, tail):
 default_title = _default_title_for_safe(pair_name, title_tail_ai)
 title = st.text_input("タイトル（最後は回収します）", value=default_title, key=f"title_{pair_name}")
 
-# ===== ①にポイント一言を自動挿入（重複防止）→ for_build を作る =====
-para1_build = _clean_text_jp_safe(para1)
+
+# --- 追加：①の最小文字数を安全に満たす（未定義なら定義）---
+if "_pad_para1_base" not in globals():
+    def _pad_para1_base(text: str, min_chars: int = 220) -> str:
+        # まず軽く整形
+        try:
+            s = _clean_text_jp_safe(text)
+        except Exception:
+            s = str(text or "")
+
+        def _len_no_nl(t: str) -> int:
+            return len("".join(str(t).splitlines()))
+
+        if _len_no_nl(s) >= min_chars:
+            return s
+
+        # 断定を避けた薄い補足文を順に追加（重複は避ける）
+        fillers = [
+            "指標ごとの強弱が混在し、方向性は限定的となりやすい。",
+            "短期は過度な断定を避け、ヘッドラインの一報に左右されやすい。",
+            "イベント前後は一時的な振れもあり、値動きの行き過ぎには注意したい。",
+        ]
+        for f in fillers:
+            if _len_no_nl(s) >= min_chars:
+                break
+            if f not in s:
+                if s and not s.endswith(("。", "！", "？")):
+                    s += "。"
+                s += " " + f
+
+        # まだ足りなければ安全な定型文で埋める
+        while _len_no_nl(s) < min_chars:
+            s += " 市場は材料待ちとなりやすく、短期の振れに留意したい。"
+
+        return s
+
+# ===== ① 最低文字数を担保＋ポイント一言（重複防止） =====
+import re
+
+# ①の安全初期化（for_build > ui > "" の優先）
+para1_build = (
+    globals().get("para1_for_build")
+    or globals().get("para1")
+    or ""
+)
+para1_build = _clean_text_jp_safe(str(para1_build))
+
+# 最低文字数を担保
+para1_build = _pad_para1_base(para1_build, P1_MIN)
+
+# Step5 の選択ポイント（最大2件）を取得
+points_items = list(st.session_state.get("points_tags_v2", []) or [])[:2]
+
+# ①内で既に触れているかを判定
+def _mentions_points(s: str, items: list[str]) -> bool:
+    if not s or not items:
+        return True
+    body = str(s).replace(" ", "")
+    for it in items:
+        key = (it.split("に", 1)[-1] or "").replace(" ", "")
+        if key and key in body:
+            return True
+    return False
+
+# 触れていなければ一言だけ自動挿入（似た文があれば除去してから）
 if points_items and not _mentions_points(para1_build, points_items):
     hint = "本日は" + "と".join(points_items) + "が控えており、短期の振れに留意したい。"
     para1_build = re.sub(r"本日は[^。]*?留意したい。", "", str(para1_build)).strip()
     if para1_build and not para1_build.endswith("。"):
         para1_build += " "
     para1_build += hint
+
+# 最後にもう一度クリーン
 para1_build = _clean_text_jp_safe(para1_build)
 
-# ===== ②は“最終に近い形”へ軽くパディング → for_build を作る =====
-para2_build = _clean_text_jp_safe(para2)
-para2_build = _pad_para2_base(para2_build, P2_MIN)  # ここでは結びの固定はしない（Step6が担当）
+# ★段落①：最終ガード（重複・体裁・用語ロック）
+#   - 「米国市場は、主要3指数が…」の重複や句読点の重複、用語表記ゆれをここで吸収
+para1_build = _final_polish_and_guard(para1_build, para="p1")
+
+# ===== ② SOTを尊重：session_state["para2"] 優先で取得 → 句点正規化＋最低文字数 =====
+_base_p2 = str(st.session_state.get("para2") or globals().get("para2") or "")
+para2_build = _clean_text_jp_safe(_base_p2).strip().rstrip("。") + "。"
+para2_build = _pad_para2_base(para2_build, P2_MIN)  # 結びの固定はStep6が担当
 
 # ---- session_state へ格納（Step6 がこの2つを優先して使う）----
 st.session_state["para1_for_build"] = para1_build
 st.session_state["para2_for_build"] = para2_build
 st.session_state["default_title"]   = default_title  # Step6の見出し用に共有
+
+
 
 # ---- 文字数（“実効テキスト”基準で表示）----
 len_p1 = len(str(para1_build).replace("\n", ""))
@@ -1890,6 +6951,8 @@ st.caption(f"段落① 文字数: {len_p1} / 最低 {P1_MIN} 字（※for_build�
 st.caption(f"段落② 文字数: {len_p2} / 最低 {P2_MIN} 字（※for_build基準）")
 
 st.markdown("---")
+
+
 
 # ---- 内部診断（安全に表示）----
 with st.expander("内部診断（出力本文には含めません）", expanded=False):
@@ -2059,19 +7122,6 @@ st.markdown("### ステップ4：指標候補（TopN + チェックで本文③�
 # 目的：開発時だけ診断ログを表示（通常は非表示）
 show_debug = st.checkbox("診断ログを表示する（開発向け）", value=False)
 
-# 任意：接続診断（本文には出ません）—TEのキー確認だけ（レガシー互換）
-if show_debug:
-    import os as _os  # 念のためローカル import
-    with st.expander("接続診断（本文には出ません）", expanded=False):
-        prov = (CFG.get("providers", {}) or {}).get("tradingeconomics", {}) or {}
-        _name = prov.get("key_env", "TE_API_KEY")
-        try:
-            _has = bool(st.secrets.get(_name))  # secrets優先
-        except Exception:
-            _has = False
-        if not _has:
-            _has = bool(_os.environ.get(_name))
-        st.json({"TE_API_KEYが読めたか": _has, "endpoint": prov.get("endpoint")})
 
 # --- 1) 候補取得：FxON API専用（今日〜2日後の3日レンジ）-----------------------
 import requests, re
@@ -2550,19 +7600,24 @@ if point_candidates and len(st.session_state["points_tags_v2"]) < 2:
 
 # --- 段落①に『本日のポイント』を一言だけ自動挿入（重複防止・任意） ---
 import re
+import streamlit as st
+from datetime import datetime
+import json, unicodedata
 
+# 本日のポイント（最大2件）
 pts = [x for x in (st.session_state.get("points_tags_v2") or []) if x][:2]
 
 # para1_for_build の安全な初期化
-p1 = (para1_for_build if "para1_for_build" in locals()
-      else (para1 if "para1" in locals() else ""))
+p1 = (para1_for_build if "para1_for_build" in globals()
+      else (para1 if "para1" in globals() else ""))
 
 def _already_mentions(body: str, items: list[str]) -> bool:
     if not body or not items:
         return True
     b = re.sub(r"\s+", "", body)
     for it in items:
-        key = (it.split("に", 1)[-1] or "")  # "8:50に日・GDP..." → "日・GDP..."
+        # "8:50に日・GDP..." → "日・GDP..." のように先頭の時刻を除去して判定
+        key = (it.split("に", 1)[-1] or "")
         if key and key in b:
             return True
     return False
@@ -2576,17 +7631,61 @@ if pts and not _already_mentions(p1, pts):
     para1_for_build = (p1 + " " + line).strip()
 else:
     para1_for_build = p1
+# ---- 段落③：指標列の「時間 に 国・指標」体裁を統一 ----
+def _normalize_calendar_line(line: str) -> str:
+    import re, unicodedata
+    s = unicodedata.normalize("NFKC", str(line or "")).strip()
+    if not s:
+        return ""
+
+    # 例： "... 8:50に企業向けサービス価格指数(前年比)、10:30にRBA議事録、..."
+    # 「HH:MM に 〜」の並びを全部拾う
+    items = re.findall(r"([0-2]?\d:[0-5]\d)\s*に\s*([^、。]+)", s)
+    if not items:
+        return s  # 予期せぬ形式は素通し
+
+    def has_prefix(name: str) -> bool:
+        return re.match(r"^(米|日|英|欧|独|仏|豪|NZ|加|南ア|スイス|中)\s*・", name) is not None
+
+    def add_prefix(name: str) -> str:
+        if has_prefix(name):
+            return name
+        # 代表的なキーワード→国略称
+        mapping = [
+            (r"FOMC|レッドブック|連銀|MBA|S&P|ケース・シラー|JOLTS|中古住宅|新築住宅|API|財務省|T-Note|耐久財|ISM|コンファレンスボード|PCE|パウエル|ジェファーソン|ウォラー|ベージュブック|ダラス連銀|シカゴ連銀|NY連銀", "米"),
+            (r"RBA|Westpac|豪州|ブロック", "豪"),
+            (r"ANZ|NZ|ニュージーランド", "NZ"),
+            (r"ECB|ユーロ圏|ユーロ", "欧"),
+            (r"独|IFO|ZEW|ナーゲル|ドイツ", "独"),
+            (r"仏|フランス", "仏"),
+            (r"英|BOE|CBI|RICS|ネーションワイド|ハリファックス|ベイリー|グリーン", "英"),
+            (r"スイス|SNB|シュレーゲル", "スイス"),
+            (r"加|BOC|マックレム|カナダ", "加"),
+            (r"中国|最優遇貸出金利|ローンプライムレート|LPR", "中"),
+            (r"南ア|南アフリカ", "南ア"),
+            (r"日|東京都区部|日銀|国内企業物価|機械受注|企業向けサービス価格指数|景気動向|鉱工業|家計|対外/対内証券|マネーストック|全国消費者物価|景気ウォッチャー", "日"),
+        ]
+        for pat, c in mapping:
+            if re.search(pat, name):
+                return f"{c}・{name}"
+        return name  # 不明はそのまま
+
+    normalized = []
+    for t, body in items:
+        body = add_prefix(body.strip())
+        # 体裁：『時間␣に国・指標』
+        normalized.append(f"{t} に{body}")
+
+    # 区切りは読点。末尾の句点はここでは付けない（外側で付く想定）
+    return "、".join(normalized)
 
 
-## =========================
-# ====== ステップ6：プレビュー（公開用体裁 + 自動チェック + 保存） ======
-## =========================
-from datetime import datetime
-import json, re, unicodedata
-
+# =========================
+# ステップ6：プレビュー（公開用体裁 + 自動チェック + 保存）
+# =========================
 st.markdown("### ステップ6：プレビュー（公開用体裁 + 自動チェック）")
 
-# ---- 再読込コントロール（キーはユニークに）----
+# ---- 再読込コントロール ----
 c1, c2, c3 = st.columns([1, 1, 3])
 with c1:
     if st.button("クリーニング再読込", key="reload_clean_rules_main"):
@@ -2608,16 +7707,164 @@ with c3:
         except Exception as e:
             st.warning(f"再読込でエラー：{e}")
 
-# =========================
-# ここから “参照の一本化” と プレビュー組み立て
-# =========================
+# ③は唯一のソース（セッションの1本）だけ参照する  ← ← この行は残してOK（目印）
+# === NEW: FxONの地域コードを使って段落③の1行を確定生成 ===
+import re
+from datetime import datetime
 
-# ③は唯一のソース（セッションの1本）だけ参照する
-cal_line = str(st.session_state.get("calendar_line", "") or "").strip()
+def _abbr_from_region(v: str) -> str:
+    x = str(v or "").strip().upper()
+    # よく使う略称だけを堅く定義（不足は随時足せます）
+    m = {
+        "US":"米", "USA":"米", "UNITED STATES":"米",
+        "JP":"日", "JPN":"日", "JAPAN":"日",
+        "UK":"英", "GB":"英", "GBR":"英", "UNITED KINGDOM":"英",
+        "EU":"欧", "EA":"欧", "EZ":"欧", "EMU":"欧", "EUROZONE":"欧", "EURO AREA":"欧",
+        "AU":"豪", "AUS":"豪", "AUSTRALIA":"豪",
+        "NZ":"NZ", "NZL":"NZ", "NEW ZEALAND":"NZ",
+        "CH":"スイス", "CHE":"スイス", "SWITZERLAND":"スイス",
+        "CA":"加", "CAN":"加", "CANADA":"加",
+        "CN":"中国", "CHN":"中国", "CHINA":"中国",
+        "DE":"独", "DEU":"独", "GERMANY":"独",
+        "FR":"仏", "FRA":"仏", "FRANCE":"仏",
+        "IT":"伊", "ITA":"伊", "ITALY":"伊",
+    }
+    return m.get(x, "")  # わからない場合は空（無理に推測しない）
 
-# 本文①/②は “for_build” があればそれを優先（自動挿入した一文を反映）
+def _extract_hhmm(v) -> str:
+    s = str(v or "").strip()
+    # 文字列に HH:MM が含まれていればそれを使う（0 埋めはしない）
+    m = re.search(r"(\d{1,2}:\d{2})", s)
+    if m: return m.group(1)
+    # タイムスタンプ/ISO/日付時刻から HH:MM を抜く（ざっくり）
+    m = re.search(r"T?(\d{1,2}):(\d{2})", s)
+    if m: return f"{int(m.group(1))}:{m.group(2)}"
+    # 数値（分）やdatetimeが来ても安全に空返し
+    return ""
+
+def _strip_country_prefix(title: str) -> str:
+    # 既に「米・」「英・」などが先頭に付いていたら除去して再付与
+    return re.sub(r"^\s*[^\u30fb・]{1,6}[・･]\s*", "", str(title or "").strip())
+
+def _events_df_like():
+    # FxONからの候補テーブルを取りにいく（複数キーに対応）
+    for k in ["events_df", "fxon_events_df", "econ_events_df", "events_table"]:
+        df = st.session_state.get(k)
+        if df is not None:
+            return df
+    # list[dict] でも受ける
+    for k in ["events", "econ_events", "fxon_events"]:
+        arr = st.session_state.get(k)
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            return arr
+    return None
+
+def _pick(row, keys, default=""):
+    for k in keys:
+        if isinstance(row, dict) and k in row:  # list[dict] の場合
+            return row.get(k, default)
+        if hasattr(row, "__class__") and hasattr(row, "__getitem__"):  # DataFrame の行
+            try:
+                return row[k]
+            except Exception:
+                continue
+    return default
+
+def _build_cal_line_from_fxon() -> str:
+    src = _events_df_like()
+    if src is None:
+        return ""
+
+    # DataFrame / list[dict] 両対応のイテレータを用意
+    if hasattr(src, "to_dict"):  # pandas.DataFrame 想定
+        try:
+            records = src.to_dict(orient="records")
+        except Exception:
+            records = []
+    else:
+        records = list(src)
+
+    items = []
+    for r in records:
+        tm = _pick(r, ["time", "時刻", "local_time", "datetime", "start_at", "start"])
+        title = _pick(r, ["indicator", "title", "name", "指標"], "")
+        region = _pick(r, ["region", "country", "country_code", "ccy", "地域"], "")
+        abbr = _abbr_from_region(region)
+
+        hhmm = _extract_hhmm(tm)
+        ttl = _strip_country_prefix(title)
+
+        # 地域が取れないケースは“推測しない”でタイトルだけを出す（重大エラー化を避ける）
+        if hhmm and abbr:
+            items.append(f"{hhmm} に {abbr}・{ttl}")
+        elif hhmm and not abbr:
+            items.append(f"{hhmm} に {ttl}")  # region未提供はそのまま
+        elif abbr:
+            items.append(f"{abbr}・{ttl}")
+        else:
+            items.append(str(ttl))
+
+    # 時刻があるものを優先して時刻昇順、その後その他
+    def _key(s: str):
+        m = re.match(r"^(\d{1,2}):(\d{2})", s)
+        return (0, int(m.group(1)) * 60 + int(m.group(2))) if m else (1, 9999)
+    items = sorted(items, key=_key)
+
+    # 連結して返す（「本日の指標は、」は上位側で付与される設計）
+    return "、".join(items)
+
+# 実際の適用
+cal_line = _build_cal_line_from_fxon()
+if not cal_line:  # 念のための後方互換（従来の session_state 文字列が残っていれば使う）
+    cal_line = str(st.session_state.get("calendar_line", "") or "")
+cal_line = _final_polish_and_guard(cal_line, para="p3")
+
+cal_line = _normalize_calendar_line(cal_line)
+cal_line = re.sub(r"([。])\1+", r"\1", cal_line)
+
+# --- 本文①/②（for_build を優先） ---
 p1 = para1_for_build if "para1_for_build" in locals() else (para1 if "para1" in locals() else "")
-p2 = para2_for_build if "para2_for_build" in locals() else (para2 if "para2" in locals() else "")
+
+# --- 段落②は SOT（プレビュー確定文）で“1本に固定” ---
+p2_source = (
+    st.session_state.get("p2_ui_preview_text")   # パッチAで保存した確定文
+    or globals().get("_para2_preview")           # 互換経路（念のため）
+)
+
+if not p2_source:
+    # 例外的なフォールバック（通常ここには来ません）
+    try:
+        p2_source = _compose_para2_preview_mix()
+    except Exception:
+        try:
+            p2_source = _compose_para2_preview_from_ui()
+        except Exception:
+            pair = str(st.session_state.get("pair", "") or "")
+            d1   = st.session_state.get("d1_imp", "横ばい")
+            h4   = st.session_state.get("h4_imp", "横ばい")
+            p2_source = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+
+# 句点を1つに正規化＋軽くクリーン
+p2 = _clean_text_jp_safe(str(p2_source).strip().rstrip("。") + "。")
+
+# 以降の保存・再組版が“同じ値”だけを見るように固定
+st.session_state["para2"] = p2
+st.session_state["para2_for_build"] = p2
+
+# ★最終品質ガードを段落①/②に適用し、プレビュー用にも保存
+p1_out = _final_polish_and_guard(st.session_state.get("para1_for_build", ""), para="p1")
+p2_out = _final_polish_and_guard(st.session_state.get("para2_for_build", ""), para="p2")
+
+# 互換のため p1/p2 を上書きし、UIプレビューにも反映
+p1 = p1_out
+p2 = p2_out
+st.session_state["p1_ui_preview_text"] = p1
+st.session_state["p2_ui_preview_text"] = p2
+
+
+
+
+# （この後のプレビュー組み立ては既存の処理で p1, p2, cal_line を使ってください）
 
 # タイトルの最終確定（UI > default > 自動生成）
 ttl_display = (str(globals().get("title", "")).strip()
@@ -2630,11 +7877,26 @@ if not ttl_display:
 ttl_display = _clean_text_jp(ttl_display) if "_clean_text_jp" in globals() else ttl_display
 
 # ---- 本日のポイント（Step5選択を2件まで）----
+# ---- 本日のポイント（Step5選択を2件まで）----
 points = list(st.session_state.get("points_tags_v2", []) or [])[:2]
+
+# ←ここから追加：H:MM の直後に必ず半角スペース入りの「 に 」を挿入して体裁統一
+import re, unicodedata
+def _normalize_point_line(s: str) -> str:
+    t = unicodedata.normalize("NFKC", str(s or ""))
+    # 先頭の「時刻 + （空白任意）に」を「時刻 + 半角スペース + に」に正規化
+    t = re.sub(r'^\s*([0-9]{1,2}:[0-9]{2})\s*に', r'\1 に', t)
+    return t
+
+points = [_normalize_point_line(p) for p in points]
+# ←ここまで追加
+
 point1 = points[0] if len(points) > 0 else ""
 point2 = points[1] if len(points) > 1 else ""
 
+
 # ---- ①が『本日のポイント』に軽く触れていなければ自動で一言だけ挿入 ----
+import re, unicodedata  # 安全のためここで明示的にインポート
 def _mentions_points(s: str, items: list[str]) -> bool:
     if not s or not items: return True
     body = str(s).replace(" ", "")
@@ -2645,9 +7907,15 @@ def _mentions_points(s: str, items: list[str]) -> bool:
 
 def _strip_prefix_and_time(s: str) -> str:
     t = unicodedata.normalize("NFKC", str(s or ""))
-    return re.sub(r'^\s*([0-9]{1,2}:[0-9]{2})に(?:米|日|英|欧|豪|NZ|中国|南ア)・\s*', r'\1に', t)
+    # 「時刻（空白任意）に（空白任意）国・」を許容
+    return re.sub(
+        r'^\s*([0-9]{1,2}:[0-9]{2})\s*に\s*(?:米|日|英|欧|豪|NZ|中|南ア|独|仏|伊|加|西|スイス)・\s*',
+        r'\1に',
+        t
+    )
 
-_pts_short = [_strip_prefix_and_time(x) for x in points if x]
+
+_pts_short = [re.sub(r'(^|[^\d])([0-9]{1,2}:[0-9]{2})\s*に', r'\1\2 に', x) for x in points if x]
 if _pts_short and not _mentions_points(p1, points):
     # 既存の似た文を除去してから1行だけ入れる
     p1 = re.sub(r"本日は[^。]*?留意したい。", "", str(p1)).strip()
@@ -2671,6 +7939,31 @@ def pad_para2(para2: str, min_chars: int = 180) -> str:
     if base and not base.endswith("。"): base += " "
     base += addon
     return base
+# ---- 段落② 最終ガードの適用（最低文字数 & クローザー揃え）----
+# 1) 文字数を最低180字まで保証
+p2 = pad_para2(p2, min_chars=180)
+
+# 2) タイトル尾語に関わらず、②の結びを常にタイトルと整合させる（末尾の既存クローザーを一旦除去→付け直し）
+closer_pat_end = r"(行方を注視したい。|値動きには警戒したい。|当面は静観としたい。|一段の変動に要注意としたい。|方向感を見極めたい。)$"
+tail = (st.session_state.get("title_tail") or "").strip()
+closer_map = {
+    "注視か": "行方を注視したい。",
+    "警戒か": "値動きには警戒したい。",
+    "静観か": "当面は静観としたい。",
+    "要注意か": "一段の変動に要注意としたい。",
+    "見極めたい": "方向感を見極めたい。",
+}
+desired = closer_map.get(tail, "方向感を見極めたい。")
+p2 = re.sub(closer_pat_end, "", p2).rstrip("。") + "。" + desired
+
+
+# 3) 末尾の句点を1つに正規化（最後は必ず「。」1個）
+p2 = (p2 or "").strip().rstrip("。") + "。"
+
+# 4) 以降の処理でも “同じ値” を使うように再度統一保存
+st.session_state["para2"] = p2
+st.session_state["para2_for_build"] = p2
+
 
 # クリーニング
 para1_clean = _clean_text_jp(str(p1).strip()) if "_clean_text_jp" in globals() else str(p1).strip()
@@ -2702,6 +7995,11 @@ para2_final = pad_para2(para2_final, 180)
 if not _ends_with_closer(para2_final):
     if not para2_final.endswith("。"): para2_final += " "
     para2_final += "方向感を見極めたい。"
+# ---- 最終ポリッシュ（①/②ともにここで重複・体裁を一括ガード）----
+para1_final = _final_polish_and_guard(para1_clean, para="p1")
+para2_final = _final_polish_and_guard(para2_final, para="p2")
+st.session_state["para1_final"] = para1_final
+st.session_state["para2_final"] = para2_final
 
 # ---- タイトル回収（非LLMで堅く合成。LLM要約があれば前置き）----
 def _guess_pair_from_title(ttl: str) -> str:
@@ -2723,14 +8021,12 @@ def _points_label_join(opts: list[str]) -> str:
 
 def _synth_closer_nonllm(title: str, pair: str, bias_phrase: str,
                          cal_line: str, pts_join: str) -> str:
-    parts = []
-    if cal_line: parts.append(f"本日の指標は、{cal_line}。")
-    parts.append(f"特に{pts_join}の通過後は短期の振れに留意しつつ、" if pts_join
-                 else "イベント通過後の振れに留意しつつ、")
-    parts.append(f"{pair}の{bias_phrase}を確認したい。" if pair
-                 else f"相場の{bias_phrase}を確認したい。")
-    parts.append(title if title.endswith("。") else title + "。")
-    return "".join(parts)
+    # ③は本文側で別段落として扱う。ここは「タイトルのエコー（句点付き）」だけ返す。
+    t = (title or "").strip()
+    return t if t.endswith("。") else t + "。"
+
+
+
 
 def _try_llm_skim_summary(p1: str, p2: str, cal: str) -> str:
     return ""  # スキム要約は当面オフ（デバッグ混入防止）
@@ -2792,35 +8088,91 @@ try:
         )
 except Exception as e:
     st.warning(f"render_report 未定義またはエラーのため簡易構成で出力します: {e}")
-    lines = []
-    if ttl_display: lines += [f"タイトル：{ttl_display}", ""]
-    if points:      lines += ["本日のポイント", *points, ""]
-    if para1_clean: lines += [para1_clean, ""]
-    if para2_final: lines += [para2_final, ""]
-    # ③は title_recall に包含されるため、ここでは別途 cal_line を足さない
-    lines += [title_recall]
-    report_final = "\n".join(lines)
+    # （抜粋）render_report 失敗時の簡易組立て
+lines = []
+if ttl_display: lines += [f"タイトル：{ttl_display}", ""]
+if points:      lines += ["本日のポイント", *points, ""]
+if para1_clean: lines += [para1_clean, ""]
+if para2_final: lines += [para2_final, ""]
+if cal_line:    lines += [f"本日の指標は、{cal_line}。", ""]
+lines += [title_recall]
+report_final = "\n".join(lines)
 
-# ---- 締めの一貫化（古い締めが付いていたら差し替えて必ず title_recall に）----
+def _normalize_cal_line_for_closer(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    if "発表予定となっている" in s:
+        return s if s.endswith("。") else s + "。"
+    s = re.sub(r"(。)?\s*$", "", s)
+    return s + "が発表予定となっている。"
+
+# ---- 締めの一貫化（③は最後の1本だけ。③＋タイトルを同一行で）----
 try:
-    _text = (report_final or "").rstrip()
-    _text = re.sub(
-        r"(本日の指標は、.*?。)(?:.*?の方向感に(?:注視|警戒|静観|要注意)か。)?\s*$",
-        "",
-        _text,
-        flags=re.S,
-    )
+    import re
 
-    # ★追加：ここで末尾の改行・空白を一度すべて落とす（残りカスの改行を消す）
-    _text = _text.rstrip()
+    text = (report_final or "").strip()
+    tr   = (title_recall or "").strip()
 
-    # ★変更：常に「\n\n」= 空行1つだけ入れてタイトル回収を付与
-    if title_recall not in _text:
-        _text += "\n\n" + title_recall
+    # A) どこにあっても「タイトル回収の単独行」は削除（本文の通常文は残す）
+    if tr:
+        text = re.sub(rf"(?m)^\s*{re.escape(tr)}\s*$\n?", "", text)
 
-    report_final = _text.strip()
+    # B) ③段落（空行区切りのブロック）をすべて検出 → 最後の1本だけ残す
+    cal_pat = r"本日の指標は、.*?(?=\n\n|$)"
+    cal_matches = list(re.finditer(cal_pat, text, flags=re.S))
+    cal_last = ""
+    if cal_matches:
+        cal_last = cal_matches[-1].group(0).strip()
+        text = re.sub(cal_pat, "", text, flags=re.S).strip()
+    if cal_last:
+        cal_last = _normalize_cal_line_for_closer(cal_last)
+
+    # C) ③末尾の混入を除去 & 表記統一
+    if cal_last:
+        # ③末尾にタイトルがくっ付いていれば切り落とす
+        if tr:
+            cal_last = re.sub(rf"\s*{re.escape(tr)}\s*$", "", cal_last)
+        # 「方向感の見極めを確認したい。」→「方向感を見極めたい。」
+        cal_last = re.sub(r"方向感の見極めを確認したい。", "方向感を見極めたい。", cal_last)
+        # 句点の連続を1つに
+        cal_last = re.sub(r"([。])\1+", r"\1", cal_last).rstrip()
+        if not cal_last.endswith("。"):
+            cal_last += "。"
+
+    # D) 再構成：本文 → （空行） → 「③ ＋ タイトル（同一行）」 or タイトル単独
+    parts = [p for p in re.split(r"\n\n+", text) if p.strip()]
+    out_parts = []
+    if parts:
+        out_parts.append("\n\n".join(parts).strip())
+
+    closer_line = ""
+    if cal_last and tr:
+        closer_line = cal_last.strip() + " " + tr.strip()
+    elif cal_last:
+        closer_line = cal_last.strip()
+    elif tr:
+        closer_line = tr.strip()
+
+    if closer_line:
+        out_parts.append(closer_line)
+
+    out = "\n\n".join(out_parts).strip()
+    # E) 仕上げ：空行と句点の正規化
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    out = re.sub(r"([。])\1+", r"\1", out).strip()
+
+    report_final = out
+
 except Exception:
     pass
+
+
+
+
+
+
+
 
 
 # ---- この時点の本文を “唯一ソース” としてセッションに固定 ----
@@ -2853,13 +8205,22 @@ if st.session_state["preview_report_base"] != text_to_show:
     st.session_state["preview_report_main"] = text_to_show  # 初期表示を差し替え
 
 # 3) 白背景のまま表示（編集できる見た目だが、下のガードですぐ元に戻る）
+# --- プレビュー（編集できる見た目だが、毎リロードでベースに戻す）---
+# 1) まずベース文を取り出す
+_base_preview = st.session_state.get("preview_report_base", "")
+
+# 2) ウィジェットを出す前に、常に同じキーへセット（←ここが重要）
+st.session_state["preview_report_main"] = _base_preview
+
+# 3) 表示（見た目は白背景で編集可・コピー可）
 st.text_area(
     "プレビュー",
-    value=st.session_state.get("preview_report_base", ""),
+    value=_base_preview,                  # ここは _base_preview でOK
     height=420,
-    key="preview_report_main",
+    key="preview_report_main",            # このキーは上で事前にセット済み
     help="コピー可。編集は保存されません（自動で元に戻ります）。",
 )
+
 
 # 4) もしユーザーが編集しても、即「正」に巻き戻す（＝実質 ReadOnly）
 if st.session_state.get("preview_report_main", "") != st.session_state.get("preview_report_base", ""):
@@ -3254,10 +8615,3 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
-
-
-
-
-
-
-
