@@ -1544,7 +1544,7 @@ def _build_one_v21(fig_title: str, ohlc: pd.DataFrame):
     rows=2, cols=1, shared_xaxes=True,
     vertical_spacing=0.06, row_heights=[0.76, 0.24],
     specs=[[{"type": "xy"}], [{"type": "xy"}]],
-　　)
+)
 
 
     # 背景レイヤ（SMA/BB は先に描画）※ connectgaps で途切れ対策
@@ -8617,5 +8617,6 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
 
