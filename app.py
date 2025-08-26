@@ -1540,11 +1540,12 @@ def _build_one_v21(fig_title: str, ohlc: pd.DataFrame):
     xpad = (v.index[-1] - v.index[-3]) if len(v) >= 3 else pd.Timedelta(days=2)
 
     # === 4) 図（上：ローソク＋SMA/BB、下：RSI） ===
-    fig = _mk(
-        rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.06, row_heights=[0.76, 0.24],
-        specs=[[{"type": "xy"}], [{"type": "xy"}]],
-    )
+    fig = make_subplots(
+    rows=2, cols=1, shared_xaxes=True,
+    vertical_spacing=0.06, row_heights=[0.76, 0.24],
+    specs=[[{"type": "xy"}], [{"type": "xy"}]],
+　　)
+
 
     # 背景レイヤ（SMA/BB は先に描画）※ connectgaps で途切れ対策
     fig.add_trace(_go.Scatter(x=v.index, y=v["SMA20"],  mode="lines",
@@ -8616,4 +8617,5 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
 
