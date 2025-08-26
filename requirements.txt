@@ -11,3 +11,4 @@ rapidfuzz
 openpyxl
 lxml
 # rebuild
+plotly==5.23.0
