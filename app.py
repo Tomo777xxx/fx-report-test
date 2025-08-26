@@ -58,6 +58,7 @@
 
 # ===== 必要インポート（安全版・重複なし） =====
 from __future__ import annotations
+from plotly.subplots import make_subplots
 
 # 標準ライブラリ
 import os
@@ -8615,3 +8616,4 @@ if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", 
 
     except Exception as e:
         st.error(f"保存/履歴の処理でエラー: {e}")
+
