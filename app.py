@@ -58,7 +58,6 @@
 
 # ===== 必要インポート（安全版・重複なし） =====
 from __future__ import annotations
-from plotly.subplots import make_subplots
 
 # 標準ライブラリ
 import os
@@ -545,6 +544,186 @@ def choose_para2_closer(para1: str, para2: str) -> str:
     )
     picked = _llm_pick_from_list(system, user)
     return picked if picked in ALLOWED_PARA2_CLOSERS else random.choice(ALLOWED_PARA2_CLOSERS)
+# ===== 正典ルールJSON＋共通検証（Step1） =====
+CANON_RULES_JSON = {
+    "tone": {"avoid_assertive": True, "advice_ban": True},
+    "min_chars": {"p1": 220, "p2": 180},
+    "title_patterns": [
+        r".+の方向感に(注視か|警戒か|静観か|要注意か)$",
+        r".+の方向感を見極めたい$",
+    ],
+    "title_tails": ALLOWED_TITLE_TAILS,  # 既存ホワイトリストを再利用
+    "forbidden_phrases": [
+        # 売買助言・断定・煽り（必要に応じて拡充）
+        "買い", "売り", "エントリー", "利確", "損切り", "両建て", "推奨",
+        "必ず", "確実", "断言", "目標到達", "仕掛ける", "勝てる", "儲かる",
+        "爆上げ", "暴落", "一択", "上昇確実", "下落確実",
+    ],
+    "normalize": {
+        "fullwidth_parentheses": True,   # （）
+        "halfwidth_alnum": True,         # 英数字は半角
+        "time_hhmm_colon": True,         # 00:00 のコロン形式
+        "sigma_minus_hyphen": True,      # -2σ の「-」統一
+        "replacements": [
+            ["ぶれ", "振れ"],
+            ["とくに", "特に"],
+            ["ふたたび", "再び"],
+            ["ゆくえ", "行方"],
+            ["ほど", "約"],
+        ],
+    },
+}
+
+def _canon_normalize(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    s = text
+    # 全角カッコ
+    if CANON_RULES_JSON["normalize"].get("fullwidth_parentheses"):
+        s = s.replace("(", "（").replace(")", "）")
+    # 英数字は半角（ここでは全角英数の簡易正規化のみ）
+    if CANON_RULES_JSON["normalize"].get("halfwidth_alnum"):
+        import unicodedata
+        s = unicodedata.normalize("NFKC", s)
+    # 時刻コロン形式（ざっくり：全角コロン→半角）
+    if CANON_RULES_JSON["normalize"].get("time_hhmm_colon"):
+        s = s.replace("：", ":")
+    # -2σ のハイフン統一（全角/長音をASCIIハイフンに）
+    if CANON_RULES_JSON["normalize"].get("sigma_minus_hyphen"):
+        s = s.replace("−", "-").replace("ー2σ", "-2σ")
+    # 語彙ゆれ
+    for a, b in CANON_RULES_JSON["normalize"].get("replacements", []):
+        s = s.replace(a, b)
+    return s
+
+def _canon_find_forbidden(text: str) -> list[str]:
+    hits = []
+    if not isinstance(text, str):
+        return hits
+    t = text
+    for ng in CANON_RULES_JSON["forbidden_phrases"]:
+        if ng and ng in t:
+            hits.append(ng)
+    return sorted(set(hits))
+
+def _canon_title_ok(title: str) -> bool:
+    import re
+    t = (title or "").strip()
+    for pat in CANON_RULES_JSON["title_patterns"]:
+        if re.fullmatch(pat, t):
+            return True
+    return False
+
+def _canon_title_recall_ok(title: str, last_line: str) -> bool:
+    import re
+    try:
+        expected = build_title_recall(title)
+    except Exception:
+        expected = (title or "").strip()
+        if not expected.endswith("。"):
+            expected += "。"
+
+    def _norm(s: str) -> str:
+        # 全角・半角や空白、連続句点などの揺れを吸収
+        s = (s or "").strip()
+        s = s.replace(" ", "").replace("\u3000", "")
+        s = s.replace("｡", "。")
+        s = re.sub(r"。+$", "。", s)  # 句点は1つに正規化
+        return s
+
+    return _norm(last_line) == _norm(expected)
+
+
+def _canon_guess_blocks_from_text(report_text: str) -> dict:
+    """
+    report_text から タイトル/ポイント2件/①/②/③（最後の行）を素直に推定。
+    既存構成（タイトル→空行→本日のポイント→…→③一行）の想定に合わせた耐性ロジック。
+    """
+    lines = [l.rstrip() for l in (report_text or "").splitlines()]
+    lines = [l for l in lines if l is not None]
+    title = (lines[0] if lines else "").strip()
+
+    # 「本日のポイント」節を探す
+    idx_points = None
+    for i, l in enumerate(lines[:50]):
+        if "本日のポイント" in l:
+            idx_points = i
+            break
+    points = []
+    if idx_points is not None:
+        # 次の非空2行をポイントとして収集
+        j = idx_points + 1
+        while j < len(lines) and len(points) < 2:
+            if lines[j].strip():
+                points.append(lines[j].strip("・：: "))
+            j += 1
+
+    # ③：最後の非空行をタイトル回収行とみなす
+    last_line = ""
+    for l in reversed(lines):
+        if l.strip():
+            last_line = l.strip()
+            break
+
+    # ①②はテキスト全体から「本日の指標は、」以降とポイント節を除いた残差で概算。
+    text_wo_title = "\n".join(lines[1:])
+    p3_head = "本日の指標は"
+    p3_pos = text_wo_title.find(p3_head)
+    head_to_p3 = text_wo_title if p3_pos < 0 else text_wo_title[:p3_pos]
+    # 「本日のポイント」見出し行以降、最初の2行（ポイント）を除去
+    if idx_points is not None:
+        head_to_p3 = "\n".join(head_to_p3.splitlines()[:idx_points-1] + head_to_p3.splitlines()[idx_points+3:])
+    # 残差を空行分割して①②候補に
+    chunks = [c.strip() for c in head_to_p3.split("\n\n") if c.strip()]
+    p1 = chunks[0] if len(chunks) >= 1 else ""
+    p2 = chunks[1] if len(chunks) >= 2 else ""
+    return {"title": title, "points": points, "p1": p1, "p2": p2, "p3_last_line": last_line}
+
+def canon_validate_current_report(report_text: str) -> tuple[list[str], dict]:
+    """
+    report_text だけを入力に、正典ベースの検証を実施。
+    戻り値: (errors[], checks_dict)
+    """
+    errs: list[str] = []
+    blk = _canon_guess_blocks_from_text(report_text)
+    title = _canon_normalize(blk.get("title", ""))
+    p1 = _canon_normalize(blk.get("p1", ""))
+    p2 = _canon_normalize(blk.get("p2", ""))
+    last_line = _canon_normalize(blk.get("p3_last_line", ""))
+
+    # タイトルパターン
+    if not _canon_title_ok(title):
+        tails = " / ".join(CANON_RULES_JSON["title_tails"])
+        errs.append(f"タイトルが規定外です（許容語尾: {tails} / 『…の方向感を見極めたい』）。")
+
+    # 長さ（①②）
+    if len(p1) < CANON_RULES_JSON["min_chars"]["p1"]:
+        errs.append(f"段落①の文字数不足（{len(p1)}字 < {CANON_RULES_JSON['min_chars']['p1']}字）。")
+    if len(p2) < CANON_RULES_JSON["min_chars"]["p2"]:
+        errs.append(f"段落②の文字数不足（{len(p2)}字 < {CANON_RULES_JSON['min_chars']['p2']}字）。")
+
+    # 禁止語（全文で判定）
+    ng_hits = _canon_find_forbidden(report_text)
+    if ng_hits:
+        errs.append("禁止語検知: " + " / ".join(ng_hits))
+
+    # ③は一行相当（実態はUI改行でも、論理的には1行の想定）
+    if "\n" in last_line:
+        errs.append("段落③は1行の想定です（イベント列挙＋タイトル回収を一行で）。")
+
+    # タイトル回収
+    if not _canon_title_recall_ok(title, last_line):
+        errs.append("段落③の末尾が『タイトル回収』になっていません。")
+
+    checks = {
+        "title": title,
+        "p1_len": len(p1),
+        "p2_len": len(p2),
+        "forbidden_hits": ng_hits,
+        "title_recalled": _canon_title_recall_ok(title, last_line),
+    }
+    return errs, checks
+# ===== 正典ルール検証 ここまで =====
 
 # ---- タイトル初期値（助詞の自動補正を含む“正”の版だけを残す） ----
 def _default_title_for(pair: str, tail: str) -> str:
@@ -586,55 +765,12 @@ def build_title_recall(title: str) -> str:
 
 
 
+
 # ===== 指標名の日本語整形（任意辞書 + 地域接頭語）========================
 
 import yaml
 
-_ALIAS_CACHE = None
 
-def _load_indicator_alias(path: str | Path = "data/indicator_alias_ja.yaml") -> dict:
-    """YAMLのエイリアス辞書を読む。無ければ空でOK。"""
-    global _ALIAS_CACHE
-    if _ALIAS_CACHE is not None:
-        return _ALIAS_CACHE
-    p = Path(path)
-    if not p.exists():
-        _ALIAS_CACHE = {"exact": {}, "contains": {}}
-        return _ALIAS_CACHE
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        _ALIAS_CACHE = {
-            "exact": data.get("exact", {}) or {},
-            "contains": data.get("contains", {}) or {},
-        }
-    except Exception:
-        _ALIAS_CACHE = {"exact": {}, "contains": {}}
-    return _ALIAS_CACHE
-
-def _region_symbol(code: str) -> str:
-    """地域コード→接頭語（本文表記に合わせる）"""
-    m = {"US":"米","JP":"日","EU":"欧","UK":"英","AU":"豪","NZ":"NZ","CN":"中国","ZA":"南ア"}
-    c = (code or "").upper()
-    return m.get(c, c)
-
-def _ja_indicator_name(raw: str, region_code: str) -> str:
-    """原文指標名を日本語に寄せる（辞書ヒット時のみ）。常に『接頭語・名称』で返す。"""
-    name = (raw or "").strip()
-    alias = _load_indicator_alias()
-    # 完全一致の置換
-    if name in alias["exact"]:
-        name = alias["exact"][name]
-    else:
-        # 部分一致の置換（順番に最初だけ適用）
-        for key, val in alias["contains"].items():
-            if key in name:
-                name = name.replace(key, val)
-                break
-    head = _region_symbol(region_code)
-    # 既に「◯・」が付いていたら二重にならないよう簡単ガード
-    if name.startswith(f"{head}・"):
-        return name
-    return f"{head}・{name}" if head else name
 # =======================================================================
 # ===== 日本語エイリアス（重複接頭ガード＋カテゴリのフォールバック付き） =====
 
@@ -650,9 +786,8 @@ def _load_alias_yaml(path: str) -> dict:
         return {}
 
 # 指標名 → 日本語（「英・」「米・」などの接頭は重複しないように一度剥がして付け直す）
-# 注意：_ja_indicator_name はこのファイル内で二重定義。
-# いまは「この後ろの定義」が有効（上書き）になっています。
-# 次の整理ステップで片方に統一します（呼び出し差し替え時に動作差分を確認予定）。
+# [統一済み] _ja_indicator_name はこの定義のみを使用（旧定義は削除済み）
+
 def _ja_indicator_name(text: str, region: str) -> str:
     global _IND_ALIASES
     if _IND_ALIASES is None:
@@ -931,314 +1066,7 @@ else:
 # ====== 前日比ランキング ここまで ======
 
 # ====== ステップ1：参照PDFの確認 ======
-# === テクニカル・チャート（D1/H4）＋選択UI＋段落② v2.1 生成（常時2枚表示 & ベース足選択） ===
-import sys
-import importlib.util as _iul
-import pandas as _pd
-import numpy as _np
-import yfinance as _yf
-import streamlit as st
-# ==== 共通インポート／オプショナル依存の安全化（import streamlit as st の直後） ====
-import calendar  # Pylance「calendar 未定義」対策
 
-# オプショナル依存は try/except にしておく（未インストールでも落ちない）
-try:
-    import openai  # noqa: F401
-    HAVE_OPENAI = True
-except Exception:
-    HAVE_OPENAI = False
-
-try:
-    import pypdf  # noqa: F401
-    HAVE_PYPDF = True
-except Exception:
-    HAVE_PYPDF = False
-
-# Plotly の有無（チャートで使用）
-try:
-    import plotly.graph_objects as _go
-    from plotly.subplots import make_subplots as _mk
-    _PLOTLY_OK = True
-except Exception:
-    _PLOTLY_OK = False
-    _go = None
-    _mk = None
-
-# チャート共通のデフォルト（Pylance の「未定義」対策も兼ねる）
-_cfg = {"displayModeBar": True, "scrollZoom": True}
-_h_dpi = 460
-_candles = int(st.session_state.get("candles", 180))  # 本数デフォルト
-
-# セッションキーの存在を保証（なければデフォルトを入れる）
-st.session_state.setdefault("pair", "ドル円")
-st.session_state.setdefault("ticker_1d", "USDJPY=X")
-st.session_state.setdefault("ticker_4h", "USDJPY=X")
-
-# ---- Plotly availability (robust) ----
-_PLOTLY_OK = _iul.find_spec("plotly") is not None
-if _PLOTLY_OK:
-    import plotly.graph_objects as _go
-    from plotly.subplots import make_subplots as _mk
-else:
-    _go = None
-    _mk = None
-
-# デフォルト（上位で未定義でも動くように）
-try:
-    _candles
-except NameError:
-    _candles = 120
-try:
-    _h_dpi
-except NameError:
-    _h_dpi = 520
-try:
-    _cfg
-except NameError:
-    _cfg = {"displayModeBar": False}
-try:
-    _ticker
-except NameError:
-    _ticker = st.session_state.get("pair_ticker") or "USDJPY=X"
-
-_need = _candles + 220  # 200SMA計算ぶん余裕を持って確保
-
-# ---- TA helpers ----
-def _sma(s: _pd.Series, n: int) -> _pd.Series:
-    return s.rolling(n, min_periods=1).mean()
-
-def _bbands(s: _pd.Series, n: int = 20, k: float = 2.0):
-    ma = s.rolling(n, min_periods=1).mean()
-    sd = s.rolling(n, min_periods=1).std(ddof=0)
-    return ma + k*sd, ma - k*sd
-
-def _rsi(close: _pd.Series, n: int = 14) -> _pd.Series:
-    d = close.diff()
-    up = d.clip(lower=0.0)
-    dn = (-d).clip(lower=0.0)
-    ema_up = up.ewm(alpha=1/n, adjust=False).mean()
-    ema_dn = dn.ewm(alpha=1/n, adjust=False).mean()
-    rs = ema_up / ema_dn.replace(0, _np.nan)
-    return (100 - (100/(1+rs))).clip(0, 100)
-
-# ---- OHLC downloader: 1d 直取得 / 4h は60m→4H リサンプル ----
-if "_dl_ohlc" not in globals():
-    def _dl_ohlc(ticker: str, interval: str, need: int) -> _pd.DataFrame | None:
-        """
-        interval: "1d" または "4h"
-        - "1d": download→空なら history フォールバック
-        - "4h": 60m を取得→4Hへリサンプル
-        """
-        try:
-            if interval == "1d":
-                df = _yf.download(ticker, period="900d", interval="1d",
-                                  auto_adjust=False, progress=False, threads=False)
-                if df is None or df.empty:
-                    h = _yf.Ticker(ticker).history(period="900d", interval="1d", auto_adjust=False)
-                    if h is None or h.empty:
-                        return None
-                    df = h
-                df = df.rename(columns=str.title)[["Open", "High", "Low", "Close"]]
-
-            elif interval == "4h":
-                raw = _yf.download(ticker, period="120d", interval="60m",
-                                   auto_adjust=False, progress=False, threads=False)
-                if raw is None or raw.empty:
-                    h = _yf.Ticker(ticker).history(period="120d", interval="60m", auto_adjust=False)
-                    if h is None or h.empty:
-                        return None
-                    raw = h
-                # 4時間に集約
-                o = raw["Open"].resample("4H").first()
-                h = raw["High"].resample("4H").max()
-                l = raw["Low"].resample("4H").min()
-                c = raw["Close"].resample("4H").last()
-                df = _pd.concat([o, h, l, c], axis=1).dropna()
-                df.columns = ["Open", "High", "Low", "Close"]
-            else:
-                return None
-
-            need_tail = max(need, _candles + 220)
-            return df.tail(need_tail).dropna()
-        except Exception:
-            return None
-
-# ---- yレンジ算出（Series比較エラー回避のため数値配列で計算） ----
-def _nanminmax_from_cols(df: _pd.DataFrame, cols: list[str]) -> tuple[float, float]:
-    """指定列の値から NaN を除外して全体の最小/最大を返す。
-    対象列が見つからない/空なら Low/High をフォールバックに使う。
-    """
-    vals: list[_np.ndarray] = []
-
-    # 指定列を順に集める（存在しない列や空はスキップ）
-    for c in cols:
-        if c in df.columns:
-            arr = _np.asarray(df[c].values, dtype="float64")
-            arr = arr[_np.isfinite(arr)]
-            if arr.size:
-                vals.append(arr)
-
-    # どれも取れなかったら Low/High でフォールバック
-    if not vals:
-        lo = _np.asarray(df.get("Low", _np.array([])),  dtype="float64")
-        hi = _np.asarray(df.get("High", _np.array([])), dtype="float64")
-        lo = lo[_np.isfinite(lo)]
-        hi = hi[_np.isfinite(hi)]
-        if lo.size and hi.size:
-            return float(lo.min()), float(hi.max())
-        # それでも無ければ安全側で 0〜1 を返す（描画はされる）
-        return 0.0, 1.0
-
-    # ここまで来れば少なくとも1配列ある
-    stacked = _np.concatenate(vals)
-    return float(_np.nanmin(stacked)), float(_np.nanmax(stacked))
-
-
-# ---- チャート1枚分の作成 ----
-# --- ここから _build_one を丸ごと置き換え ---
-def _build_one(fig_title: str, ohlc: _pd.DataFrame) -> _go.Figure:
-    # 直近_candles 本だけ使用（グローバル _candles を利用）
-    v = ohlc.tail(_candles).copy()
-
-    # 数値化（万一 object/str でも安全に）
-    for c in ["Open", "High", "Low", "Close"]:
-        v[c] = _pd.to_numeric(v[c], errors="coerce").astype("float64")
-
-    # 指標（SMA20/200, BB±2σ, RSI14）
-    sma20  = v["Close"].rolling(20,  min_periods=1).mean()
-    sma200 = v["Close"].rolling(200, min_periods=1).mean()
-    sd20   = v["Close"].rolling(20,  min_periods=1).std(ddof=0)
-    bbu    = sma20 + 2.0*sd20
-    bbl    = sma20 - 2.0*sd20
-    # RSI14
-    d = v["Close"].diff()
-    up = d.clip(lower=0.0); dn = (-d).clip(lower=0.0)
-    ema_up = up.ewm(alpha=1/14, adjust=False).mean()
-    ema_dn = dn.ewm(alpha=1/14, adjust=False).mean()
-    rs = ema_up / ema_dn.replace(0, _np.nan)
-    rsi14 = (100 - (100/(1+rs))).clip(0,100)
-
-    # Yレンジ（ローソク＋SMA＋BBの最大最小で固定）※BBははみ出してOKにしたいなら外しても可
-    vals = _np.vstack([
-        _np.asarray(v["Low"].values,  dtype="float64"),
-        _np.asarray(v["High"].values, dtype="float64"),
-        _np.asarray(sma20.values,     dtype="float64"),
-        _np.asarray(sma200.values,    dtype="float64"),
-        _np.asarray(bbu.values,       dtype="float64"),
-        _np.asarray(bbl.values,       dtype="float64"),
-    ])
-    y_min = float(_np.nanmin(vals))
-    y_max = float(_np.nanmax(vals))
-    pad   = (y_max - y_min) * 0.01
-    y_rng = [y_min - pad, y_max + pad]
-
-    # サブプロット（上=価格、下=RSI）
-    fig = _mk(rows=2, cols=1, shared_xaxes=True,
-              vertical_spacing=0.06, row_heights=[0.76, 0.24])
-
-    # ローソク（上段だけ）
-    fig.add_trace(_go.Candlestick(
-        x=v.index, open=v["Open"], high=v["High"], low=v["Low"], close=v["Close"],
-        increasing_line_color="green", increasing_fillcolor="green",
-        decreasing_line_color="red",   decreasing_fillcolor="red",
-        showlegend=False
-    ), row=1, col=1)
-
-    # SMA20（赤）/ SMA200（青）/ BB±2σ（薄灰）
-    fig.add_trace(_go.Scatter(x=v.index, y=sma20,  mode="lines",
-                              line=dict(width=2, color="red"),  name="SMA20"),
-                  row=1, col=1)
-    fig.add_trace(_go.Scatter(x=v.index, y=sma200, mode="lines",
-                              line=dict(width=2, color="blue"), name="SMA200"),
-                  row=1, col=1)
-    fig.add_trace(_go.Scatter(x=v.index, y=bbu, mode="lines",
-                              line=dict(width=1, color="rgba(0,0,0,0.25)"), name="BB+2σ"),
-                  row=1, col=1)
-    fig.add_trace(_go.Scatter(x=v.index, y=bbl, mode="lines",
-                              line=dict(width=1, color="rgba(0,0,0,0.25)"), name="BB-2σ"),
-                  row=1, col=1)
-
-    # RSI（下段のみ）
-    fig.add_trace(_go.Scatter(x=v.index, y=rsi14, mode="lines",
-                              line=dict(width=1.6), name="RSI(14)"),
-                  row=2, col=1)
-    # ガイドライン
-    fig.add_hline(y=30, line_width=1, line_dash="dot", line_color="gray", row=2, col=1)
-    fig.add_hline(y=70, line_width=1, line_dash="dot", line_color="gray", row=2, col=1)
-
-    # 右側余白（見やすさ用）
-    if len(v.index) >= 3:
-        xpad = (v.index[-1] - v.index[-3])
-    else:
-        xpad = _pd.Timedelta(days=2)
-
-    # 軸・見た目（上下で固定レンジ、上下ドラッグ禁止）
-    fig.update_xaxes(range=[v.index[0], v.index[-1] + xpad],
-                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=1, col=1)
-    fig.update_xaxes(range=[v.index[0], v.index[-1] + xpad],
-                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=2, col=1)
-    fig.update_yaxes(range=y_rng, fixedrange=True,
-                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=1, col=1)
-    fig.update_yaxes(range=[0,100], fixedrange=True,
-                     showgrid=True, gridcolor="rgba(0,0,0,0.08)", row=2, col=1)
-
-    fig.update_layout(
-        title=dict(text=fig_title, y=0.98, x=0.01, xanchor="left", yanchor="top"),
-        margin=dict(l=8, r=24, t=30, b=8),
-        height=_h_dpi,
-        showlegend=False,
-        xaxis_rangeslider_visible=False  # 下部レンジスライダー非表示
-    )
-    return fig
-# --- ここまで置き換え ---
-
-
-
-# === 段落② 自動判定用ユーティリティ（_indicators / _vol_score） ===
-# 依存: _pd (pandas), _np (numpy), そして _sma/_bbands/_rsi が上で定義済みであること
-
-def _indicators(df: _pd.DataFrame | None) -> _pd.DataFrame | None:
-    """Close から SMA20/200, BB±2σ, RSI(14) を計算して返す。"""
-    if df is None or len(df) == 0 or "Close" not in df.columns:
-        return None
-    close = _pd.to_numeric(df["Close"], errors="coerce").astype("float64")
-    out = _pd.DataFrame(index=df.index)
-    out["SMA20"]  = _sma(close, 20)
-    out["SMA200"] = _sma(close, 200)
-    bbu, bbl      = _bbands(close, 20, 2.0)
-    out["BBU"], out["BBL"] = bbu, bbl
-    out["RSI14"]  = _rsi(close, 14)
-    return out
-
-def _vol_score(df: _pd.DataFrame | None, ind: _pd.DataFrame | None) -> float:
-    """
-    “どちらが変化が大きいか”の簡易スコア。
-    - 直近N本（N = _candles があればそれ、なければ120）
-    - ①リターンの標準偏差（ボラ）
-    - ②SMA20の傾きの絶対値（トレンド感）
-    の合算を返す（大きいほど“動きがある”）。
-    """
-    if df is None or ind is None or len(df) == 0:
-        return 0.0
-    N = int(globals().get("_candles", 120))
-    v = _pd.concat([df, ind], axis=1).tail(N)
-
-    # ① ボラ（%）
-    ret = _pd.to_numeric(v["Close"], errors="coerce").pct_change().dropna()
-    s1 = float(ret.std()) if len(ret) else 0.0
-
-    # ② SMA20 の傾き（単位を正規化）
-    y = _pd.to_numeric(v["SMA20"], errors="coerce").dropna()
-    if len(y) >= 5:
-        x = _np.arange(len(y), dtype="float64")
-        slope = _np.polyfit(x, y.values, 1)[0]
-        denom = float(abs(y.mean())) if float(abs(y.mean())) > 0 else 1.0
-        s2 = float(abs(slope) / denom)
-    else:
-        s2 = 0.0
-
-    return float(s1 + s2)
-# === ここまで ===
 # === Tech Charts (D1/H4) v2.1 — self-contained block START ===
 import importlib.util as _iul
 
@@ -1540,12 +1368,11 @@ def _build_one_v21(fig_title: str, ohlc: pd.DataFrame):
     xpad = (v.index[-1] - v.index[-3]) if len(v) >= 3 else pd.Timedelta(days=2)
 
     # === 4) 図（上：ローソク＋SMA/BB、下：RSI） ===
-    fig = make_subplots(
-    rows=2, cols=1, shared_xaxes=True,
-    vertical_spacing=0.06, row_heights=[0.76, 0.24],
-    specs=[[{"type": "xy"}], [{"type": "xy"}]],
-)
-
+    fig = _mk(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.06, row_heights=[0.76, 0.24],
+        specs=[[{"type": "xy"}], [{"type": "xy"}]],
+    )
 
     # 背景レイヤ（SMA/BB は先に描画）※ connectgaps で途切れ対策
     fig.add_trace(_go.Scatter(x=v.index, y=v["SMA20"],  mode="lines",
@@ -2219,10 +2046,12 @@ def _p2_flow_polish(text: str) -> str:
 
     # 軸ごとに1文へ凝縮
     grouped = []
+    mix = st.session_state.get("tf_mix_mode", "両方（半々）")
     if d1_frags:
         grouped.append("日足では" + "、".join(d1_frags))
-    if h4_frags:
+    if (mix != "日足のみ") and h4_frags:
         grouped.append("4時間足では" + "、".join(h4_frags))
+
 
     # 並び順：為替市場は→ブレークポイント（〜付近〜）→軸文→その他
     base = None
@@ -2798,11 +2627,20 @@ def _compose_para2_preview_mix() -> str:
     try:
         base = _compose_para2_preview_from_ui()
     except Exception:
-        pair = str(st.session_state.get("pair", "") or "")
-        d1   = st.session_state.get("d1_imp", "横ばい")
-        h4   = st.session_state.get("h4_imp", "横ばい")
-        base = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+        pair   = str(st.session_state.get("pair", "") or "")
+        d1     = st.session_state.get("d1_imp", "横ばい")
+        h4     = st.session_state.get("h4_imp", "横ばい")
+        tfmode = st.session_state.get("tf_mix_mode", "両方（半々）")
+        market = _market_word_for(pair)
+
+        if tfmode == "日足のみ":
+            base = f"{market}は、{pair}は日足は{d1}。"
+        elif tfmode == "4時間足のみ":
+            base = f"{market}は、{pair}は4時間足は{h4}。"
+        else:  # 両方（半々）
+            base = f"{market}は、{pair}は日足は{d1}、4時間足は{h4}。"
     base = (base or "").strip()
+
 
     # ---------- 2) session_state から柔軟に値を拾うユーティリティ ----------
     def _ss_pick(keys=None, substrings=None, default=""):
@@ -2955,15 +2793,21 @@ def _compose_para2_preview_mix() -> str:
 
     # ---------- 5) ブレークポイント短句を1本だけ追加 ----------
     bp_sentence = ""
+        # 修正: 「日足のみ」選択時はBP軸を強制D1（AUTO/H4を上書き）
     try:
-        # 既存の _bp_sentence_mix を利用（あなたの環境のキー優先順に対応）
-        _bp_sent, dbg = _bp_sentence_mix()
-        bp_sentence = _bp_sent or ""
-        # デバッグ表示（任意）
-        if st.session_state.get("show_debug", False):
-            st.write("DEBUG_BP_PICK:", dbg)
+        if st.session_state.get("tf_mix_mode") == "日足のみ":
+            axis_now = st.session_state.get("p2_bp_axis", "AUTO")
+            if str(axis_now).upper() in ("AUTO", "H4"):
+                st.session_state["p2_bp_axis"] = "D1"
     except Exception:
         pass
+    
+            # 修正C: 「日足のみ」選択時はBP軸を強制的にD1へ（AUTO/H4を上書き）
+        if st.session_state.get("tf_mix_mode") == "日足のみ":
+            axis_now = st.session_state.get("p2_bp_axis", "AUTO")
+            if axis_now in ("AUTO", "H4"):
+                st.session_state["p2_bp_axis"] = "D1"
+
 
     base = _append_once(base, bp_sentence)
 
@@ -2999,11 +2843,7 @@ _choice = st.session_state.get("bp_apply_mode", "自動（基準に合わせる�
 _axis_map = {"自動（基準に合わせる）": "AUTO", "日足のみを使う": "D1", "4時間足のみを使う": "H4"}
 st.session_state["p2_bp_axis"] = _axis_map.get(_choice, "AUTO")
 
-st.write("DEBUG:", {
-    "p2_bp_upper": st.session_state.get("p2_bp_upper"),
-    "p2_bp_lower": st.session_state.get("p2_bp_lower"),
-    "p2_bp_axis":  st.session_state.get("p2_bp_axis"),
-})
+
 # --- FIX: _compose_para2_preview_mix を呼ぶ前に必ず定義しておく（未定義時のみ） ---
 if "_decimals_from_pair" not in globals():
     def _decimals_from_pair(pair_label: str) -> int:
@@ -3081,22 +2921,27 @@ if "_compose_para2_preview_mix" not in globals():
         try:
             base = _compose_para2_preview_from_ui()
         except Exception:
-            pair = str(st.session_state.get("pair", "") or "")
-            d1   = st.session_state.get("d1_imp", "横ばい")
-            h4   = st.session_state.get("h4_imp", "横ばい")
-            base = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+            pair   = str(st.session_state.get("pair", "") or "")
+            d1     = st.session_state.get("d1_imp", "横ばい")
+            h4     = st.session_state.get("h4_imp", "横ばい")
+            tfmode = st.session_state.get("tf_mix_mode", "両方（半々）")
+            market = _market_word_for(pair) if '_market_word_for' in globals() else "為替市場"
 
-        # 2) BP短句（数値）を必要なら付与
+            if tfmode == "日足のみ":
+                base = f"{market}は、{pair}は日足は{d1}。"
+            elif tfmode == "4時間足のみ":
+                base = f"{market}は、{pair}は4時間足は{h4}。"
+            else:  # 両方（半々）
+                base = f"{market}は、{pair}は日足は{d1}、4時間足は{h4}。"
+
+                # 2) BP短句（数値）を必要なら付与
         bp_sentence, dbg = _bp_sentence_mix()
         if st.session_state.get("show_debug", False):
             st.write("DEBUG_BP_PICK:", dbg)
         if bp_sentence and (bp_sentence not in base):
             base = (base.rstrip("。") + "。" if base else "") + bp_sentence
 
-        # 3) Step6 でも同じ文を使えるよう保存（ヘルパーがあれば合流）
-        merged = _p2_merge_indicators(base) if "_p2_merge_indicators" in globals() else base
-        st.session_state["p2_ui_preview_text"] = merged
-        return merged
+
 
 # --- /FIX ---
 
@@ -3105,13 +2950,22 @@ if "_compose_para2_preview_mix" not in globals():
 try:
     _p2_preview = _compose_para2_preview_mix()  # ※ここはBP短句も含む“最終に近いプレビュー文”
 except Exception:
+    # 新ロジック: '時間軸の使い方'（tf_mix_mode）に厳密準拠
     try:
-        _p2_preview = _compose_para2_preview_from_ui()  # フォールバック：素文
+        _p2_preview = _compose_para2_base_from_state()
     except Exception:
+        mix  = st.session_state.get("tf_mix_mode", "両方（半々）")
         pair = str(st.session_state.get("pair", "") or "")
         d1   = st.session_state.get("d1_imp", "横ばい")
         h4   = st.session_state.get("h4_imp", "横ばい")
-        _p2_preview = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+        if mix == "日足のみ":
+            _p2_preview = f"為替市場は、{pair}は日足は{d1}。"
+        elif mix == "4時間足のみ":
+            # 4時間足のみ＝短期フォーカス。ただし日足の“方向”だけは残す
+            _p2_preview = f"為替市場は、{pair}は日足は{_coarse_trend(d1)}、4時間足は{h4}。"
+        else:
+            _p2_preview = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
+
 
 # 句点を1つに正規化
 _p2_preview = (_p2_preview or "").strip().rstrip("。") + "。"
@@ -3730,6 +3584,8 @@ def _finalize_para2_for_build(text: str) -> str:
     tmp = _tidy_para2((text or "").strip())        # 1) 下ごしらえ
     tmp = _avoid_repeated_openers(tmp)             # 2) 句頭言い換え ★重要
     tmp = _enforce_length_bounds(tmp, 180, 210)    # 3) 文字数ガード
+    text = text.replace("。。", "。").replace("。 、", "。")
+
     return _tidy_para2(tmp)                        # 4) 最終仕上げ
 
 
@@ -4237,67 +4093,6 @@ def _choose_grounds_sentences(gc: str, rsi: str, bb: str) -> list[str]:
     return picks[:2]
 
 
-# ==== 段落② プレビュー本体（統一版） ======================================
-def _compose_para2_preview_from_ui() -> str:
-    # 印象 → 導入文
-    d1_imp = st.session_state.get("d1_imp", "横ばい")
-    h4_imp = st.session_state.get("h4_imp", "横ばい")
-    intro = _intro_from_impressions(d1_imp, h4_imp)
-
-    # 主役ペアとリード文
-    pair_label = str(st.session_state.get("pair", "") or "")
-    lead = _lead_sentence(pair_label, d1_imp, h4_imp)
-
-    # 先頭文の組み立て
-    parts: list[str] = []
-    if _is_crypto_or_gold(pair_label):
-        parts.append(f"{lead}{intro}")
-    else:
-        parts.append(lead)
-        parts.append(intro)
-
-    # 根拠（最大2句）
-    gc = _gc_phrase(
-        st.session_state.get("gc_axis", "未選択"),
-        st.session_state.get("gc_state", "未選択"),
-    )
-    rsi = _rsi_phrase(st.session_state.get("rsi_state", "未選択"))
-    bb  = _bb_phrase(st.session_state.get("bb_state", "未選択"), d1_imp, h4_imp)
-    grounds = [p for p in (gc, rsi, bb) if p]
-    if grounds:
-        parts.append("。".join(grounds[:2]))
-
-    # ブレークポイント（任意）— 空なら保険で自作
-    up_txt, dn_txt, _ = _choose_breakpoints()
-    bp_txt = _bp_phrase(up_txt, dn_txt, d1_imp, h4_imp)
-    if not bp_txt:
-        if dn_txt:
-            bp_txt = f"下値{dn_txt}付近割れの可否をまず確認したい"
-        elif up_txt:
-            bp_txt = f"上値{up_txt}付近の上抜けの有無をまず見極めたい"
-    if bp_txt:
-        parts.append(bp_txt)
-
-    # 締め
-    closing = _closing_sentence(d1_imp, h4_imp)
-    parts.append(closing)
-
-    # 文末句点を補完しながら連結
-    text = "".join(p if str(p).endswith("。") else (str(p) + "。") for p in parts)
-    text = text.replace("。。", "。").strip()
-
-    # 句頭の重複回避（失敗しても無視）
-    try:
-        text = _avoid_repeated_openers(text)
-    except Exception:
-        pass
-
-    # 仕上げ
-    try:
-        return _finalize_para2_for_build(text)
-    except Exception:
-        return text
-
 
 
 
@@ -4332,42 +4127,6 @@ def _pick_first_valid(*keys):
             return v, k
     return None, None
 
-def _bp_sentence_mix() -> tuple[str, dict]:
-    """
-    上側: D1 → H4 → 共通
-    下側: H4 → D1 → 共通
-    （片方だけでも文章を作る）
-    """
-    up, up_src = _pick_first_valid(
-        "p2_bp_d1_upper", "bp_d1_up",
-        "p2_bp_h4_upper", "bp_h4_up",
-        "p2_bp_upper",    "bp_up"
-    )
-    dn, dn_src = _pick_first_valid(
-        "p2_bp_h4_lower", "bp_h4_dn",
-        "p2_bp_d1_lower", "bp_d1_dn",
-        "p2_bp_lower",    "bp_dn"
-    )
-
-    pair = str(st.session_state.get("pair", "") or "")
-    decimals = 2 if ("JPY" in pair.upper() or "円" in pair) else 4
-    fmt = f"{{:.{decimals}f}}"
-
-    if up is None and dn is None:
-        return "", {"up": None, "dn": None, "up_src": up_src, "dn_src": dn_src}
-
-    if up is not None and dn is not None:
-        return f"{fmt.format(up)}付近の上抜け／{fmt.format(dn)}付近割れのどちらに傾くかを見極めたい。", {
-            "up": up, "dn": dn, "up_src": up_src, "dn_src": dn_src
-        }
-    if up is not None:
-        return f"{fmt.format(up)}付近の上抜けの有無をまず確かめたい。", {
-            "up": up, "dn": None, "up_src": up_src, "dn_src": dn_src
-        }
-    # dn のみ
-    return f"{fmt.format(dn)}付近割れの可否をまず確認したい。", {
-        "up": None, "dn": dn, "up_src": up_src, "dn_src": dn_src
-    }
 
 # ==== 段落②（プレビュー：新ロジック）・BP反映ミックス ====
 
@@ -4440,140 +4199,9 @@ def _bp_sentence_mix() -> tuple[str, dict]:
     return sent, debug
 
 def _compose_para2_preview_mix_legacy() -> str:
-    """
-    段落②プレビューの確定文（UI選択＋手入力＋BP短句を統合、重複は抑制）。
-    - ベース: _compose_para2_preview_from_ui()
-    - 追記: MA(20/200), BB(20,±2σ), RSI(14)（UI/手入力のどちらでも拾う）
-    - BP短句: 上/下のいずれか（両方あれば両方）を1本だけ追加
-    - 既に含まれる表現は二重にしない
-    """
-    import re
+    """[ラッパ] 旧名から新ロジックへ委譲（一本化）。"""
+    return _compose_para2_preview_mix()
 
-    # ---------- 1) ベース（UIプレビュー素文） ----------
-    try:
-        base = _compose_para2_preview_from_ui()
-    except Exception:
-        pair = str(st.session_state.get("pair", "") or "")
-        d1   = st.session_state.get("d1_imp", "横ばい")
-        h4   = st.session_state.get("h4_imp", "横ばい")
-        base = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
-    base = (base or "").strip()
-
-    # ---------- 2) session_state から柔軟に値を拾う ----------
-    def _ss_pick(keys=None, substrings=None, default=""):
-        ss = st.session_state
-        # 明示キーを優先
-        if keys:
-            for k in keys:
-                v = ss.get(k)
-                if v is None:
-                    continue
-                if isinstance(v, (list, tuple)) and v:
-                    v = v[0]
-                s = str(v).strip()
-                if s:
-                    return s
-        # 見当たらなければ部分一致検索（保険）
-        if substrings:
-            subs = [s.lower() for s in substrings]
-            for k, v in ss.items():
-                if not isinstance(k, str):
-                    continue
-                kl = k.lower()
-                if all(sub in kl for sub in subs):
-                    if v is None:
-                        continue
-                    if isinstance(v, (list, tuple)) and v:
-                        v = v[0]
-                    s = str(v).strip()
-                    if s:
-                        return s
-        return default
-
-    def _axis_label(raw: str) -> str:
-        s = str(raw or "").upper()
-        if "H4" in s or "4" in s:
-            return "4時間足"
-        return "日足"  # 既定はD1
-
-    # ---------- 3) MA / BB / RSI の短句 ----------
-    # MA(20↔200)
-    ma_axis  = _ss_pick(
-        keys=["p2_ma_axis","ma_axis","ma_cross_axis","ma_timeframe","p2_ma_timeframe","ma_axis_select"],
-        substrings=["ma","axis"], default="D1"
-    )
-    ma_state = _ss_pick(
-        keys=["p2_ma_state","ma_state","ma_cross_state","p2_ma_manual","ma_state_select","ma_manual"],
-        substrings=["ma","state"], default=""
-    )
-    ma_sentence = ""
-    if ma_state:
-        axis_txt = _axis_label(ma_axis)
-        if "ゴールデンクロス" in ma_state:
-            ma_sentence = f"{axis_txt}では20SMAが200SMAを上回り上向き基調。"
-        elif ("デッドクロス" in ma_state) or ("デスクロ" in ma_state):
-            ma_sentence = f"{axis_txt}では20SMAが200SMAを下回り上向きは鈍い。"
-        else:
-            ma_sentence = f"{axis_txt}の20/200SMAは{ma_state}。"
-
-    # ボリンジャーバンド(20, ±2σ)
-    bb_state = _ss_pick(
-        keys=["p2_bb_state","bb_state","p2_bb_manual","bb_manual","bb_state_select"],
-        substrings=["bb","state"], default=""
-    )
-    bb_sentence = f"ボリンジャーバンド(20, ±2σ)は{bb_state}。" if bb_state else ""
-
-    # RSI(14)
-    rsi_state = _ss_pick(
-        keys=["p2_rsi_state","rsi_state","p2_rsi_manual","rsi_manual","rsi_state_select"],
-        substrings=["rsi","state"], default=""
-    )
-    rsi_sentence = ""
-    if rsi_state:
-        if any(ch.isdigit() for ch in str(rsi_state)):
-            rsi_sentence = f"RSIは{rsi_state}。"
-        else:
-            rsi_sentence = f"RSIは{rsi_state}気味。"
-
-    # ---------- 4) 重複を避けつつ付け足し ----------
-    def _append_once(text: str, add: str) -> str:
-        t = (text or "").strip()
-        a = (add  or "").strip()
-        if not a:
-            return t
-        if a.replace(" ", "") in t.replace(" ", ""):
-            return t
-        if t and not t.endswith("。"):
-            t += "。"
-        return t + a
-
-    base = _append_once(base, ma_sentence)
-    base = _append_once(base, rsi_sentence)
-    base = _append_once(base, bb_sentence)
-
-    # ---------- 5) ブレークポイント短句 ----------
-    bp_sentence = ""
-    try:
-        _bp_sent, dbg = _bp_sentence_mix()
-        bp_sentence = _bp_sent or ""
-        if st.session_state.get("show_debug", False):
-            st.write("DEBUG_BP_PICK:", dbg)
-    except Exception:
-        pass
-    base = _append_once(base, bp_sentence)
-
-    # ---------- 6) 仕上げ（句点/重複整理） ----------
-    base = base.strip()
-    base = re.sub(r"。{2,}", "。", base)
-    parts = [p for p in re.split(r"。+", base) if p]
-    seen, uniq = set(), []
-    for p in parts:
-        key = p.replace(" ", "")
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(p)
-    return "。".join(uniq).strip() + "。"
 
 
 
@@ -5324,6 +4952,11 @@ def _default_title_for(pair: str, tail: str) -> str:
 
 # ---- 本文③のタイトル回収（一文）
 def build_title_recall(title: str) -> str:
+    if _build_title_recall_from_mod:
+        try:
+            return _build_title_recall_from_mod(title)
+        except Exception:
+            pass
     t = (title or "").strip()
     tail_map = {
         "注視か": "注視したい。",
@@ -5336,6 +4969,8 @@ def build_title_recall(title: str) -> str:
             stem = t[: -len(q)].rstrip()
             if fin.endswith("したい。") and not stem.endswith("に"):
                 stem += "に"
+            if not stem.endswith("。") and fin.endswith("。"):
+                return stem + fin
             return stem + fin
     if t.endswith("見極めたい"):
         t = t.replace("の方向感に見極めたい", "の方向感を見極めたい")
@@ -5345,6 +4980,7 @@ def build_title_recall(title: str) -> str:
     if not t.endswith("。"):
         t += "。"
     return t
+
 # ===== 1) yfinanceベースのレジーム判定ユーティリティ =====
 import math
 from dataclasses import dataclass
@@ -7709,53 +7345,56 @@ with c3:
         except Exception as e:
             st.warning(f"再読込でエラー：{e}")
 
-# ③は唯一のソース（セッションの1本）だけ参照する  ← ← この行は残してOK（目印）
-# === NEW: FxONの地域コードを使って段落③の1行を確定生成 ===
-import re
+# ========== ここから：③は「FXONデータ直参照」で確定生成（パターン一切なし） ==========
+
+import re, unicodedata, json
+from pathlib import Path
 from datetime import datetime
 
-def _abbr_from_region(v: str) -> str:
-    x = str(v or "").strip().upper()
-    # よく使う略称だけを堅く定義（不足は随時足せます）
-    m = {
-        "US":"米", "USA":"米", "UNITED STATES":"米",
-        "JP":"日", "JPN":"日", "JAPAN":"日",
-        "UK":"英", "GB":"英", "GBR":"英", "UNITED KINGDOM":"英",
-        "EU":"欧", "EA":"欧", "EZ":"欧", "EMU":"欧", "EUROZONE":"欧", "EURO AREA":"欧",
-        "AU":"豪", "AUS":"豪", "AUSTRALIA":"豪",
-        "NZ":"NZ", "NZL":"NZ", "NEW ZEALAND":"NZ",
-        "CH":"スイス", "CHE":"スイス", "SWITZERLAND":"スイス",
-        "CA":"加", "CAN":"加", "CANADA":"加",
-        "CN":"中国", "CHN":"中国", "CHINA":"中国",
-        "DE":"独", "DEU":"独", "GERMANY":"独",
-        "FR":"仏", "FRA":"仏", "FRANCE":"仏",
-        "IT":"伊", "ITA":"伊", "ITALY":"伊",
-    }
-    return m.get(x, "")  # わからない場合は空（無理に推測しない）
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", str(s or ""))
+
+def _clean_text_jp_safe(s: str) -> str:
+    t = _nfkc(s or "").strip()
+    t = re.sub(r"[　 ]+", " ", t)
+    t = re.sub(r"([。])\1+", r"\1", t)
+    return t
 
 def _extract_hhmm(v) -> str:
     s = str(v or "").strip()
-    # 文字列に HH:MM が含まれていればそれを使う（0 埋めはしない）
-    m = re.search(r"(\d{1,2}:\d{2})", s)
-    if m: return m.group(1)
-    # タイムスタンプ/ISO/日付時刻から HH:MM を抜く（ざっくり）
-    m = re.search(r"T?(\d{1,2}):(\d{2})", s)
+    m = re.search(r"(\d{1,2}):(\d{2})", s)
     if m: return f"{int(m.group(1))}:{m.group(2)}"
-    # 数値（分）やdatetimeが来ても安全に空返し
+    m = re.search(r"T(\d{2}):(\d{2})", s)
+    if m: return f"{int(m.group(1))}:{m.group(2)}"
+    m = re.search(r"\b(\d{2})(\d{2})\b", s)  # 2130 → 21:30
+    if m: return f"{int(m.group(1))}:{m.group(2)}"
     return ""
 
 def _strip_country_prefix(title: str) -> str:
-    # 既に「米・」「英・」などが先頭に付いていたら除去して再付与
-    return re.sub(r"^\s*[^\u30fb・]{1,6}[・･]\s*", "", str(title or "").strip())
+    # 既に「米・」「英・」などが先頭に付いていたら除去（付け直すため）
+    return re.sub(r"^\s*(米|英|日|欧|独|仏|豪|NZ|加|南ア|スイス|中国)\s*[・･]\s*", "", str(title or "").strip())
 
+# NEW: かっこ周りの余白を除去（半角/全角）
+def _tidy_label(name: str) -> str:
+    s = _nfkc(name or "")
+    s = re.sub(r"\s+([)）])", r"\1", s)   # ' )' ' ）' → ')','）'
+    s = re.sub(r"([（(])\s+", r"\1", s)   # '( ' '（ ' → '(', '（'
+    return s.strip()
+
+# --- FXONのイベントテーブル取得（DataFrame or list[dict] のどれでも） ---
 def _events_df_like():
-    # FxONからの候補テーブルを取りにいく（複数キーに対応）
-    for k in ["events_df", "fxon_events_df", "econ_events_df", "events_table"]:
+    # 優先：Step5で作った選択済みの表（selected/edited/表示用）
+    for k in ["selected", "edited_df", "df_display"]:
+        df = globals().get(k)
+        if df is not None:
+            return df
+    # セッションに保持されている候補
+    for k in ["events_df","fxon_events_df","econ_events_df","events_table"]:
         df = st.session_state.get(k)
         if df is not None:
             return df
-    # list[dict] でも受ける
-    for k in ["events", "econ_events", "fxon_events"]:
+    # list[dict] 形
+    for k in ["events","fxon_events","econ_events"]:
         arr = st.session_state.get(k)
         if isinstance(arr, list) and arr and isinstance(arr[0], dict):
             return arr
@@ -7763,22 +7402,85 @@ def _events_df_like():
 
 def _pick(row, keys, default=""):
     for k in keys:
-        if isinstance(row, dict) and k in row:  # list[dict] の場合
+        if isinstance(row, dict) and k in row:
             return row.get(k, default)
-        if hasattr(row, "__class__") and hasattr(row, "__getitem__"):  # DataFrame の行
-            try:
-                return row[k]
-            except Exception:
-                continue
+        try:
+            return row[k]
+        except Exception:
+            continue
     return default
 
-def _build_cal_line_from_fxon() -> str:
+# --- 地域列 → 和略称（米/英/日/欧/…）に**直接**変換（推測なし） ---
+_JA_NAME_TO_ABBR = {
+    "米": "米","米国": "米","アメリカ": "米",
+    "英": "英","英国": "英","イギリス": "英",
+    "日": "日","日本": "日",
+    "欧": "欧","ユーロ圏": "欧","欧州": "欧","ユーロエリア":"欧",
+    "独": "独","ドイツ": "独",
+    "仏": "仏","フランス": "仏",
+    "伊": "伊","イタリア": "伊",
+    "西": "西","スペイン": "西",
+    "スイス":"スイス",
+    "加":"加","カナダ":"加",
+    "豪":"豪","豪州":"豪","オーストラリア":"豪",
+    "NZ":"NZ","ニュージーランド":"NZ",
+    "中国":"中国","中":"中国",
+    "南ア":"南ア","南アフリカ":"南ア",
+}
+_EN_NAME_TO_ISO2 = {
+    "UNITED STATES":"US","USA":"US","UNITED KINGDOM":"GB","UK":"GB","JAPAN":"JP",
+    "EUROZONE":"EU","EURO AREA":"EU","EUROPEAN UNION":"EU",
+    "GERMANY":"DE","FRANCE":"FR","ITALY":"IT","SPAIN":"ES",
+    "SWITZERLAND":"CH","CANADA":"CA","AUSTRALIA":"AU","NEW ZEALAND":"NZ","CHINA":"CN",
+    "SOUTH AFRICA":"ZA",
+}
+_ISO_TO_ABBR = {
+    "US":"米","GB":"英","JP":"日","EU":"欧",
+    "DE":"独","FR":"仏","IT":"伊","ES":"西",
+    "CH":"スイス","CA":"加","AU":"豪","NZ":"NZ","CN":"中国","ZA":"南ア",
+    # 3桁ISOも念のため
+    "USA":"米","GBR":"英","JPN":"日","DEU":"独","FRA":"仏","ITA":"伊","ESP":"西",
+    "CHE":"スイス","AUS":"豪","NZL":"NZ","CHN":"中国","ZAF":"南ア","CAN":"加",
+}
+def _abbr_from_region_value(v: str) -> str:
+    s = _nfkc(v).strip()
+    if not s: return ""
+    if s in _JA_NAME_TO_ABBR:
+        return _JA_NAME_TO_ABBR[s]
+    core = re.sub(r"\s*\(.*?\)\s*", "", s).upper()  # (....) を除去
+    if core in _EN_NAME_TO_ISO2:
+        iso2 = _EN_NAME_TO_ISO2[core]
+        return _ISO_TO_ABBR.get(iso2, "")
+    return _ISO_TO_ABBR.get(core, "")
+
+def _abbr_from_row(ev: dict) -> str:
+    # 地域情報の候補キーを総当りで**直接**参照（推測なし）
+    cand_keys = (
+        "地域","国","国コード",
+        "region","region_code","regionCode",
+        "country","country_name_ja","country_ja",
+        "country_code","countryCode",
+        "ccy","iso2","iso3","currency"
+    )
+    for k in cand_keys:
+        if k in ev and ev[k]:
+            ab = _abbr_from_region_value(ev[k])
+            if ab: return ab
+    return ""
+
+def _normalize_time_str(s: str) -> str:
+    try:
+        h, m = str(s).split(":")
+        return f"{int(h)}:{int(m):02d}"
+    except Exception:
+        return str(s)
+
+# --- ③：FXON → 「HH:MM に略称・指標」列挙を**直接**生成 ---
+def _build_calendar_from_fxon() -> str:
     src = _events_df_like()
     if src is None:
         return ""
-
-    # DataFrame / list[dict] 両対応のイテレータを用意
-    if hasattr(src, "to_dict"):  # pandas.DataFrame 想定
+    if hasattr(src, "to_dict"):
         try:
             records = src.to_dict(orient="records")
         except Exception:
@@ -7786,55 +7488,52 @@ def _build_cal_line_from_fxon() -> str:
     else:
         records = list(src)
 
-    items = []
+    rows = []
     for r in records:
-        tm = _pick(r, ["time", "時刻", "local_time", "datetime", "start_at", "start"])
-        title = _pick(r, ["indicator", "title", "name", "指標"], "")
-        region = _pick(r, ["region", "country", "country_code", "ccy", "地域"], "")
-        abbr = _abbr_from_region(region)
+        t_raw = _pick(r, ["時刻","time","local_time","datetime","start_at","start"])
+        title = _pick(r, ["指標","indicator","title","name"], "")
+        abbr  = _abbr_from_row(r)
+        hhmm  = _extract_hhmm(t_raw)
+        if not title or not hhmm:
+            continue
+        ttl = _tidy_label(_strip_country_prefix(title))
+        disp = f"{_normalize_time_str(hhmm)} に{(abbr + '・') if abbr else ''}{ttl}"  # “に”の後は詰める
+        norm_key = (hhmm, _nfkc(ttl))
+        rows.append((hhmm, norm_key, disp))
 
-        hhmm = _extract_hhmm(tm)
-        ttl = _strip_country_prefix(title)
+    # 時刻昇順 → 時刻+指標でユニーク
+    rows.sort(key=lambda x: (int(x[0].split(':')[0]), int(x[0].split(':')[1])))
+    seen = set()
+    items = []
+    for _, key, disp in rows:
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(disp)
 
-        # 地域が取れないケースは“推測しない”でタイトルだけを出す（重大エラー化を避ける）
-        if hhmm and abbr:
-            items.append(f"{hhmm} に {abbr}・{ttl}")
-        elif hhmm and not abbr:
-            items.append(f"{hhmm} に {ttl}")  # region未提供はそのまま
-        elif abbr:
-            items.append(f"{abbr}・{ttl}")
-        else:
-            items.append(str(ttl))
+    out = "、".join(items)
+    # 念のため “HH:MM に ” を “HH:MM に” に正規化
+    out = re.sub(r'([0-2]?\d:[0-5]\d)\s*に\s*', r'\1 に', out)
+    return out
 
-    # 時刻があるものを優先して時刻昇順、その後その他
-    def _key(s: str):
-        m = re.match(r"^(\d{1,2}):(\d{2})", s)
-        return (0, int(m.group(1)) * 60 + int(m.group(2))) if m else (1, 9999)
-    items = sorted(items, key=_key)
-
-    # 連結して返す（「本日の指標は、」は上位側で付与される設計）
-    return "、".join(items)
-
-# 実際の適用
-cal_line = _build_cal_line_from_fxon()
-if not cal_line:  # 念のための後方互換（従来の session_state 文字列が残っていれば使う）
+# ③の唯一ソースを **FXON直参照で上書き確定**
+cal_line = _build_calendar_from_fxon()
+if not cal_line:
     cal_line = str(st.session_state.get("calendar_line", "") or "")
-cal_line = _final_polish_and_guard(cal_line, para="p3")
+cal_line = _clean_text_jp_safe(cal_line)
+if cal_line:
+    st.session_state["calendar_line"] = cal_line
 
-cal_line = _normalize_calendar_line(cal_line)
-cal_line = re.sub(r"([。])\1+", r"\1", cal_line)
+# ========== ここまで：③生成 ==========
 
-# --- 本文①/②（for_build を優先） ---
-p1 = para1_for_build if "para1_for_build" in locals() else (para1 if "para1" in locals() else "")
+# --- 本文①/②（for_build を優先：既存ロジック踏襲） ---
+p1 = para1_for_build if "para1_for_build" in globals() else (para1 if "para1" in globals() else "")
 
-# --- 段落②は SOT（プレビュー確定文）で“1本に固定” ---
 p2_source = (
-    st.session_state.get("p2_ui_preview_text")   # パッチAで保存した確定文
-    or globals().get("_para2_preview")           # 互換経路（念のため）
+    st.session_state.get("p2_ui_preview_text")
+    or globals().get("_para2_preview")
 )
-
 if not p2_source:
-    # 例外的なフォールバック（通常ここには来ません）
     try:
         p2_source = _compose_para2_preview_mix()
     except Exception:
@@ -7846,59 +7545,65 @@ if not p2_source:
             h4   = st.session_state.get("h4_imp", "横ばい")
             p2_source = f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。"
 
-# 句点を1つに正規化＋軽くクリーン
 p2 = _clean_text_jp_safe(str(p2_source).strip().rstrip("。") + "。")
-
-# 以降の保存・再組版が“同じ値”だけを見るように固定
 st.session_state["para2"] = p2
 st.session_state["para2_for_build"] = p2
 
-# ★最終品質ガードを段落①/②に適用し、プレビュー用にも保存
-p1_out = _final_polish_and_guard(st.session_state.get("para1_for_build", ""), para="p1")
-p2_out = _final_polish_and_guard(st.session_state.get("para2_for_build", ""), para="p2")
-
-# 互換のため p1/p2 を上書きし、UIプレビューにも反映
-p1 = p1_out
-p2 = p2_out
+if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
+    p1_out = _final_polish_and_guard(st.session_state.get("para1_for_build", ""), para="p1")
+    p2_out = _final_polish_and_guard(st.session_state.get("para2_for_build", ""), para="p2")
+else:
+    p1_out = _clean_text_jp_safe(st.session_state.get("para1_for_build", ""))
+    p2_out = _clean_text_jp_safe(st.session_state.get("para2_for_build", ""))
+p1, p2 = p1_out, p2_out
 st.session_state["p1_ui_preview_text"] = p1
 st.session_state["p2_ui_preview_text"] = p2
 
-
-
-
-# （この後のプレビュー組み立ては既存の処理で p1, p2, cal_line を使ってください）
-
-# タイトルの最終確定（UI > default > 自動生成）
-ttl_display = (str(globals().get("title", "")).strip()
-               or str(globals().get("default_title", "")).strip())
+# --- タイトル最終確定（先に定義） ---
+ttl_display = (str(globals().get("title", "")).strip() or str(globals().get("default_title", "")).strip())
 if not ttl_display:
     base = str(globals().get("pair", "") or "ポンド円")
-    tail = (st.session_state.get("title_tail")
-            if "st" in globals() and hasattr(st, "session_state") else None) or "注視か"
+    tail = (st.session_state.get("title_tail") if hasattr(st, "session_state") else None) or "注視か"
     ttl_display = f"{base}の方向感に{tail}"
-ttl_display = _clean_text_jp(ttl_display) if "_clean_text_jp" in globals() else ttl_display
+ttl_display = _clean_text_jp_safe(ttl_display)
 
-# ---- 本日のポイント（Step5選択を2件まで）----
-# ---- 本日のポイント（Step5選択を2件まで）----
+# --- 本日のポイント（FXONデータから略式付で再構成：2件） ---
+def _build_points_from_fxon() -> list[str]:
+    src = _events_df_like()
+    if src is None: return []
+    if hasattr(src, "to_dict"):
+        try: records = src.to_dict(orient="records")
+        except Exception: records = []
+    else:
+        records = list(src)
+
+    pts = []
+    for r in records:
+        t_raw = _pick(r, ["時刻","time","local_time","datetime","start_at","start"])
+        title = _pick(r, ["指標","indicator","title","name"], "")
+        abbr  = _abbr_from_row(r)
+        hhmm  = _extract_hhmm(t_raw)
+        if not title or not hhmm:
+            continue
+        ttl = _tidy_label(_strip_country_prefix(title))
+        pts.append((hhmm, f"{_normalize_time_str(hhmm)} に{(abbr + '・') if abbr else ''}{ttl}"))
+    pts.sort(key=lambda x: (int(x[0].split(':')[0]), int(x[0].split(':')[1])))
+    out = [p[1] for p in pts[:2]]
+    out = [re.sub(r'([0-2]?\d:[0-5]\d)\s*に\s*', r'\1 に', x) for x in out]  # “に”後詰め
+    return out
+
+_pts_fx = _build_points_from_fxon()
+if _pts_fx:
+    st.session_state["points_tags_v2"] = _pts_fx
+
+def _norm_point_line(s: str) -> str:
+    return re.sub(r'^\s*([0-9]{1,2}:[0-9]{2})\s*に\s*', r'\1 に', _nfkc(s))
 points = list(st.session_state.get("points_tags_v2", []) or [])[:2]
-
-# ←ここから追加：H:MM の直後に必ず半角スペース入りの「 に 」を挿入して体裁統一
-import re, unicodedata
-def _normalize_point_line(s: str) -> str:
-    t = unicodedata.normalize("NFKC", str(s or ""))
-    # 先頭の「時刻 + （空白任意）に」を「時刻 + 半角スペース + に」に正規化
-    t = re.sub(r'^\s*([0-9]{1,2}:[0-9]{2})\s*に', r'\1 に', t)
-    return t
-
-points = [_normalize_point_line(p) for p in points]
-# ←ここまで追加
-
+points = [_norm_point_line(p) for p in points]
 point1 = points[0] if len(points) > 0 else ""
 point2 = points[1] if len(points) > 1 else ""
 
-
-# ---- ①が『本日のポイント』に軽く触れていなければ自動で一言だけ挿入 ----
-import re, unicodedata  # 安全のためここで明示的にインポート
+# --- ①にポイント未言及なら一言だけ挿入（既存） ---
 def _mentions_points(s: str, items: list[str]) -> bool:
     if not s or not items: return True
     body = str(s).replace(" ", "")
@@ -7907,25 +7612,16 @@ def _mentions_points(s: str, items: list[str]) -> bool:
         if key and key in body: return True
     return False
 
-def _strip_prefix_and_time(s: str) -> str:
-    t = unicodedata.normalize("NFKC", str(s or ""))
-    # 「時刻（空白任意）に（空白任意）国・」を許容
-    return re.sub(
-        r'^\s*([0-9]{1,2}:[0-9]{2})\s*に\s*(?:米|日|英|欧|豪|NZ|中|南ア|独|仏|伊|加|西|スイス)・\s*',
-        r'\1に',
-        t
-    )
-
-
 _pts_short = [re.sub(r'(^|[^\d])([0-9]{1,2}:[0-9]{2})\s*に', r'\1\2 に', x) for x in points if x]
-if _pts_short and not _mentions_points(p1, points):
-    # 既存の似た文を除去してから1行だけ入れる
-    p1 = re.sub(r"本日は[^。]*?留意したい。", "", str(p1)).strip()
-    hint = ("本日は" + "と".join(_pts_short) + "が控えており、短期の振れに留意したい。")
+if _pts_short and not _mentions_points(globals().get("p1", ""), points):
+    p1 = re.sub(r"本日は[^。]*?留意したい。", "", str(globals().get("p1", ""))).strip()
+    hint = "本日は" + "と".join(_pts_short) + "が控えており、短期の振れに留意したい。"
     if p1 and not p1.endswith("。"): p1 += " "
     p1 += hint
+else:
+    p1 = str(globals().get("p1", "") or "")
 
-# ---- ② 最低文字数ガード＋安全な結び ----
+# --- ② 最低文字数＋末尾整合（既存ロジック温存） ---
 def _allowed_closers() -> list[str]:
     if "ALLOWED_PARA2_CLOSERS" in globals() and ALLOWED_PARA2_CLOSERS:
         return list(ALLOWED_PARA2_CLOSERS)
@@ -7938,15 +7634,13 @@ def pad_para2(para2: str, min_chars: int = 180) -> str:
     base = str(para2 or "").strip()
     if len(base) >= min_chars: return base
     addon = "短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。"
-    if base and not base.endswith("。"): base += " "
-    base += addon
+    if addon not in base:
+        if base and not base.endswith("。"): base += " "
+        base += addon
     return base
-# ---- 段落② 最終ガードの適用（最低文字数 & クローザー揃え）----
-# 1) 文字数を最低180字まで保証
-p2 = pad_para2(p2, min_chars=180)
 
-# 2) タイトル尾語に関わらず、②の結びを常にタイトルと整合させる（末尾の既存クローザーを一旦除去→付け直し）
-closer_pat_end = r"(行方を注視したい。|値動きには警戒したい。|当面は静観としたい。|一段の変動に要注意としたい。|方向感を見極めたい。)$"
+p2 = str(globals().get("p2", "") or "")
+p2 = pad_para2(p2, min_chars=180)
 tail = (st.session_state.get("title_tail") or "").strip()
 closer_map = {
     "注視か": "行方を注視したい。",
@@ -7956,34 +7650,21 @@ closer_map = {
     "見極めたい": "方向感を見極めたい。",
 }
 desired = closer_map.get(tail, "方向感を見極めたい。")
-p2 = re.sub(closer_pat_end, "", p2).rstrip("。") + "。" + desired
-
-
-# 3) 末尾の句点を1つに正規化（最後は必ず「。」1個）
+p2 = re.sub(r"(行方を注視したい。|値動きには警戒したい。|当面は静観としたい。|一段の変動に要注意としたい。|方向感を見極めたい。)$", "", p2).rstrip("。") + "。" + desired
 p2 = (p2 or "").strip().rstrip("。") + "。"
 
-# 4) 以降の処理でも “同じ値” を使うように再度統一保存
-st.session_state["para2"] = p2
-st.session_state["para2_for_build"] = p2
+para1_clean = _clean_text_jp_safe(str(p1).strip())
+para2_clean = _clean_text_jp_safe(str(p2).strip())
 
-
-# クリーニング
-para1_clean = _clean_text_jp(str(p1).strip()) if "_clean_text_jp" in globals() else str(p1).strip()
-para2_clean = _clean_text_jp(str(p2).strip()) if "_clean_text_jp" in globals() else str(p2).strip()
-
-# ②：LLM補筆は任意（OFF既定）→その後パディング
 use_llm_refine = bool(globals().get("use_llm_refine", False))
 def _try_llm_refine_para2(text: str, target_min: int = 180) -> str:
     try:
-        if "llm_complete" in globals():
-            prompt = (
-                "次の日本語テキストを、断定を避けるトーンを維持しつつ、"
+        if "llm_complete" in globals() and callable(llm_complete):
+            out = llm_complete(
+                "次の日本語テキストを、断定を避ける筆致のまま"
                 f"{target_min}〜220字程度に自然に補筆してください。"
-                "ボリンジャーバンドやSMA/EMAといった語彙は崩さず、"
-                "売買助言はしないこと。末尾は句点「。」で終えること。\n\n"
-                f"【テキスト】\n{text}"
+                "ボリンジャーバンドやSMA/EMAの語彙は維持し、売買助言はしないこと。末尾は句点。\n\n【テキスト】\n" + text
             )
-            out = llm_complete(prompt)
             if isinstance(out, str) and len(out.strip()) >= target_min:
                 return out.strip()
     except Exception:
@@ -7995,628 +7676,220 @@ if use_llm_refine and len(para2_final) < 180:
     para2_final = _try_llm_refine_para2(para2_final, 180)
 para2_final = pad_para2(para2_final, 180)
 if not _ends_with_closer(para2_final):
-    if not para2_final.endswith("。"): para2_final += " "
+    if not para2_final.endswith("。"): para2_final += "。"
     para2_final += "方向感を見極めたい。"
-# ---- 最終ポリッシュ（①/②ともにここで重複・体裁を一括ガード）----
-para1_final = _final_polish_and_guard(para1_clean, para="p1")
-para2_final = _final_polish_and_guard(para2_final, para="p2")
+
+if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
+    para1_final = _final_polish_and_guard(para1_clean, para="p1")
+    para2_final = _final_polish_and_guard(para2_final, para="p2")
+    para2_final = pad_para2(para2_final, 180)
+else:
+    para1_final = _clean_text_jp_safe(para1_clean)
+    para2_final = _clean_text_jp_safe(para2_final)
 st.session_state["para1_final"] = para1_final
 st.session_state["para2_final"] = para2_final
 
-# ---- タイトル回収（非LLMで堅く合成。LLM要約があれば前置き）----
-def _guess_pair_from_title(ttl: str) -> str:
-    m = re.search(r"^(.+?)の方向感", ttl or "")
-    return m.group(1) if m else ""
-
-def _infer_bias(para2: str) -> str:
-    s = para2 or ""
-    if any(k in s for k in ["上昇トレンド","上昇バイアス","上向き"]): return "上昇バイアス"
-    if any(k in s for k in ["下落トレンド","下落圧力","下向き","反落"]): return "下落圧力"
-    if any(k in s for k in ["もみ合い","方向感は限定","見極めたい"]): return "方向感の見極め"
-    return "方向感の見極め"
-
-def _points_label_join(opts: list[str]) -> str:
-    labs = []
-    for x in opts[:2]:
-        labs.append((x.split("に", 1)[1] if "に" in x else x))
-    return "と".join([z for z in labs if z])
-
-def _synth_closer_nonllm(title: str, pair: str, bias_phrase: str,
-                         cal_line: str, pts_join: str) -> str:
-    # ③は本文側で別段落として扱う。ここは「タイトルのエコー（句点付き）」だけ返す。
-    t = (title or "").strip()
-    return t if t.endswith("。") else t + "。"
-
-
-
-
-def _try_llm_skim_summary(p1: str, p2: str, cal: str) -> str:
-    return ""  # スキム要約は当面オフ（デバッグ混入防止）
-    """
-    1文要約（任意）。llm_complete が使える時だけ要約を取りに行く。
-    使えない時は必ず空文字を返す（プロンプトが本文に混入しないようにする）。
-    """
+# --- ③＋タイトル回収（同一行） ---
+def _make_cal_plus_recall(cal_src: str, ttl: str) -> str:
+    cs = _nfkc(cal_src or "").strip()
+    cs = re.sub(r"[。．]+$", "", cs)
+    if cs:
+        cal_txt = f"本日の指標は、{cs}が発表予定となっている。"
+    else:
+        cal_txt = "本日の指標は、が発表予定となっている。"
     try:
-        llm = globals().get("llm_complete", None)
-        if callable(llm):
-            prompt = (
-                "次の①②③を踏まえて、日本語で60〜120字の要約を1文だけ返してください。"
-                "断定は避け、売買助言は含めないこと。\n"
-                f"① {p1}\n② {p2}\n③ {cal}"
-            )
-            out = llm(prompt)
-            s = (out or "").strip()
-            # 念のためのガード：プロンプトの断片が返ってきたら破棄
-            bad_markers = ("以下の段落", "短く1文で", "[①]", "[②]", "[③]")
-            if not s or any(k in s for k in bad_markers):
-                return ""
-            # 1行に整形して長すぎる場合は切り詰め
-            return s.replace("\n", " ")[:120]
+        rec = build_title_recall(ttl)
     except Exception:
-        pass
-    return ""
+        rec = ttl
+    recall = _nfkc(str(rec or "")).strip().rstrip("。")
+    return cal_txt + recall + "。"
 
+cal_line_src   = str(st.session_state.get("calendar_line", "") or "").strip()
+cal_plus_recall = _make_cal_plus_recall(cal_line_src, ttl_display)
 
-pair_hint = _guess_pair_from_title(ttl_display)
-bias      = _infer_bias(para2_final)
-pts_join  = _points_label_join(points)
-skim      = _try_llm_skim_summary(para1_clean, para2_final, cal_line)
-if any(k in skim for k in ("以下の段落", "短く1文で", "[①]", "[②]", "[③]")):
-    skim = ""
-
-
-core = _synth_closer_nonllm(ttl_display, pair_hint, bias, cal_line, pts_join)
-title_recall = core
-title_recall = title_recall.strip()
-
-# ---- レポート本文の組み立て（render_report があれば使う・無くても動く）----
+# --- レポート本文の組み立て（既存関数があれば使用） ---
 report_final = ""
 try:
     try:
         report_final = render_report(
             title=ttl_display,
             point1=point1, point2=point2,
-            para1=para1_clean, para2=para2_final,
-            calendar_line=cal_line,     # ← ③はセッションの唯一ソース
-            title_recall=title_recall,  # ← 最後は必ずこの総括で回収
+            para1=para1_final, para2=para2_final,
+            calendar_line=cal_line_src,
+            title_recall=cal_plus_recall,
         )
     except TypeError:
         report_final = render_report(
             title=ttl_display,
             point1=point1, point2=point2,
-            para1=para1_clean, para2=para2_final,
-            cal_line=cal_line,          # ← 旧引数名に対応
-            title_recall=title_recall,
+            para1=para1_final, para2=para2_final,
+            cal_line=cal_line_src,
+            title_recall=cal_plus_recall,
         )
-except Exception as e:
-    st.warning(f"render_report 未定義またはエラーのため簡易構成で出力します: {e}")
-    # （抜粋）render_report 失敗時の簡易組立て
-lines = []
-if ttl_display: lines += [f"タイトル：{ttl_display}", ""]
-if points:      lines += ["本日のポイント", *points, ""]
-if para1_clean: lines += [para1_clean, ""]
-if para2_final: lines += [para2_final, ""]
-if cal_line:    lines += [f"本日の指標は、{cal_line}。", ""]
-lines += [title_recall]
-report_final = "\n".join(lines)
-
-def _normalize_cal_line_for_closer(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return s
-    if "発表予定となっている" in s:
-        return s if s.endswith("。") else s + "。"
-    s = re.sub(r"(。)?\s*$", "", s)
-    return s + "が発表予定となっている。"
-
-# ---- 締めの一貫化（③は最後の1本だけ。③＋タイトルを同一行で）----
-try:
-    import re
-
-    text = (report_final or "").strip()
-    tr   = (title_recall or "").strip()
-
-    # A) どこにあっても「タイトル回収の単独行」は削除（本文の通常文は残す）
-    if tr:
-        text = re.sub(rf"(?m)^\s*{re.escape(tr)}\s*$\n?", "", text)
-
-    # B) ③段落（空行区切りのブロック）をすべて検出 → 最後の1本だけ残す
-    cal_pat = r"本日の指標は、.*?(?=\n\n|$)"
-    cal_matches = list(re.finditer(cal_pat, text, flags=re.S))
-    cal_last = ""
-    if cal_matches:
-        cal_last = cal_matches[-1].group(0).strip()
-        text = re.sub(cal_pat, "", text, flags=re.S).strip()
-    if cal_last:
-        cal_last = _normalize_cal_line_for_closer(cal_last)
-
-    # C) ③末尾の混入を除去 & 表記統一
-    if cal_last:
-        # ③末尾にタイトルがくっ付いていれば切り落とす
-        if tr:
-            cal_last = re.sub(rf"\s*{re.escape(tr)}\s*$", "", cal_last)
-        # 「方向感の見極めを確認したい。」→「方向感を見極めたい。」
-        cal_last = re.sub(r"方向感の見極めを確認したい。", "方向感を見極めたい。", cal_last)
-        # 句点の連続を1つに
-        cal_last = re.sub(r"([。])\1+", r"\1", cal_last).rstrip()
-        if not cal_last.endswith("。"):
-            cal_last += "。"
-
-    # D) 再構成：本文 → （空行） → 「③ ＋ タイトル（同一行）」 or タイトル単独
-    parts = [p for p in re.split(r"\n\n+", text) if p.strip()]
-    out_parts = []
-    if parts:
-        out_parts.append("\n\n".join(parts).strip())
-
-    closer_line = ""
-    if cal_last and tr:
-        closer_line = cal_last.strip() + " " + tr.strip()
-    elif cal_last:
-        closer_line = cal_last.strip()
-    elif tr:
-        closer_line = tr.strip()
-
-    if closer_line:
-        out_parts.append(closer_line)
-
-    out = "\n\n".join(out_parts).strip()
-    # E) 仕上げ：空行と句点の正規化
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    out = re.sub(r"([。])\1+", r"\1", out).strip()
-
-    report_final = out
-
 except Exception:
-    pass
+    lines = []
+    if ttl_display: lines += [f"タイトル：{ttl_display}", ""]
+    if points:      lines += ["本日のポイント", *points, ""]
+    if para1_final: lines += [para1_final, ""]
+    if para2_final: lines += [para2_final, ""]
+    lines += [cal_plus_recall]
+    report_final = "\n".join(lines).strip()
 
+# --- ③重複除去＆末尾1本に統一（既存） ---
+def _compact_final_text(s: str, ttl: str) -> str:
+    t = (s or "").strip()
+    t = re.sub(r"本日の指標は、.*?(?=\n\n|$)", "", t, flags=re.S).strip()
+    if ttl:
+        try:
+            solo = (build_title_recall(ttl) or ttl).strip()
+        except Exception:
+            solo = ttl
+        solo = re.escape(_nfkc(solo).rstrip("。"))
+        t = re.sub(rf"(?m)^\s*{solo}。?\s*$\n?", "", t)
+    t = re.sub(r"(?:\n\s*){3,}", "\n\n", t)
+    t = re.sub(r"([。])\1+", r"\1", t)
+    return t.strip()
 
+body = _compact_final_text(report_final, ttl_display)
+if body and not body.endswith("\n\n"): body += "\n\n"
+report_final = (body + cal_plus_recall).strip()
 
-
-
-
-
-
-
-# ---- この時点の本文を “唯一ソース” としてセッションに固定 ----
+# --- 唯一ソースに固定 & プレビュー表示 ---
 st.session_state["report_final_main"] = str(report_final or "").strip()
+text_to_show = st.session_state["report_final_main"]
 
-# ---- 体裁チェック（任意：最低限）----
-viol = []
-try:
-    g = CFG.get("text_guards", {}) or {}
-except Exception:
-    g = {}
-if len(para1_clean.replace("\n", "")) < g.get("p1_min_chars", 220): viol.append("段落①が規定文字数に未達")
-if len(para2_final.replace("\n", "")) < g.get("p2_min_chars", 180): viol.append("段落②が規定文字数に未達")
-bad_words = ["買い", "売り", "ロング", "ショート", "損切り", "推奨", "おすすめ", "必勝"]
-if any(w in (para1_clean + para2_final) for w in bad_words): viol.append("売買助言に該当し得る語が含まれる")
-
-# ---- プレビュー（唯一ソースから）----
-text_to_show = str(st.session_state.get("report_final_main", "") or "")
-
-# メモ: text_area は改行/空行を絶対に保持する。一方 disabled=True だと灰色になるので、
-# enabled のまま「編集しても即元に戻す」＝実質ReadOnlyにする。
-
-# 1) 現在のプレビュー本文を「正」としてセッションに保存
 if "preview_report_base" not in st.session_state:
     st.session_state["preview_report_base"] = text_to_show
-
-# 2) 上流で本文が更新されたときは base と表示用キーを同期
 if st.session_state["preview_report_base"] != text_to_show:
     st.session_state["preview_report_base"] = text_to_show
-    st.session_state["preview_report_main"] = text_to_show  # 初期表示を差し替え
-
-# 3) 白背景のまま表示（編集できる見た目だが、下のガードですぐ元に戻る）
-# --- プレビュー（編集できる見た目だが、毎リロードでベースに戻す）---
-# 1) まずベース文を取り出す
+    st.session_state["preview_report_main"] = text_to_show
 _base_preview = st.session_state.get("preview_report_base", "")
 
-# 2) ウィジェットを出す前に、常に同じキーへセット（←ここが重要）
-st.session_state["preview_report_main"] = _base_preview
+# --- Pre-AIプレビュー ---
+try:
+    if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
+        para1_pre = _final_polish_and_guard(globals().get("para1_clean", para1_final), para="p1")
+    else:
+        para1_pre = _clean_text_jp_safe(globals().get("para1_clean", para1_final))
+    src_p2 = str(globals().get("para2_clean", para2_final))
+    pre_p2 = pad_para2(src_p2, 180)
+    if not _ends_with_closer(pre_p2):
+        if not pre_p2.endswith("。"): pre_p2 += "。"
+        pre_p2 += "方向感を見極めたい。"
+    if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
+        pre_p2 = _final_polish_and_guard(pre_p2, para="p2")
+    else:
+        pre_p2 = _clean_text_jp_safe(pre_p2)
+    cal_line_pre = _make_cal_plus_recall(cal_line_src, ttl_display)
+    pre_lines = []
+    if ttl_display: pre_lines += [f"タイトル：{ttl_display}", ""]
+    if points:      pre_lines += ["本日のポイント", *points, ""]
+    if para1_pre:   pre_lines += [para1_pre, ""]
+    if pre_p2:      pre_lines += [pre_p2, ""]
+    pre_lines += [cal_line_pre]
+    pre_text = "\n".join(pre_lines).strip()
+except Exception:
+    pre_text = _base_preview
 
-# 3) 表示（見た目は白背景で編集可・コピー可）
-st.text_area(
-    "プレビュー",
-    value=_base_preview,                  # ここは _base_preview でOK
-    height=420,
-    key="preview_report_main",            # このキーは上で事前にセット済み
-    help="コピー可。編集は保存されません（自動で元に戻ります）。",
-)
+tab1, tab2 = st.tabs(["Pre-AI版プレビュー", "AI後プレビュー"])
+with tab1:
+    st.text_area("Pre-AI本文", value=pre_text, height=420, key="pre_ai_preview", disabled=True)
+with tab2:
+    st.text_area("プレビュー", value=_base_preview, height=420, key="preview_report_main")
 
-
-# 4) もしユーザーが編集しても、即「正」に巻き戻す（＝実質 ReadOnly）
 if st.session_state.get("preview_report_main", "") != st.session_state.get("preview_report_base", ""):
     st.session_state["preview_report_main"] = st.session_state["preview_report_base"]
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
+    try: st.rerun()
+    except Exception: st.experimental_rerun()
 
-# ルール要約の先頭だけ確認（長いとUIが崩れるので400字まで）
+# --- 体裁チェック ---
 try:
-    digest = (RULES_DIGEST or "").strip() if "RULES_DIGEST" in globals() else ""
-    if digest:
-        st.caption("現在のルール要約（先頭400字）")
-        st.code(digest[:400])
+    guards = CFG.get("text_guards", {}) or {}
 except Exception:
-    pass
+    guards = {}
+p1_min = int(guards.get("p1_min_chars", 220))
+p2_min = int(guards.get("p2_min_chars", 180))
 
-# 体裁OK/NG表示（この下は元のままでOK）
+def _norm_for_check(s: str) -> str:
+    if "_canon_normalize" in globals() and callable(globals().get("_canon_normalize")):
+        try:
+            return _canon_normalize(s)
+        except Exception:
+            pass
+    return _nfkc(s)
 
+p1_check = _norm_for_check(para1_final).replace("\n", "")
+p2_check = _norm_for_check(para2_final).replace("\n", "")
+
+viol = []
+if len(p1_check) < p1_min: viol.append("段落①が規定文字数に未達")
+if len(p2_check) < p2_min: viol.append("段落②が規定文字数に未達")
+ban_words = ["買い","売り","ロング","ショート","損切り","推奨","おすすめ","必勝"]
+if any(w in (para1_final + para2_final) for w in ban_words): viol.append("売買助言に該当し得る語が含まれる")
+
+last_block = report_final.split("\n\n")[-1].strip() if report_final else ""
+if not (last_block.startswith("本日の指標は、") and last_block.endswith("。")):
+    viol.append("段落③の体裁が不正（本日の指標は、〜 で始まり句点で終える必要）")
+if ttl_display:
+    try:
+        rec_expect = (build_title_recall(ttl_display) or ttl_display).strip().rstrip("。")
+    except Exception:
+        rec_expect = ttl_display.strip().rstrip("。")
+    def _strip_spaces(s: str) -> str: return _nfkc(s).replace(" ", "").replace("\u3000", "")
+    if _strip_spaces(rec_expect) not in _strip_spaces(last_block):
+        viol.append("段落③の末尾が『タイトル回収』になっていません")
 
 if viol:
     st.error("体裁チェック NG：" + " / ".join(viol))
 else:
-    st.success("体裁チェック OK（見出し直後の空行なし／段落③は1行／最後はタイトル回収）。")
+    st.success("体裁チェック OK（①≥220字／②≥180字／③は1行で回収まで同一行・句点で終える）。")
+st.session_state["__final_check_done"] = True
 
-# === 保存・ダウンロード（“プレビューと同一本文”を唯一ソースに統一） ===
+# --- 保存 ---
 out_dir = Path("./out"); out_dir.mkdir(parents=True, exist_ok=True)
 fname = f"m{datetime.now():%Y%m%d}.txt"
 save_path = out_dir / fname
 try:
     save_path.write_text(text_to_show, encoding="utf-8")
     st.success(f"保存しました：{fname}")
-    st.download_button(
-        "このプレビューをダウンロード",
-        data=text_to_show.encode("utf-8"),
-        file_name=fname,
-        mime="text/plain",
-        key="dl_report_unified",
-    )
+    st.download_button("このプレビューをダウンロード",
+                       data=text_to_show.encode("utf-8"),
+                       file_name=fname, mime="text/plain",
+                       key="dl_report_unified")
 except Exception as e:
     st.warning(f"保存時のエラー：{e}")
 
-
-# ===== 監査ログ（再現性のため） =====
-from datetime import datetime
-import json, re
-
+# --- 監査ログ ---
 try:
-    # プレビュー本文（唯一ソース）
     report_text = str(st.session_state.get("report_final_main", "")).strip()
-
-    # タイトル推定（フォールバック付き）
     title_guess = ""
     if report_text:
         first_line = report_text.splitlines()[0]
         m = re.search(r"^タイトル：(.+)$", first_line)
-        if m:
-            title_guess = m.group(1).strip()
+        if m: title_guess = m.group(1).strip()
     if not title_guess:
-        title_guess = str(
-            globals().get("ttl_display", "")
-            or globals().get("title", "")
-            or globals().get("default_title", "")
-        ).strip()
-
-    # 監査項目
+        title_guess = str(globals().get("ttl_display", "")
+                          or globals().get("title", "")
+                          or globals().get("default_title", "")).strip()
     points_log = list(st.session_state.get("points_tags_v2", []) or [])[:2]
-    cal_line   = str(st.session_state.get("calendar_line", "") or "").strip()
-    checks     = st.session_state.get("checks_failed", [])  # あれば採用、無ければ空のまま
-
-    live_diag = globals().get("live_diag", {})
-    te_diag   = globals().get("te_diag", {})
+    cal_log = str(st.session_state.get("calendar_line", "") or "").strip()
+    checks = st.session_state.get("checks_failed", [])
+    live_diag = globals().get("live_diag", {});  te_diag = globals().get("te_diag", {})
     if not isinstance(live_diag, dict): live_diag = {}
-    if not isinstance(te_diag, dict):   te_diag   = {}
-
+    if not isinstance(te_diag, dict):   te_diag = {}
     log = {
         "ts": datetime.now().isoformat(),
         "pair": str(globals().get("pair", "")),
         "title": title_guess,
         "points": points_log,
-        "calendar_line": cal_line,
+        "calendar_line": cal_log,
         "preview_len": len(report_text),
         "checks_failed": checks,
         "live_diag": live_diag,
         "te_diag": te_diag,
     }
-
-    # 保存
     log_dir = Path("outlog"); log_dir.mkdir(parents=True, exist_ok=True)
     log_name = f"log_{datetime.now():%Y%m%d_%H%M%S}.json"
     (log_dir / log_name).write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
 except Exception as e:
     st.warning(f"監査ログの保存に失敗しました: {e}")
-
-# ===== （任意）LLMで最終本文を再組版：既定オフ・手動実行のみ =====
-import os, json, re
-from datetime import datetime
-
-def _get_secret_any(name: str) -> str | None:
-    # secrets.toml > env の順で取得
-    try:
-        v = st.secrets.get(name)
-        if v:
-            return str(v)
-    except Exception:
-        pass
-    return os.environ.get(name)
-
-# プレビュー本文（唯一ソース）
-preview_text = str(st.session_state.get("report_final_main", "")).strip()
-
-with st.expander("LLMで最終本文を再組版（任意／実験的）", expanded=False):
-    st.caption("※ クリック時のみ実行。プレビューと保存内容の唯一ソース（report_final_main）を上書きします。")
-
-    # OpenAI 設定（config が無くても env/secrets から拾えるようフォールバック）
-    prov_openai = ((CFG.get("providers") or {}).get("openai") or {}) if "CFG" in globals() else {}
-    OPENAI_KEY   = _get_secret_any(prov_openai.get("key_env", "OPENAI_API_KEY"))
-    OPENAI_MODEL = prov_openai.get("model", "gpt-4o-mini")
-    OPENAI_TIMEOUT = int(prov_openai.get("timeout_sec", 30))
-
-    # 入力素材は “唯一ソース/直前の確定値” を使う（再計算しない）
-    ttl = str(globals().get("ttl_display", "") or "").strip()
-    if not ttl:
-        # プレビュー本文の先頭から推定（フォールバック）
-        if preview_text.startswith("タイトル："):
-            first = preview_text.splitlines()[0].replace("タイトル：", "", 1).strip()
-            ttl = first
-
-    p1_src = str(globals().get("p1", "") or "").strip()
-    p2_src = str(globals().get("p2", "") or "").strip()
-    cal_line = str(st.session_state.get("calendar_line", "") or "").strip()
-    points_v = list(st.session_state.get("points_tags_v2", []) or [])[:2]
-
-    # 実行ボタン
-    run_llm = st.button("LLMで再組版を実行", key="btn_llm_compose_manual")
-    if run_llm:
-        if not OPENAI_KEY:
-            st.warning("OpenAI API キーが見つかりません（secrets/env）。再組版はスキップしました。")
-        else:
-            # 要求仕様を JSON で返してもらう
-            SYSTEM_MSG = (
-                "あなたは金融パブリッシャー向けの編集者です。日本語で、煽らず断定しない筆致で、"
-                "以下の制約を必ず守って相場レポートを整形してください。"
-                "・禁止：売買助言（買い/売り/ロング/ショート等の推奨）\n"
-                "・段落構成：①市況サマリー（>=220字想定）②テクニカル（>=180字想定）③本日の指標（1行）＋タイトル回収（句点で終える）\n"
-                "・語彙例：SMA/EMA、ボリンジャーバンド、±2σ/±3σ、200SMA/EMA\n"
-                "・②の最後は『行方を注視したい。／値動きには警戒したい。／当面は静観としたい。／一段の変動に要注意としたい。／方向感を見極めたい。』のいずれかで締める"
-            )
-            payload = {
-                "title_suggestion": ttl,
-                "points": points_v,
-                "calendar_line": cal_line,
-                "para1_draft": p1_src,
-                "para2_draft": p2_src,
-                "require_json": True
-            }
-
-            def _compose_with_openai(p):
-                import requests
-                url = "https://api.openai.com/v1/chat/completions"
-                headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
-                body = {
-                    "model": OPENAI_MODEL,
-                    "temperature": 0.3,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_MSG},
-                        {"role": "user", "content": "次の入力をJSONで整形して。必ずUTF-8日本語。keys: title, para1, para2, para3。\n" + json.dumps(p, ensure_ascii=False)}
-                    ],
-                    "response_format": {"type": "json_object"}
-                }
-                r = requests.post(url, headers=headers, json=body, timeout=OPENAI_TIMEOUT)
-                r.raise_for_status()
-                data = r.json()
-                content = data["choices"][0]["message"]["content"]
-                obj = json.loads(content)
-                for k in ["title", "para1", "para2", "para3"]:
-                    if k not in obj or not str(obj[k]).strip():
-                        raise ValueError(f"LLM出力に {k} が欠落")
-                return obj, data.get("usage", {})
-
-            try:
-                obj, usage = _compose_with_openai(payload)
-                new_title = str(obj["title"]).strip()
-                new_p1    = str(obj["para1"]).strip()
-                new_p2    = str(obj["para2"]).strip()
-                new_p3    = str(obj["para3"]).strip()
-
-                # 本文は “唯一ソース” 形式に合成し直す
-                blocks = []
-                blocks += [f"タイトル：{new_title}", ""]
-                if points_v:
-                    blocks += ["本日のポイント", *points_v, ""]
-                blocks += [new_p1, "", new_p2, "", new_p3]
-                new_text = "\n".join(blocks).strip()
-
-                # 唯一ソースを上書き → 以降のプレビュー/保存はすべてこれを参照
-                st.session_state["report_final_main"] = new_text
-                st.session_state["compose_diag"] = {"provider": "openai", "model": OPENAI_MODEL, "usage": usage}
-                st.success("LLMで再組版を実行し、プレビュー本文（唯一ソース）を更新しました。")
-
-            except Exception as e:
-                st.warning(f"LLM再組版に失敗：{e}")
-
-# =========================
-# 以降：体裁チェック / プレビュー表示 / 保存・ダウンロード / 履歴（唯一ソースを使用）
-# =========================
-from datetime import datetime
-import json
-
-# --- 唯一ソース（プレビュー本文） ---
-report_text = str(st.session_state.get("report_final_main", "")).strip()
-
-# compose_diag 既定（LLM再組版を実行していない場合でも安全）
-compose_diag = st.session_state.get("compose_diag", {"provider": "none"})
-
-# 最低文字数（未定義でも動くようフォールバック）
-try:
-    P1_MIN
-except NameError:
-    P1_MIN = 220
-try:
-    P2_MIN
-except NameError:
-    P2_MIN = 180
-
-# ①②の実体（未定義でも落ちない多段フォールバック＋②は最小文字数を保証）
-
-# 最低文字数（CFGが無ければ既定）
-try:
-    _tg = (CFG.get("text_guards") or {})
-    P1_MIN = int(_tg.get("p1_min_chars", 220))
-    P2_MIN = int(_tg.get("p2_min_chars", 180))
-except Exception:
-    P1_MIN, P2_MIN = 220, 180
-
-# パディング関数（既存があればそれを使う）
-if "pad_para2" in globals():
-    _pad_func = pad_para2
-else:
-    def _pad_func(s: str, min_chars: int = 180) -> str:
-        base = str(s or "").strip()
-        if len(base.replace("\n", "")) >= min_chars:
-            return base
-        addon = "短期は過度に方向感を決めつけず、節目やボリンジャーバンド周辺の反応を確かめつつ、値動きには警戒したい。"
-        if base and not base.endswith("。"):
-            base += " "
-        return (base + addon).strip()
-
-# ①は for_build > clean > 生 の順で取得
-p1_src = (
-    globals().get("para1_for_build")
-    or globals().get("para1_clean")
-    or globals().get("para1")
-    or globals().get("p1")
-    or ""
-)
-p1_src = str(p1_src)
-
-# ②は final > for_build > clean > 生 の順で取得し、必ず最小文字数までパディング
-p2_src = (
-    globals().get("para2_final")
-    or globals().get("para2_for_build")
-    or globals().get("para2_clean")
-    or globals().get("para2")
-    or globals().get("p2")
-    or ""
-)
-p2_src = _pad_func(str(p2_src), min_chars=P2_MIN)
-
-def _validate_char_min(p1s: str, p2s: str, p1min: int, p2min: int) -> list[str]:
-    errs = []
-    if len((p1s or "").replace("\n","")) < p1min:
-        errs.append(f"段落①が規定文字数未満（現在{len(p1s)}字 / 最低{p1min}字）")
-    if len((p2s or "").replace("\n","")) < p2min:
-        errs.append(f"段落②が規定文字数未満（現在{len(p2s)}字 / 最低{p2min}字）")
-    return errs
-
-# ---- 体裁チェック ----
-
-
-errors = []
-
-# 既存のレイアウト検証器があればまず使う（無ければ無視）
-try:
-    errs = validate_layout(report_text)
-    if errs:
-        errors.extend(errs)
-except Exception:
-    pass
-
-# 文字数ガード（①②）
-try:
-    errs = _validate_char_min(p1_src, p2_src, P1_MIN, P2_MIN)
-    if errs:
-        errors.extend(errs)
-except Exception:
-    pass
-
-# 禁止語チェック（本文全体に対して）
-forbidden = [" 推奨", "おすすめ", "必勝", "利益確定を", "エントリー推奨"]
-if any(w in report_text for w in forbidden):
-    errors.append("売買助言と見なされる文言が含まれています（語彙を緩めてください）")
-
-# ---- 診断の表示（LLM使用状況など）----
-with st.expander("組版診断（本文には出ません）", expanded=False):
-    st.write(compose_diag)
-
-# ---- プレビューのソースをそのまま表示 ----
-st.code(report_text, language="markdown")
-
-# ---- チェック結果 ----
-if errors:
-    st.error("体裁チェック NG：\n- " + "\n- ".join(errors))
-    can_export = False
-else:
-    st.success("体裁チェック OK（見出し直後の空行なし／段落③は1行／最後はタイトル回収）。")
-    can_export = True
-
-# ---- 保存・ダウンロード（唯一ソースを使用）----
-# 目的：公開用テキストを保存（命名規則 mYYYYMMDD.txt を推奨）。保存の成否を画面に明示し、再出力の再現性を確保
-file_name_default = f"m{datetime.now():%Y%m%d}.txt"
-file_name = st.text_input("保存ファイル名（例：m20250812.txt）", value=file_name_default, key="fname_llm_v1")
-
-st.download_button(
-    "この内容をダウンロード（.txt）",
-    data=report_text,
-    file_name=file_name,
-    mime="text/plain",
-    disabled=not can_export,
-    key="dl_btn_llm_v1",
-)
-
-# ---- 任意：プロジェクト内保存＋履歴追記（安全版・全置換OK）----
-if st.checkbox("プロジェクト内 data/out に保存して履歴へ記録", value=False, key="save_and_log_llm_v1", disabled=not can_export):
-    try:
-        # 1) 本文を data/out/ に保存（UTF-8 BOMでメモ帳互換）
-        outdir = Path("data") / "out"
-        outdir.mkdir(parents=True, exist_ok=True)
-        outfile = outdir / file_name
-        outfile.write_text(report_text, encoding="utf-8-sig")
-        st.success(f"保存しました：{outfile}")
-
-        # 2) 履歴メタを安全に収集（未定義や型ずれに強く）
-        pair_safe = str(globals().get("pair") or "")
-        ttl_log = str((globals().get("ttl_display") or globals().get("title") or "")).strip()
-
-        # ポイント：必ず文字列化→空要素除去→先頭2件
-        _raw_pts = st.session_state.get("points_tags_v2", []) or []
-        points_v = [str(x).strip() for x in _raw_pts if str(x).strip()][:2]
-
-        # 本日の指標：区切りを「、」に正規化→空要素除去
-        cal_line = str(st.session_state.get("calendar_line", "") or "")
-        cal_events = [s.strip() for s in cal_line.replace(",", "、").split("、") if s.strip()]
-
-        # compose_diag（LLMの実行ログ）が無い環境でも安全
-        _cd = globals().get("compose_diag", {}) or {}
-        if isinstance(_cd, dict):
-            provider = _cd.get("provider")
-            llm_model = _cd.get("model")
-        else:
-            provider = None
-            llm_model = None
-        llm_used = (str(provider).lower() == "openai")
-
-        # NFP 次回日付は存在時のみ記録
-        nfp_obj = globals().get("_nfp")
-        nfp_next = nfp_obj.strftime("%Y-%m-%d") if getattr(nfp_obj, "strftime", None) else None
-
-        # ソースCSVのパス（あれば）
-        src_csv = globals().get("use_csv_path")
-        src_csv = str(src_csv) if src_csv else None
-
-        # 3) JSONL へ1行追記（UTF-8 / 日本語可）
-        hist_path = Path("data") / "history.jsonl"
-        meta = {
-            "id": str(uuid4()),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "pair": pair_safe,
-            "title": ttl_log,
-            "points": points_v,
-            "calendar_events": cal_events,
-            "nfp_next": nfp_next,
-            "source_csv": src_csv,
-            "file_name": file_name,
-            "llm_used": llm_used,
-            "llm_model": llm_model,
-        }
-        with hist_path.open("a", encoding="utf-8") as hf:
-            hf.write(json.dumps(meta, ensure_ascii=False) + "\n")
-        st.caption(f"履歴に追記しました：{hist_path}")
-
-    except Exception as e:
-        st.error(f"保存/履歴の処理でエラー: {e}")
-
-
-
