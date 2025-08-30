@@ -7732,124 +7732,237 @@ def _fetch_fx_related_news(max_items=10):
     return items
 
 # --- タイトル＆回収（AI/フォールバック） ---
-def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_news_list: list[dict],
-                         base_title_tail: str = "", pair_name: str = ""):
-    news_lines = [x.strip() for x in manual_news_list if str(x).strip()]
-    news_lines += [_clean_news_title_for_prompt(d["title"]) for d in picked_news_list if d.get("title")]
+def _ai_title_and_recall(
+    preview_text: str,
+    manual_news_list: list[str],
+    picked_news_list: list[dict],
+    base_title_tail: str = "",
+    pair_name: str = "",
+):
+    # ニュース素材（手入力＋選択候補）
+    news_lines = [x.strip() for x in (manual_news_list or []) if str(x).strip()]
+    # _clean_news_title_for_prompt が無い環境でも安全に
+    def _clean_for_prompt(t: str) -> str:
+        try:
+            if "_clean_news_title_for_prompt" in globals() and callable(globals().get("_clean_news_title_for_prompt")):
+                return _clean_news_title_for_prompt(t)
+        except Exception:
+            pass
+        return str(t)
+    for d in (picked_news_list or []):
+        title = (d or {}).get("title")
+        if title:
+            news_lines.append(_clean_for_prompt(title))
 
     prompt = (
         "次の素材を踏まえ、FXレポートの『自然で簡潔なタイトル（18〜28字程度）』を1つと、"
         "『タイトル回収の一文（50〜90字程度）』を1つ作ってください。"
-        "断定は避け、助言はしない。句読点は和文のまま。"
-        "ニュースの媒体名や日付、URLは本文に書かない。括弧で挿入しない。\n\n"
+        "断定は避け、助言はしない。句読点は和文のまま。ニュースの媒体名や日付、URLは本文に書かない。括弧で挿入しない。\n\n"
         f"【主役ペア】{pair_name}\n"
         f"【タイトル語尾候補】{base_title_tail}\n"
-        "【本日の重要ニュース（人入力+AI拾い）】\n- " + "\n- ".join(news_lines[:10]) + "\n\n"
-        "【Pre-AI本文プレビュー】\n" + _clean_text_jp_safe(preview_text)[:1200]
+        "【本日の重要ニュース（手入力+AI候補）】\n- " + "\n- ".join(news_lines[:10]) + "\n\n"
+        "【Pre-AI本文プレビュー（抜粋）】\n" + _clean_text_jp_safe(preview_text or "")[:1200]
         + "\n\n--- 出力フォーマット ---\n"
           "Title: <タイトル>\n"
           "Recall: <タイトル回収の一文>\n"
     )
-    out = _call_llm_with_flags(prompt)
 
-    if isinstance(out, str) and "Title:" in out and "Recall:" in out:
-        m1 = re.search(r"Title:\s*(.+)", out)
-        m2 = re.search(r"Recall:\s*(.+)", out)
-        title  = _clean_text_jp_safe(m1.group(1)) if m1 else ""
-        recall = _strip_media_brackets(_clean_text_jp_safe(m2.group(1)) if m2 else "")
-        title = title.strip("。"); recall = recall.rstrip("。")
-        if title:
-            return title, recall
+    title, recall = "", ""
+    try:
+        out = _call_llm_with_flags(prompt)
+        if isinstance(out, str) and "Title:" in out and "Recall:" in out:
+            m1 = re.search(r"Title:\s*(.+)", out)
+            m2 = re.search(r"Recall:\s*(.+)", out)
+            title  = _clean_text_jp_safe(m1.group(1)) if m1 else ""
+            recall = _strip_media_brackets(_clean_text_jp_safe(m2.group(1)) if m2 else "")
+            title = title.strip("。"); recall = recall.rstrip("。")
+    except Exception:
+        pass
 
-    # フォールバック（タイトル回収の二重語を避ける）
+    if title:
+        return title, recall
+
+    # --- フォールバック（タイトル回収の二重語を避ける） ---
     base = pair_name or str(st.session_state.get("pair", "") or "為替")
     tail = base_title_tail or str(st.session_state.get("title_tail") or "見極めたい")
-    tip = f"（{news_lines[0]}）" if news_lines else ""
+    tip  = f"（{news_lines[0]}）" if news_lines else ""
     title = _clean_text_jp_safe(f"{base}の方向感を{tail}".replace("に見極めたい", "見極めたい")).strip("。")
     recall = _strip_media_brackets(
         _clean_text_jp_safe(f"{base}は材料が交錯しやすい局面{('で' + tip) if tip else 'で'}、ヘッドライン次第の振れに留意したい").rstrip("。")
     )
     return title, recall
 
-def _selected_news_strings() -> tuple[list[str], list[dict]]:
-    man = st.session_state.get("manual_news_lines", "")
-    manual_list = [x.strip() for x in str(man or "").splitlines() if x.strip()]
-    sel_idx = st.session_state.get("ai_news_selected_idx", [])
-    cand = st.session_state.get("ai_news_candidates", [])
-    picked = [cand[i] for i in sel_idx if isinstance(i, int) and i < len(cand)]
-    return manual_list, picked
+
+# ========== Step6: タイトル / 回収 / ニュース のUI＋同期（安全版・ここから） ==========
+
+# 0) クリック適用の“保留値”を、ウィジェット作成の前にセッションへ反映（重要）
+if "__pending_title_input" in st.session_state:
+    st.session_state["title_ai"] = st.session_state["__pending_title_input"]
+    del st.session_state["__pending_title_input"]
+
+if "__pending_recall_input" in st.session_state:
+    # 入力ウィジェット用の値と、プレビューが読む最終値の両方を更新
+    st.session_state["ai_title_recall_input"] = st.session_state["__pending_recall_input"]
+    st.session_state["ai_title_recall_final"] = st.session_state["__pending_recall_input"]
+    del st.session_state["__pending_recall_input"]
+
+# 入力→最終値へ自動同期（入力が変わったら毎回クリーンアップして反映）
+def _on_change_recall_input():
+    raw = st.session_state.get("ai_title_recall_input", "")
+    st.session_state["ai_title_recall_final"] = _strip_media_brackets(
+        _clean_text_jp_safe(raw).rstrip("。")
+    )
 
 with st.container():
     st.markdown("#### AI補正：タイトル/回収 と 重要ニュース（任意）")
     st.caption("手入力ニュースを優先。AI候補は参考（RSSのみ使用／外部ブラウズ不要）。")
 
-    col1, col2 = st.columns([3, 2])
+    # 1) タイトル（AI後が参照する値）
+    ttl_default = str(st.session_state.get(
+        "title_ai",
+        str(globals().get("ttl_display","") or globals().get("title","") or "")
+    ))
+    st.text_input("AI提案タイトル（編集可・句点なし推奨）",
+                  value=ttl_default, key="title_ai")
+
+    # 2) タイトル回収（編集用ウィジェット：*_input、最終値：*_final）
+    st.text_area("AI提案：タイトル回収（編集可・句点なし推奨）",
+                 value=st.session_state.get("ai_title_recall_final",""),
+                 key="ai_title_recall_input",
+                 height=80,
+                 on_change=_on_change_recall_input)
+
+    # 3) ニュース（手入力）
+    st.caption("手入力ニュースを優先。AI候補は未入力分を補完します。")
+    st.text_area("本日の重要ニュース（手入力・1行1件）",
+                 value=st.session_state.get("manual_news_lines",""),
+                 placeholder="例）米大統領選TV討論会\n中東地政学リスク再燃\n大規模停電 など",
+                 key="manual_news_lines", height=96)
+
+    # 4) AI候補ニュースの取得
+    col1, col2 = st.columns([1,1])
     with col1:
-        manual_news = st.text_area(
-            "本日の重要ニュース（手入力・1行1件）",
-            value=st.session_state.get("manual_news_lines",""),
-            placeholder="例）米大統領選TV討論会\n中東地政学リスク再燃\n大規模停電 など",
-            key="manual_news_lines", height=96,
-        )
-    with col2:
-        st.write(""); st.write("")
         fetch_now = st.button("AIニュース（RSS）を取得/更新", key="btn_fetch_ai_news")
-        n_items = st.number_input("AI候補：最大件数", 3, 20, 10, step=1, key="ai_news_max_items")
+    with col2:
+        n_items = st.number_input("AI候補：最大件数", min_value=3, max_value=20, value=10, step=1, key="ai_news_max_items")
 
     if fetch_now:
-        st.session_state["ai_news_candidates"] = _fetch_fx_related_news(int(n_items))
+        try:
+            cand = _fetch_fx_related_news(int(n_items))
+            if isinstance(cand, list):
+                st.session_state["ai_news_candidates"] = cand[:int(n_items)]
+        except Exception as e:
+            st.warning(f"AIニュース取得に失敗しました: {e}")
 
-    cand = st.session_state.get("ai_news_candidates", [])
-    if cand:
+    # 5) 候補の表示＆選択（辞書/文字列どちらにも対応・インデックス選択に統一）
+    raw_cand = st.session_state.get("ai_news_candidates", [])
+    cand_list = []
+    for c in raw_cand:
+        if isinstance(c, dict):
+            title = c.get("title") or c.get("headline") or str(c)
+            source = c.get("source","")
+        else:
+            title, source = str(c), ""
+        cand_list.append({"title": title, "source": source})
+
+    if cand_list:
         st.caption("AI候補ニュース（複数選択可）")
-        view = [f"{i+1}. {_clean_news_title_for_prompt(c['title'])}（{c.get('source','')}）" for i, c in enumerate(cand)]
-        st.multiselect(
-            "採用するAI候補ニュースを選択",
-            options=list(range(len(view))),
-            format_func=lambda i: view[i],
-            default=st.session_state.get("ai_news_selected_idx", [])[:3],
-            key="ai_news_selected_idx"
-        )
+        def _fmt_title(t):
+            try:
+                if "_clean_news_title_for_prompt" in globals() and callable(globals().get("_clean_news_title_for_prompt")):
+                    return _clean_news_title_for_prompt(t)
+            except Exception:
+                pass
+        # 表示用テキスト
+        view = [f"{i+1}. {_fmt_title(c['title'])}（{c['source']}）" if c['source'] else f"{i+1}. {_fmt_title(c['title'])}"
+                for i, c in enumerate(cand_list)]
+        st.multiselect("採用するAI候補ニュースを選択",
+                       options=list(range(len(view))),
+                       format_func=lambda i: view[i],
+                       default=st.session_state.get("ai_news_selected_idx", [])[:3],
+                       key="ai_news_selected_idx")
     else:
         st.info("『AIニュース（RSS）を取得/更新』を押すと候補が表示されます。")
 
+    # 6) ニュース統合（手入力＋候補選択 → manual_news_lines に確定）
+    if st.button("ニュースを適用/統合", key="btn_apply_news"):
+        lines = []
+        # 手入力
+        for ln in str(st.session_state.get("manual_news_lines","")).splitlines():
+            ln = ln.strip()
+            if ln and ln not in lines:
+                lines.append(ln)
+        # 候補（選択分）
+        for i in st.session_state.get("ai_news_selected_idx", []):
+            if isinstance(i, int) and 0 <= i < len(cand_list):
+                t = cand_list[i]["title"].strip()
+                if t and t not in lines:
+                    lines.append(t)
+        st.session_state["manual_news_lines"] = "\n".join(lines[:10])
+        st.success("ニュースを適用しました（AI後プレビューに反映されます）。")
+
+    # 7) タイトル案のAI生成
     colA, colB, colC = st.columns([1,1,2])
     with colA:
         gen_title = st.button("AIでタイトル案を生成", key="btn_ai_title")
     with colB:
         apply_title = st.button("↑ このタイトルを適用", key="btn_apply_title")
     with colC:
-        period_only = st.checkbox("③は『回収文のみ句点』にする", value=st.session_state.get("recall_period_only", False), key="recall_period_only")
+        st.checkbox("③は『回収文のみ句点』にする",
+                    value=st.session_state.get("recall_period_only", False),
+                    key="recall_period_only")
 
     if gen_title:
-        preview_all = "\n".join([str(globals().get("p1","")), str(globals().get("p2","")), str(st.session_state.get("calendar_line",""))])
-        manual_list, picked = _selected_news_strings()
-        pair_name = str(st.session_state.get("pair",""))  # ← session_stateで統一
-        base_tail = str(st.session_state.get("title_tail") or "")
-        t, r = _ai_title_and_recall(preview_all, manual_list, picked, base_tail, pair_name)
-        st.session_state["ai_title_draft"] = t
-        st.session_state["ai_recall_draft"] = r
+        preview_all = "\n".join([
+            str(globals().get("p1","")), str(globals().get("p2","")), str(st.session_state.get("calendar_line",""))
+        ])[:1200]
+        picked = []
+        for i in st.session_state.get("ai_news_selected_idx", []):
+            if isinstance(i, int) and 0 <= i < len(cand_list):
+                picked.append(cand_list[i])
+        manual_list = [x.strip() for x in str(st.session_state.get("manual_news_lines","")).splitlines() if x.strip()]
 
-    ai_t = st.text_input("AI提案タイトル（編集可）", value=st.session_state.get("ai_title_draft", ""), key="ai_title_draft_text")
-    ai_r = st.text_area("AI提案：タイトル回収（編集可・句点なし推奨）", value=st.session_state.get("ai_recall_draft", ""), height=66, key="ai_recall_draft_text")
+        try:
+            t, r = _ai_title_and_recall(preview_all, manual_list, picked,
+                                        str(st.session_state.get("title_tail") or ""),
+                                        str(st.session_state.get("pair","")))
+        except Exception:
+            # フォールバック
+            base = str(st.session_state.get("pair", "") or "為替")
+            tail = str(st.session_state.get("title_tail") or "見極めたい")
+            t = _clean_text_jp_safe(f"{base}の方向感を{tail}".replace("に見極めたい", "見極めたい")).strip("。")
+            tip_src = manual_list[0] if manual_list else ""
+            r = _strip_media_brackets(
+                _clean_text_jp_safe(f"{base}は材料が交錯しやすい局面{('で（' + tip_src + '）') if tip_src else 'で'}、ヘッドライン次第の振れに留意したい").rstrip("。")
+            )
+
+        st.session_state["ai_title_draft_text"] = t
+        st.session_state["ai_recall_draft_text"] = r
+
+    st.text_input("AI提案タイトル（編集可）",
+                  value=st.session_state.get("ai_title_draft_text", ""), key="ai_title_draft_text")
+    st.text_area("AI提案：タイトル回収（編集可・句点なし推奨）",
+                 value=st.session_state.get("ai_recall_draft_text", ""), height=66, key="ai_recall_draft_text")
 
     if apply_title:
+        # タイトル：Pre側（globals["title"]）と AI後（title_ai）の両方を、次回実行でウィジェットに安全反映
         new_t = _clean_text_jp_safe(st.session_state.get("ai_title_draft_text","")).strip("。")
         if new_t:
             globals()["title"] = new_t
             st.session_state["title"] = new_t
+            st.session_state["__pending_title_input"] = new_t  # → 次の実行で title_ai ウィジェットへ
+
+        # 回収文：ウィジェットに直書きせず、保留→rerun で“ウィジェット作成前”に反映
         new_r_raw = _clean_text_jp_safe(st.session_state.get("ai_recall_draft_text","")).rstrip("。")
-        st.session_state["ai_title_recall_final"] = _strip_media_brackets(new_r_raw)
-        st.success("AIタイトル＆回収を適用しました。下のプレビューを更新してください。")
+        st.session_state["__pending_recall_input"] = _strip_media_brackets(new_r_raw)
 
-    # --- ここでAI使用サインを表示 ---
-    _af = _ai_flags()
-    badge = f"🔎 AI使用状況｜LLM: {'✅' if _af['llm_used'] else '—'} / RSS: {'✅' if _af['rss_used'] else '—'} / 概算Tokens: ~{_af['tokens_est']}"
-    st.info(badge)
-    if _af.get("last_error"):
-        st.warning(f"LLM呼び出しエラー: {_af['last_error']}")
+        st.success("AIタイトル＆回収を適用しました。プレビューに反映します。")
+        st.rerun()  # ← この実行を中断し、次回の実行の冒頭で保留値を吸い上げ
 
-# --- タイトル最終確定（AI適用を反映） ---
+# ========== Step6: タイトル / 回収 / ニュース のUI＋同期（安全版・ここまで） ==========
+
+
+# --- タイトル最終確定（AI適用を反映／Pre側に使う見出し） ---
 ttl_display = (str(globals().get("title", "")).strip() or str(globals().get("default_title", "")).strip())
 if not ttl_display:
     base = str(st.session_state.get("pair", "") or "ポンド円")
@@ -7857,7 +7970,8 @@ if not ttl_display:
     ttl_display = f"{base}の方向感に{tail}"
 ttl_display = _clean_text_jp_safe(ttl_display)
 
-# --- 本日のポイント（FXONデータから略式付で再構成：2件） ---
+
+# --- 本日のポイント（FxONから2件） ---
 def _build_points_from_fxon() -> list[str]:
     src = _events_df_like()
     if src is None:
@@ -7896,7 +8010,7 @@ points = [_norm_point_line(p) for p in points]
 point1 = points[0] if len(points) > 0 else ""
 point2 = points[1] if len(points) > 1 else ""
 
-# --- ①にポイント未言及なら一言だけ挿入（既存） ---
+# --- ①にポイント未言及なら一言だけ挿入（既存仕様を維持） ---
 def _mentions_points(s: str, items: list[str]) -> bool:
     if not s or not items:
         return True
@@ -7918,6 +8032,8 @@ else:
     p1 = str(globals().get("p1", "") or "")
 
 # --- ② 段落の生成（Pre-AI=基礎 / AI後=個別補正）＋体裁・保存・ログ ----
+
+
 
 # 0) ヘルパ
 def _allowed_closers() -> list[str]:
