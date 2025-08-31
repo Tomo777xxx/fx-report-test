@@ -4814,6 +4814,53 @@ def _get_api_key() -> str | None:
     import os
     return os.environ.get("OPENAI_API_KEY")
 
+# ===== LLM接続（共通） =====
+# OpenAI SDK v1 形式。requirements.txt に `openai>=1.40.0` を入れてください。
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # 未インストールでもアプリは落とさない
+
+_LLMC = None
+def _get_client():
+    """遅延初期化で OpenAI クライアントを用意"""
+    global _LLMC
+    if _LLMC is not None:
+        return _LLMC
+    if OpenAI is None:
+        return None
+    key = _get_api_key()
+    if not key:
+        return None
+    _LLMC = OpenAI(api_key=key)
+    return _LLMC
+
+def llm_complete(prompt: str,
+                 system: str = (
+                     "あなたは金融レポートの校正者です。"
+                     "事実の改変や新規の数値・固有名詞の創作は禁止。"
+                     "助言・断定・煽りを避け、語尾は穏当。日本語で出力。"
+                 ),
+                 temperature: float = 0.2,
+                 max_tokens: int = 600) -> str:
+    """
+    文章整形専用の薄いラッパ。既存の各ボタンからこの関数が呼ばれます。
+    """
+    client = _get_client()
+    if client is None or not prompt:
+        return ""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-5-thinking",  # ← ご指定の ChatGPT5 Thinking
+            messages=[{"role": "system", "content": system},
+                      {"role": "user",   "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        # 失敗時は空文字で呼び出し側のフォールバックに委ねる
+        return ""
 
 # 目的：段落②が短い時に“安全な汎用文”をYAMLから読み込み、結びの直前に自動で追記できるようにするためのローダー群
 # ====== 段落② 安全文（外部YAML）ローダーと拡張ロジック ======
