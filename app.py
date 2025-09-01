@@ -4787,9 +4787,8 @@ st.markdown("---")
 
 
 
-
-
 # ====== タイトル・回収の補助（ステップ3の直前に置く） ======
+from pathlib import Path
 
 def _get_api_key() -> str | None:
     """
@@ -4798,7 +4797,6 @@ def _get_api_key() -> str | None:
     2) st.secrets["general"]["OPENAI_API_KEY"]
     3) 環境変数 OPENAI_API_KEY
     見つからなければ None を返す。
-    ※ 秘密鍵の保管場所が変わっても、この関数だけ差し替えれば全体が対応可。
     """
     # 1) / 2) Streamlit secrets（ローカルimportで安全化）
     try:
@@ -4814,62 +4812,63 @@ def _get_api_key() -> str | None:
     import os
     return os.environ.get("OPENAI_API_KEY")
 
-# ===== LLM接続（共通） =====
-# OpenAI SDK v1 形式。requirements.txt に `openai>=1.40.0` を入れてください。
+
+# === LLM（ChatGPT5 Thinking）呼び出し：一度定義して全体で使い回し ===
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None  # 未インストールでもアプリは落とさない
+    OpenAI = None
 
-_LLMC = None
-def _get_client():
-    """遅延初期化で OpenAI クライアントを用意"""
-    global _LLMC
-    if _LLMC is not None:
-        return _LLMC
+_openai_client = None
+def _ensure_openai_client():
+    """OpenAIクライアント（使い回し）。キー無 or 失敗で None。"""
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
     if OpenAI is None:
         return None
     key = _get_api_key()
     if not key:
         return None
-    _LLMC = OpenAI(api_key=key)
-    return _LLMC
+    try:
+        _openai_client = OpenAI(api_key=key)
+        return _openai_client
+    except Exception:
+        return None
 
 def llm_complete(prompt: str,
                  system: str = (
-                     "あなたは金融レポートの校正者です。"
-                     "事実の改変や新規の数値・固有名詞の創作は禁止。"
-                     "助言・断定・煽りを避け、語尾は穏当。日本語で出力。"
+                     "あなたは金融レポートの日本語校正者です。"
+                     "売買助言はしない・新規の数値/固有名詞は出さない・断定を避ける。"
+                     "体裁を整えることに専念してください。"
                  ),
                  temperature: float = 0.2,
-                 max_tokens: int = 600) -> str:
-    """
-    文章整形専用の薄いラッパ。既存の各ボタンからこの関数が呼ばれます。
-    """
-    client = _get_client()
+                 max_tokens: int = 800) -> str:
+    """ChatGPT-5 Thinking で短文を整形。失敗時は空文字を返す。"""
+    client = _ensure_openai_client()
     if client is None or not prompt:
         return ""
     try:
         resp = client.chat.completions.create(
-            model="gpt-5-thinking",  # ← ご指定の ChatGPT5 Thinking
-            messages=[{"role": "system", "content": system},
-                      {"role": "user",   "content": prompt}],
+            model="gpt-5-thinking",  # ChatGPT5 Thinking を固定
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": prompt},
+            ],
             temperature=temperature,
             max_tokens=max_tokens,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
-        # 失敗時は空文字で呼び出し側のフォールバックに委ねる
         return ""
 
-# 目的：段落②が短い時に“安全な汎用文”をYAMLから読み込み、結びの直前に自動で追記できるようにするためのローダー群
-# ====== 段落② 安全文（外部YAML）ローダーと拡張ロジック ======
 
+# 目的：段落②が短い時に“安全な汎用文”をYAMLから読み込み、結びの直前に自動で追記するためのローダー群
+# ====== 段落② 安全文（外部YAML）ローダーと拡張ロジック ======
 try:
     import yaml
 except Exception:
     yaml = None  # 未インストールでもアプリは落とさない
-
 
 _P2_SAFE_CACHE = None
 
@@ -4879,11 +4878,10 @@ def _load_para2_boiler_yaml(path: str | Path = "data/para2_boilerplate.yaml") ->
     if _P2_SAFE_CACHE is not None:
         return _P2_SAFE_CACHE
 
-    # ↓↓↓ ここを追加 ↓↓↓
+    # yaml が使えない環境では空を返す
     if yaml is None:
         _P2_SAFE_CACHE = {"generic": [], "per_pair": {}}
         return _P2_SAFE_CACHE
-    # ↑↑↑ ここまで追加 ↑↑↑
 
     p = Path(path)
     if not p.exists():
@@ -4897,6 +4895,7 @@ def _load_para2_boiler_yaml(path: str | Path = "data/para2_boilerplate.yaml") ->
     except Exception:
         _P2_SAFE_CACHE = {"generic": [], "per_pair": {}}
     return _P2_SAFE_CACHE
+
 def _load_para2_boiler(path: str | Path = "data/para2_boilerplate.yaml") -> dict:
     """互換ラッパー：既存コードの呼び名を維持しつつ、実体は YAML ローダーへ委譲。"""
     return _load_para2_boiler_yaml(path)
@@ -4940,6 +4939,7 @@ def _extend_para2_if_short(para2: str, pair: str, min_chars: int, closers: list[
         if not out.endswith("。"):
             out += "。"
         out += " " + sent
+
     # 万一まだ足りなければ最後に短い安全文を一つ
     if len(out.replace("\n", "")) < min_chars:
         out += " 市場の振れに留意したい。"
@@ -4949,6 +4949,7 @@ def _extend_para2_if_short(para2: str, pair: str, min_chars: int, closers: list[
             out += "。"
         out += " " + closer
     return out.strip()
+
 # ====== ここまで ======
 
 
@@ -8335,8 +8336,10 @@ def _apply_ai_to_title_and_p3():
         f"段落②: {ai_p2}",
     ])
     p3 = _make_cal_plus_recall(cal_line_src, ttl, preview_for_recall_ai)
-    st.session_state["title_ai"] = ttl
+    # ウィジェット直書きはNG。保留キーに入れて、次回実行でStep6が安全に反映する
+    st.session_state["__pending_title_input"] = ttl
     st.session_state["p3_ai"] = p3
+
 
 def _apply_ai_to_p2_only():
     refined = _refine_para2_structured(ai_p2, _pair_now)
@@ -8345,6 +8348,58 @@ def _apply_ai_to_p2_only():
         if not refined.endswith("。"): refined += "。"
         refined += "方向感を見極めたい。"
     st.session_state["p2_ai"] = _clean_text_jp_safe(refined)
+# --- 段落②：ルール整形の結果を ChatGPT-5 で最終ポリッシュする（手動時のみ使用） ---
+def _p2_ai_postprocess(text: str) -> str:
+    import re
+    t = _clean_text_jp_safe(str(text or ""))
+    # よく出る重複の解消（例：同じ導入文の二重化／「4時間足では 為替市場は、」の誤連結）
+    t = t.replace("4時間足では 為替市場は、", "4時間足では ")
+    t = re.sub(r"(為替市場は、[^。]+。)\s*\1", r"\1", t)
+    # 余分な空白を整理
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t.endswith("。"):
+        t += "。"
+    return t
+
+def _apply_ai_to_p2_with_ai():
+    """
+    1) 既存のルール整形（_apply_ai_to_p2_only）で安全に骨子を作る
+    2) その結果を LLM で日本語だけ整える（事実改変なし）
+    3) 180字未満なら安全文を足して基準を満たす
+    """
+    # まず既存のルール整形を実行（ここで session_state["p2_ai"] を更新）
+    _apply_ai_to_p2_only()
+
+    base = st.session_state.get("p2_ai") or ""
+    src  = _p2_ai_postprocess(base)
+
+    out = src
+    try:
+        if "llm_complete" in globals() and callable(globals().get("llm_complete")):
+            prompt = (
+                "次の『段落②（為替テクニカル）』の文章を、事実関係を変えずに自然な日本語へ整えてください。"
+                "助言・断定は避け、重複表現を削り、句読点を整えます。専門用語は保持。末尾は句点。"
+                "\n---\n" + src
+            )
+            tmp = llm_complete(prompt, max_tokens=600, temperature=0.2)
+            if isinstance(tmp, str) and tmp.strip():
+                out = _p2_ai_postprocess(tmp)
+    except Exception:
+        pass
+
+    # 180字未満なら安全に追記（既存のユーティリティを使用）
+    try:
+        pair = str(st.session_state.get("pair", ""))
+        closers = [
+            "方向感を見極めたい。", "行方を注視したい。", "値動きには警戒したい。"
+        ]
+        out = _extend_para2_if_short(out, pair, 180, closers)
+    except Exception:
+        # フォールバック：最低限の一文を足す
+        if len(out.replace("\n", "")) < 180:
+            out = out.rstrip("。") + "。 市場の振れに留意したい。"
+
+    st.session_state["p2_ai"] = out
 
 def _apply_ai_to_p1_only():
     try:
@@ -8413,6 +8468,14 @@ with tab1:
     st.text_area("Pre-AI本文", value=pre_text, height=420, key="pre_ai_preview", disabled=True)
 with tab2:
     st.text_area("プレビュー", value=ai_text,  height=420, key="preview_report_main_area", disabled=False)
+    if st.button("AI後プレビューをAIで補正（手動）", key="btn_refine_preview_after"):
+        # 既存の個別適用関数を順に実行
+        _apply_ai_to_p1_only()          # 段落①（ChatGPT5で整形）
+        _apply_ai_to_p2_only()          # 段落②（既存の構造化ロジック）
+        _apply_ai_to_title_and_p3()     # タイトル簡潔化＋③再生成（タイトルは“保留→次回反映”）
+
+        st.success("AI補正を適用しました。")
+        # ※ボタン押下→自動で再実行され、Step6冒頭が __pending_title_input を吸い上げます
 
 # 6) 体裁チェック（AI後で判定）
 try:
