@@ -7623,26 +7623,25 @@ from pathlib import Path
 from datetime import datetime
 
 # ---------- LLM 必須ガード & ランプ ----------
+# ※ 毎実行リセット（この実行内の回数/トークンを可視化）
+st.session_state["ai_flags"] = {
+    "llm_used": False, "llm_calls": 0, "rss_used": False,
+    "tokens_est": 0, "last_error": "", "ready": False,
+}
+
 def _ai_flags():
-    # 1実行ごとに初期化（呼出回数はこの実行内でのみカウント）
-    if "ai_flags" not in st.session_state:
-        st.session_state["ai_flags"] = {
-            "llm_used": False, "llm_calls": 0, "rss_used": False,
-            "tokens_est": 0, "last_error": "", "ready": False,
-        }
     return st.session_state["ai_flags"]
 
 def _llm_ready() -> bool:
-    # llm_complete/_ensure_openai_client を使って“実際に使えるか”を確認
+    """llm_complete/_ensure_openai_client が実体として使えるかを確認"""
     try:
-        ok = ("llm_complete" in globals() and callable(globals().get("llm_complete")))
-        if not ok:
+        if not callable(globals().get("llm_complete")):
             return False
-        if " _ensure_openai_client " in globals():
-            cli = globals().get("_ensure_openai_client")()
-        else:
-            cli = globals().get("_ensure_openai_client", lambda: None)()
-        return cli is not None
+        ensure = globals().get("_ensure_openai_client")
+        if callable(ensure):
+            return ensure() is not None
+        # 旧実装でも llm_complete があれば最低限OK
+        return True
     except Exception:
         return False
 
@@ -7660,7 +7659,7 @@ def _est_tokens(s: str) -> int:
     return max(0, round(len(s) / 3))
 
 def _call_llm_with_flags(prompt: str, **kw) -> str:
-    """llm_complete を必ず通す。失敗したら例外は投げず、空文字＋last_error更新。"""
+    """llm_complete を必ず通す。失敗は空文字＋last_error更新。"""
     af = _ai_flags()
     out = ""
     try:
@@ -7680,7 +7679,10 @@ def _llm_lamp_inline():
     af = _ai_flags()
     ready = _llm_ready()
     lamp = "🟢" if ready else "🔴"
-    st.markdown(f"**LLM接続**：{lamp} {'接続OK' if ready else '未接続'}", help="OPENAI_API_KEY（secrets / 環境変数）を確認")
+    st.markdown(
+        f"**LLM接続**：{lamp} {'接続OK' if ready else '未接続'}",
+        help="OPENAI_API_KEY（secrets / 環境変数）を確認"
+    )
 
 def _ai_usage_lamp_inline():
     af = _ai_flags()
@@ -7871,7 +7873,7 @@ def _ai_title_and_recall(
 # ========== Step6: タイトル / 回収 / ニュース のUI＋同期（ここから） ==========
 with st.container():
     st.markdown("#### AI補正：タイトル/回収 と 重要ニュース（任意）")
-    _llm_lamp_inline()  # ← 接続ランプ（🟢/🔴）
+    _llm_lamp_inline()  # 接続ランプ（🟢/🔴）
     st.caption("手入力ニュースを優先。AI候補は参考（RSSのみ使用／外部ブラウズ不要）。")
 
     # 0) クリック適用の“保留値”を、ウィジェット作成前に反映（重要）
@@ -7968,7 +7970,7 @@ with st.container():
         st.session_state["manual_news_lines"] = "\n".join(lines[:10])
         st.success("ニュースを適用しました（AI後プレビューに反映されます）。")
 
-    # 7) タイトル案のAI生成（AI必須／失敗時はエラーで終了）
+    # 7) タイトル案のAI生成（AI必須）
     colA, colB, colC = st.columns([1,1,2])
     with colA:
         gen_title = st.button("AIでタイトル案を生成", key="btn_ai_title")
@@ -8162,7 +8164,7 @@ def _p2_ai_postprocess(text: str) -> str:
     return t
 
 def _apply_ai_to_p2_only():
-    refined = _refine_para2_structured(ai_p2, _pair_now)
+    refined = _refine_para2_structured(ai_p2, _cur_pair)
     refined = pad_para2(refined, 180)
     if not _ends_with_closer(refined):
         if not refined.endswith("。"): refined += "。"
@@ -8251,7 +8253,6 @@ def _apply_ai_to_title_and_p3():
     st.session_state["p3_ai"] = p3
 
 # 2) Pre-AI（段落①/②/③/タイトル）を作成
-_pair_now = str(st.session_state.get("pair",""))
 ttl_display = str(globals().get("ttl_display","") or globals().get("title","") or "").strip()
 
 # 段落①
@@ -8261,6 +8262,7 @@ if "_final_polish_and_guard" in globals() and callable(globals().get("_final_pol
 
 # 段落②（合成→pad→BP→クローザー）
 p2_src = str(globals().get("p2","") or st.session_state.get("para2_for_build","") or "")
+
 def _needs_recompose_p2(txt: str, pair: str) -> bool:
     if not txt: return True
     t = _nfkc(txt); p = _nfkc(pair)
@@ -8312,8 +8314,8 @@ def _fallback_bp_from_ui():
     dn = _pick_first_num("p2_bp_lower","bp_dn","p2_bp_d1_lower","p2_bp_h4_lower")
     return up, dn
 
-if _needs_recompose_p2(p2_src, _pair_now):
-    p2_src = _recompose_para2(_pair_now)
+if _needs_recompose_p2(p2_src, _cur_pair):
+    p2_src = _recompose_para2(_cur_pair)
     st.session_state["para2"] = p2_src
     st.session_state["para2_for_build"] = p2_src
 
