@@ -1,18 +1,23 @@
-streamlit
+# Core
+streamlit>=1.35
+openai>=1.40.0
+
+# Data & utils
 pandas
 numpy
 yfinance
-pypdf
-pyyaml
-requests
-openai
-romkan
-rapidfuzz
 openpyxl
 lxml
-# rebuild
-plotly==5.23.0
-streamlit>=1.35
-feedparser>=6.0.11
+pyyaml
 requests>=2.32
-openai>=1.40.0
+
+# Parsing / RSS
+pypdf
+feedparser>=6.0.11
+
+# Japanese & text
+romkan
+rapidfuzz
+
+# Viz
+plotly==5.23.0
