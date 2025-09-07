@@ -7735,22 +7735,85 @@ def _safe_get(d, k, default=""):
     except Exception:
         return default
 
-# 既存の llm_complete があればそれを使う。無ければ最小限のフォールバック
-def _ensure_openai_client():
+# ============ OpenAI 直叩きフォールバック ============
+def _ensure_pkg(pkg: str) -> bool:
     try:
-        # 既存の初期化関数があれば尊重
-        ensure = globals().get("_ensure_openai_client")
-        if callable(ensure):
-            return ensure()
+        __import__(pkg)
+        return True
     except Exception:
-        pass
-    # ここでは単純に存在検査だけ（初期化は外側に任せる）
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+            __import__(pkg)
+            return True
+        except Exception:
+            return False
+
+def _ensure_openai_client():
+    """キーがあれば文字列を返す（既存互換）。"""
     try:
-        if st.secrets.get("OPENAI_API_KEY"):  # secrets 直下
+        if st.secrets.get("OPENAI_API_KEY"):
             return st.secrets["OPENAI_API_KEY"]
     except Exception:
         pass
     return os.environ.get("OPENAI_API_KEY")
+
+def _get_openai_client():
+    """新/旧SDKどちらでも扱えるクライアントを返す。失敗時 None。"""
+    key = _ensure_openai_client()
+    if not key:
+        return None
+    if st.session_state.get("__openai_client_cached"):
+        return st.session_state["__openai_client_cached"]
+
+    # 新SDK優先
+    if _ensure_pkg("openai"):
+        try:
+            # 新SDK
+            from openai import OpenAI
+            client = OpenAI(api_key=key)
+            st.session_state["__openai_client_cached"] = ("new", client)
+            return ("new", client)
+        except Exception:
+            # 旧SDK
+            try:
+                import openai as _oai
+                _oai.api_key = key
+                st.session_state["__openai_client_cached"] = ("old", _oai)
+                return ("old", _oai)
+            except Exception:
+                return None
+    return None
+
+def _direct_openai_call(prompt: str, model=None, max_tokens=512, temperature=0.2) -> str:
+    cli = _get_openai_client()
+    if not cli:
+        return ""
+    kind, client = cli
+    try:
+        if kind == "new":
+            # 新SDK
+            mdl = model or "gpt-4o-mini"
+            rsp = client.chat.completions.create(
+                model=mdl,
+                messages=[{"role":"user","content": prompt}],
+                max_tokens=max_tokens or 512,
+                temperature=temperature if temperature is not None else 0.2,
+            )
+            return (rsp.choices[0].message.content or "").strip()
+        else:
+            # 旧SDK
+            mdl = model or "gpt-3.5-turbo"
+            rsp = client.ChatCompletion.create(
+                model=mdl,
+                messages=[{"role":"user","content": prompt}],
+                max_tokens=max_tokens or 512,
+                temperature=temperature if temperature is not None else 0.2,
+            )
+            return (rsp["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        _ai_flags()["last_error"] = f"OpenAI call error: {e}"
+        return ""
+# ====================================================
 
 def _func_accepts_kw(func, kwname: str) -> bool:
     """関数が特定キーワード（例: model）を受け付けるかを判定（**kwargs含む）"""
@@ -7766,7 +7829,6 @@ def _func_accepts_kw(func, kwname: str) -> bool:
     return False
 
 def _filter_kwargs(func, kwargs: dict) -> dict:
-    """func が受理できるキーワードだけに間引く（**kwargsがあればそのまま通す）"""
     try:
         sig = inspect.signature(func)
         if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
@@ -7776,24 +7838,31 @@ def _filter_kwargs(func, kwargs: dict) -> dict:
         return {}
 
 def _llm_call(prompt: str, **kw) -> str:
-    """既存 llm_complete を優先。未対応キーワードは自動で外して再試行。失敗時は空文字。"""
+    """
+    1) グローバルの llm_complete があれば最優先（既存互換）
+    2) 無ければ OpenAI SDK を直接叩く（新/旧SDK両対応）
+    """
     llm = globals().get("llm_complete")
-    if not callable(llm):
-        return ""
-    # llm_complete 側が受け取れない引数を除去
-    kw = _filter_kwargs(llm, kw)
-    try:
-        return llm(prompt, **kw) or ""
-    except TypeError:
-        # まだ型不一致なら最終フォールバック（引数なし）
+    if callable(llm):
         try:
-            return llm(prompt) or ""
-        except Exception as e2:
-            _ai_flags()["last_error"] = f"TypeError in llm_complete: {e2}"
+            kw = _filter_kwargs(llm, kw)
+            return llm(prompt, **kw) or ""
+        except TypeError:
+            try:
+                return llm(prompt) or ""
+            except Exception as e2:
+                _ai_flags()["last_error"] = f"TypeError in llm_complete: {e2}"
+                return ""
+        except Exception as e:
+            _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
             return ""
-    except Exception as e:
-        _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
-        return ""
+    # 直叩きフォールバック
+    return _direct_openai_call(
+        prompt,
+        model=kw.get("model"),
+        max_tokens=kw.get("max_tokens", 512),
+        temperature=kw.get("temperature", 0.2),
+    )
 
 # -------------------------------------------------
 # 1) LLM 必須ガード & ランプ（既存互換＋拡張）
@@ -7809,9 +7878,9 @@ def _ai_flags():
 
 def _llm_ready() -> bool:
     try:
-        if not callable(globals().get("llm_complete")) and not _ensure_openai_client():
-            return False
-        return True
+        if callable(globals().get("llm_complete")):
+            return True
+        return bool(_ensure_openai_client())
     except Exception:
         return False
 
@@ -7824,10 +7893,8 @@ def _require_llm(action_label: str = "AI処理") -> bool:
     return True
 
 def _est_tokens(s: str) -> int:
-    # 超概算：日本語は3文字 ≒ 1 token
     return max(0, round(len(str(s or "")) / 3))
 
-# 優先モデル（上位→下位）。存在しない/使えない場合は llm_complete 側に委譲
 MODEL_PREF_ORDER = [
     os.environ.get("OPENAI_MODEL") or st.secrets.get("OPENAI_MODEL", ""),
     "gpt-4o-mini",
@@ -7843,7 +7910,6 @@ def _call_llm_with_flags(prompt: str, **kw) -> str:
     try:
         used_any = False
         for m in (MODEL_PREF_ORDER or [""]):
-            # llm_complete が model を受理できない実装でも、_llm_call 側で安全に捌く
             tmp = _llm_call(prompt, model=m, **kw) if m else _llm_call(prompt, **kw)
             tmp = (tmp or "").strip()
             if tmp:
@@ -7896,12 +7962,10 @@ with st.expander("LLM診断", expanded=False):
 # -------------------------------------------------
 # 2) 表記ゆれ・断定/助言調の自動中和・辞書ガード
 # -------------------------------------------------
-# 禁則（助言・売買直結）
 NG_WORDS = [
     "買い", "売り", "ロング", "ショート", "損切り", "推奨", "おすすめ", "必勝",
     "間違いない", "絶対", "必ず", "確実", "勝てる", "儲かる",
 ]
-# 強断定の緩和パターン
 ASSERTIVE_PAT = [
     (r"(上昇|下落)する。", r"\1しやすい。"),
     (r"見込まれる。", "見込む向きもある。"),
@@ -7909,7 +7973,6 @@ ASSERTIVE_PAT = [
     (r"～と考える。", "～との見方がある。"),
     (r"重要である。", "重要視されやすい。"),
 ]
-# 表記統一（単位・記号）
 NORMALIZE_MAP = [
     (r"％", "%"),
     (r"\s+%", "%"),
@@ -7923,14 +7986,13 @@ NORMALIZE_MAP = [
     (r"２００SMA|200ＳＭＡ|200SＭＡ", "200SMA"),
     (r"４時間足", "4時間足"),
     (r"ひあし|しあし", "日足"),
-    (r"\s*:\s*", ":"),  # 時刻コロンは半角に
+    (r"\s*:\s*", ":"),
 ]
 
 def _normalize_units_and_notation(s: str) -> str:
     t = _clean_text_jp_safe(s)
     for pat, rep in NORMALIZE_MAP:
         t = re.sub(pat, rep, t)
-    # 時刻 8:5 → 08:05
     def _fix_time(m):
         hh = int(m.group(1)); mm = int(m.group(2))
         return f"{hh:02d}:{mm:02d}"
@@ -7965,12 +8027,10 @@ def _fit_title_soft(title: str, target_min=18, target_max=28) -> str:
     n = len(t)
     if target_min <= n <= target_max:
         return t
-    # 1) 余計な語尾削減
     t = re.sub(r"(について|への|に対する|を巡る)$", "", t)
     t = re.sub(r"(に注目|に注視|に警戒|を見極めたい|の動向|の行方)$", "に注視", t)
     t = re.sub(r"(相場|為替|市場)$", "", t)
     t = re.sub(r"\s+", "", t)
-    # 2) まだ長い→LLMに圧縮（可能なら）
     if len(t) > target_max and _llm_ready():
         prompt = (
             "次のタイトルを、日本語で自然さを保ったまま18〜28字程度に短縮してください。"
@@ -7980,7 +8040,6 @@ def _fit_title_soft(title: str, target_min=18, target_max=28) -> str:
         t2 = _clean_text_jp_safe(out).strip("。")
         if 12 <= len(t2) <= 32:
             t = t2
-    # 3) それでも短い→補語付与
     if len(t) < target_min:
         t = t + "の動向に注視"
     return t[:target_max]
@@ -8160,7 +8219,7 @@ def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_
         st.error("🔴 タイトル案のAI生成に失敗しました。接続やキー、ネットワークを確認してください。")
         return "", ""
 
-    # 堅牢パーサ（全角/半角コロン・日本語ラベル・コードブロック対応）
+    # ロバストな Title/Recall パーサ
     def _parse_title_recall(text: str) -> tuple[str, str]:
         s = _clean_text_jp_safe(text)
         s = re.sub(r"^```.*?\n", "", s, flags=re.S)
@@ -8168,29 +8227,20 @@ def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_
 
         title = ""
         recall = ""
-
-        title_patterns  = [r"(?im)^\s*Title\s*[：:]\s*(.+)$",
-                           r"(?im)^\s*タイトル\s*[：:]\s*(.+)$"]
-        recall_patterns = [r"(?im)^\s*Recall\s*[：:]\s*(.+)$",
-                           r"(?im)^\s*(?:回収|要旨|要約)\s*[：:]\s*(.+)$"]
+        title_patterns  = [r"(?im)^\s*Title\s*[：:]\s*(.+)$", r"(?im)^\s*タイトル\s*[：:]\s*(.+)$"]
+        recall_patterns = [r"(?im)^\s*Recall\s*[：:]\s*(.+)$", r"(?im)^\s*(?:回収|要旨|要約)\s*[：:]\s*(.+)$"]
 
         for p in title_patterns:
             m = re.search(p, s)
-            if m:
-                title = m.group(1).strip()
-                break
+            if m: title = m.group(1).strip(); break
         for p in recall_patterns:
             m = re.search(p, s)
-            if m:
-                recall = m.group(1).strip()
-                break
+            if m: recall = m.group(1).strip(); break
 
         if not title or not recall:
             lines = [x.strip() for x in s.splitlines() if x.strip()]
-            if not title and lines:
-                title = lines[0]
-            if not recall and len(lines) >= 2:
-                recall = lines[1]
+            if not title and lines: title = lines[0]
+            if not recall and len(lines) >= 2: recall = lines[1]
         return title, recall
 
     title_raw, recall_raw = _parse_title_recall(out)
@@ -8597,13 +8647,11 @@ def _apply_ai_to_title_and_p3():
 # -------------------------------------------------
 # 11) Pre-AI / AI後 の確定と描画
 # -------------------------------------------------
-# 段落①
 para1_pre = _strict_style_guard(_clean_text_jp_safe(str(p1).strip()))
 if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
     try: para1_pre = _final_polish_and_guard(para1_pre, para="p1")
     except Exception: pass
 
-# 段落②
 p2_src = str(globals().get("p2","") or st.session_state.get("para2_for_build","") or "")
 if not p2_src:
     d1 = st.session_state.get("d1_imp", "横ばい")
@@ -8612,7 +8660,6 @@ if not p2_src:
 para2_pre = pad_para2(p2_src, 180)
 para2_pre = _strict_style_guard(para2_pre)
 
-# ブレークポイント反映（既存踏襲）
 def _fallback_bp_from_ui():
     import re as _re
     def _pick_first_num(*keys):
@@ -8773,7 +8820,6 @@ def _validate_and_fix_all(p1: str, p2: str, p3: str, ttl: str):
     if any(w in (p1 + p2) for w in NG_WORDS): msgs.append("売買助言に該当し得る語が含まれる")
     if not (p3.startswith("本日の指標は、") and p3.endswith("。")):
         msgs.append("段落③の体裁が不正（本日の指標は、〜 で始まり句点で終える必要）")
-    # 最終整形：二重句点、空白、表記ゆれ
     def _final_sanitize(s: str) -> str:
         t = _strict_style_guard(s)
         t = re.sub(r"\s+\n", "\n", t)
@@ -8781,7 +8827,6 @@ def _validate_and_fix_all(p1: str, p2: str, p3: str, ttl: str):
         return t
     return msgs, _final_sanitize(p1), _final_sanitize(p2), _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final","") or p3, bool(st.session_state.get("recall_period_only", False))), _fit_title_soft(ttl)
 
-# 最終検証
 viol, ai_p1_final, ai_p2_final, ai_p3_final, ai_title_final = _validate_and_fix_all(ai_p1, ai_p2, ai_p3, ai_title)
 if viol:
     st.error("体裁チェック NG：" + " / ".join(viol))
