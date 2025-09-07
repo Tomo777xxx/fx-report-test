@@ -7709,33 +7709,179 @@ st.session_state["p1_ui_preview_text"] = p1
 st.session_state["p2_ui_preview_text"] = p2
 
 # =========================
-# AI補正：タイトル & タイトル回収（手入力ニュース + RSS候補）
+# AI補正：タイトル & タイトル回収（手入力ニュース + RSS候補）— “確実にAIを叩く”版
 # =========================
 
-import sys, subprocess, re, json
+import os, sys, subprocess, re, json, unicodedata, inspect
 from pathlib import Path
 from datetime import datetime
+import streamlit as st
 
-# ---------- LLM 必須ガード & ランプ ----------
-# ※ 毎実行リセット（この実行内の回数/トークンを可視化）
+# -------------------------------------------------
+# 0) ユーティリティ
+# -------------------------------------------------
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", str(s or ""))
+
+def _clean_text_jp_safe(s: str) -> str:
+    t = _nfkc(s).strip()
+    t = re.sub(r"[　 ]+", " ", t)
+    t = re.sub(r"([。])\1+", r"\1", t)
+    return t
+
+def _safe_get(d, k, default=""):
+    try:
+        return d.get(k, default)
+    except Exception:
+        return default
+
+# ===== OpenAI を“必ず”叩くための最低限の配線 =====
+def _ensure_pkg(pkg: str) -> bool:
+    try:
+        __import__(pkg); return True
+    except Exception:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+            __import__(pkg); return True
+        except Exception:
+            return False
+
+def _get_api_key() -> str | None:
+    """secrets[top] → secrets[general] → env の順で取得"""
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    try:
+        if "general" in st.secrets and "OPENAI_API_KEY" in st.secrets["general"]:
+            return st.secrets["general"]["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("OPENAI_API_KEY")
+
+# キャッシュ: ("new" or "old", client)
+def _get_openai_client():
+    if st.session_state.get("__openai_client_cached"):
+        return st.session_state["__openai_client_cached"]
+    key = _get_api_key()
+    if not key:
+        return None
+    if not _ensure_pkg("openai"):
+        _ai_flags()["last_error"] = "openai パッケージの導入に失敗"
+        return None
+    # 新SDK優先
+    try:
+        from openai import OpenAI
+        cli = OpenAI(api_key=key)
+        st.session_state["__openai_client_cached"] = ("new", cli)
+        return ("new", cli)
+    except Exception:
+        pass
+    # 旧SDKも試す
+    try:
+        import openai as _oai
+        _oai.api_key = key
+        st.session_state["__openai_client_cached"] = ("old", _oai)
+        return ("old", _oai)
+    except Exception as e:
+        _ai_flags()["last_error"] = f"OpenAI init error: {e}"
+        return None
+
+def _direct_openai_call(prompt: str, model=None, max_tokens=512, temperature=0.2) -> str:
+    cli = _get_openai_client()
+    if not cli:
+        return ""
+    kind, client = cli
+    try:
+        mdl = model or os.environ.get("OPENAI_MODEL") or st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+    except Exception:
+        mdl = model or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+    try:
+        if kind == "new":
+            r = client.chat.completions.create(
+                model=mdl,
+                messages=[{"role":"user","content": prompt}],
+                temperature=temperature if temperature is not None else 0.2,
+                max_tokens=max_tokens or 512,
+            )
+            return (r.choices[0].message.content or "").strip()
+        else:
+            r = client.ChatCompletion.create(
+                model=mdl,
+                messages=[{"role":"user","content": prompt}],
+                temperature=temperature if temperature is not None else 0.2,
+                max_tokens=max_tokens or 512,
+            )
+            return (r["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        _ai_flags()["last_error"] = f"OpenAI call error: {e}"
+        return ""
+
+def _func_accepts_kw(func, kwname: str) -> bool:
+    try:
+        sig = inspect.signature(func)
+        for p in sig.parameters.values():
+            if p.kind == p.VAR_KEYWORD:
+                return True
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and p.name == kwname:
+                return True
+    except Exception:
+        pass
+    return False
+
+def _filter_kwargs(func, kwargs: dict) -> dict:
+    try:
+        sig = inspect.signature(func)
+        if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+            return dict(kwargs)
+        return {k: v for k, v in kwargs.items() if k in sig.parameters}
+    except Exception:
+        return {}
+
+def _llm_call(prompt: str, **kw) -> str:
+    """
+    1) 既存 llm_complete を優先（互換維持）
+    2) 無ければ OpenAI を直接叩く（新/旧SDKどちらでも）
+    """
+    llm = globals().get("llm_complete")
+    if callable(llm):
+        try:
+            kw = _filter_kwargs(llm, kw)
+            return llm(prompt, **kw) or ""
+        except TypeError:
+            try:
+                return llm(prompt) or ""
+            except Exception as e2:
+                _ai_flags()["last_error"] = f"TypeError in llm_complete: {e2}"
+                return ""
+        except Exception as e:
+            _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
+            return ""
+    # 直叩き
+    return _direct_openai_call(
+        prompt,
+        model=kw.get("model"),
+        max_tokens=kw.get("max_tokens", 512),
+        temperature=kw.get("temperature", 0.2),
+    )
+
+# -------------------------------------------------
+# 1) LLM ガード & ランプ
+# -------------------------------------------------
 st.session_state["ai_flags"] = {
     "llm_used": False, "llm_calls": 0, "rss_used": False,
     "tokens_est": 0, "last_error": "", "ready": False,
+    "models_used": [],
 }
-
 def _ai_flags():
     return st.session_state["ai_flags"]
 
 def _llm_ready() -> bool:
-    """llm_complete/_ensure_openai_client が実体として使えるかを確認"""
     try:
-        if not callable(globals().get("llm_complete")):
-            return False
-        ensure = globals().get("_ensure_openai_client")
-        if callable(ensure):
-            return ensure() is not None
-        # 旧実装でも llm_complete があれば最低限OK
-        return True
+        if callable(globals().get("llm_complete")):
+            return True
+        return bool(_get_api_key())
     except Exception:
         return False
 
@@ -7748,97 +7894,155 @@ def _require_llm(action_label: str = "AI処理") -> bool:
     return True
 
 def _est_tokens(s: str) -> int:
-    # 超概算：日本語は3文字 ≒ 1 token 目安
-    s = str(s or "")
-    return max(0, round(len(s) / 3))
+    return max(0, round(len(str(s or "")) / 3))
+
+MODEL_PREF_ORDER = [
+    os.environ.get("OPENAI_MODEL") or st.secrets.get("OPENAI_MODEL", ""),
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
+]
+MODEL_PREF_ORDER = [m for m in MODEL_PREF_ORDER if m]
 
 def _call_llm_with_flags(prompt: str, **kw) -> str:
-    """llm_complete を必ず通す。失敗は空文字＋last_error更新。"""
     af = _ai_flags()
+    if not _require_llm("AI呼び出し"):
+        return ""
     out = ""
     try:
-        if not _require_llm("AI呼び出し"):
-            return ""
-        out = llm_complete(prompt, **kw) or ""
-        if out.strip():
+        used = False
+        for m in (MODEL_PREF_ORDER or [""]):
+            tmp = _llm_call(prompt, model=m, **kw) if m else _llm_call(prompt, **kw)
+            tmp = (tmp or "").strip()
+            if tmp:
+                af["models_used"].append(m or "<default>")
+                out = tmp; used = True; break
+        if not used:
+            out = (_llm_call(prompt, **kw) or "").strip()
+        if out:
             af["llm_used"] = True
         af["llm_calls"] = int(af.get("llm_calls", 0)) + 1
         af["tokens_est"] = int(af.get("tokens_est", 0)) + _est_tokens(prompt) + _est_tokens(out)
-        return out.strip()
+        return out
     except Exception as e:
         af["last_error"] = f"{type(e).__name__}: {e}"
         return ""
 
 def _llm_lamp_inline():
-    af = _ai_flags()
-    ready = _llm_ready()
-    lamp = "🟢" if ready else "🔴"
-    st.markdown(
-        f"**LLM接続**：{lamp} {'接続OK' if ready else '未接続'}",
-        help="OPENAI_API_KEY（secrets / 環境変数）を確認"
-    )
-with st.expander("LLM診断", expanded=False):
-    st.json(_probe_openai_secrets())
-    st.caption(_ai_flags().get("last_error") or "last_error: <none>")
+    lamp = "🟢" if _llm_ready() else "🔴"
+    st.markdown(f"**LLM接続**：{lamp} {'接続OK' if _llm_ready() else '未接続'}", help="OPENAI_API_KEY（secrets / 環境変数）を確認")
 
 def _ai_usage_lamp_inline():
     af = _ai_flags()
-    used = bool(af.get("llm_used"))
-    lamp = "🟢" if used else "🔴"
-    calls = int(af.get("llm_calls", 0))
-    toks  = int(af.get("tokens_est", 0))
+    lamp = "🟢" if af.get("llm_used") else "🔴"
+    calls = int(af.get("llm_calls", 0)); toks = int(af.get("tokens_est", 0))
+    models = ", ".join(dict.fromkeys(af.get("models_used") or []))
     msg = f"**AI使用状況**：{lamp} 呼び出し {calls} 回 / 概算 {toks} tokens"
-    if af.get("last_error"):
-        msg += f"（最終エラー: {af['last_error']}）"
+    if models: msg += f" / 使用モデル: {models}"
+    if af.get("last_error"): msg += f"（最終エラー: {af['last_error']}）"
     st.caption(msg)
 
-# ---- ペア変更を検知して、段落②やプレビュー関連の古いキャッシュを破棄（ここで必ず実行）----
-_cur_pair = str(st.session_state.get("pair", ""))
-if st.session_state.get("__pair_prev_ai_title") != _cur_pair:
-    st.session_state["__pair_prev_ai_title"] = _cur_pair
-    for k in (
-        "p2_ui_preview_text", "para2", "para2_for_build", "para2_final",
-        "ai_title_draft", "ai_recall_draft", "ai_title_draft_text", "ai_recall_draft_text",
-        "preview_report_base", "preview_report_main"
-    ):
-        st.session_state.pop(k, None)
-    if "_para2_preview" in globals():
-        try:
-            del globals()["_para2_preview"]
-        except Exception:
-            pass
+with st.expander("LLM診断", expanded=False):
+    probe = {}
+    # app.py 互換の診断ヘルパがあれば呼ぶ（任意）
+    try:
+        if callable(globals().get("_probe_openai_secrets")):
+            probe = globals()["_probe_openai_secrets"]()
+    except Exception:
+        pass
+    if not probe:
+        probe = {
+            "OPENAI_API_KEY": "set" if bool(_get_api_key()) else "unset",
+            "OPENAI_MODEL": os.environ.get("OPENAI_MODEL") or st.secrets.get("OPENAI_MODEL","<unset>")
+        }
+    st.json(probe)
+    st.caption(_ai_flags().get("last_error") or "last_error: <none>")
 
-# --- ニュース見出しクレンジング ---
-def _clean_news_title_for_prompt(t: str) -> str:
-    s = _nfkc(t or "")
-    s = re.sub(r"^\d+[).:\-]\s*", "", s)
-    s = re.sub(r"\s*\d{4}[./]\d{1,2}[./]\d{1,2}\s*$", "", s)
-    s = re.sub(r"\s*[–—\-‐\-]\s*[^・、，,。]+$", "", s)
-    s = re.sub(r"（[^）]*）", "", s); s = re.sub(r"\([^)]*\)", "", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
+# -------------------------------------------------
+# 2) 表記ゆれ・断定/助言調の中和・辞書ガード
+# -------------------------------------------------
+NG_WORDS = ["買い","売り","ロング","ショート","損切り","推奨","おすすめ","必勝","間違いない","絶対","必ず","確実","勝てる","儲かる"]
+ASSERTIVE_PAT = [
+    (r"(上昇|下落)する。", r"\1しやすい。"),
+    (r"見込まれる。", "見込む向きもある。"),
+    (r"～と断定できる", "～との見方もある"),
+    (r"～と考える。", "～との見方がある。"),
+    (r"重要である。", "重要視されやすい。"),
+]
+NORMALIZE_MAP = [
+    (r"％", "%"), (r"\s+%", "%"), (r"\s+ドル", "ドル"), (r"\s+円", "円"),
+    (r"WTI原油|原油WTI", "原油WTI"),
+    (r"ボリンジャーバンド ?[-−]?\s*2σ", "ボリンジャーバンド(20, ±2σ)の下限付近"),
+    (r"ボリンジャーバンド ?\+?\s*2σ", "ボリンジャーバンド(20, ±2σ)の上限付近"),
+    (r"ボリンジャーバンド ?(中心|ミドル)", "ボリンジャーバンド(20, ±2σ)の中央値（20SMA）付近"),
+    (r"２０SMA|20ＳＭＡ|20SＭＡ", "20SMA"),
+    (r"２００SMA|200ＳＭＡ|200SＭＡ", "200SMA"),
+    (r"４時間足", "4時間足"),
+    (r"ひあし|しあし", "日足"),
+    (r"\s*:\s*", ":"),
+]
+def _normalize_units_and_notation(s: str) -> str:
+    t = _clean_text_jp_safe(s)
+    for pat, rep in NORMALIZE_MAP: t = re.sub(pat, rep, t)
+    def _fix_time(m): return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    return re.sub(r"\b([0-2]?\d):([0-5]?\d)\b", _fix_time, t)
 
-# --- 回収文括弧情報除去 ---
-_PAT_MEDIA = r"(?:外為どっとコム|ロイター|Reuters|Bloomberg|ブルームバーグ|日経|Nikkei|共同|Kyodo|時事|Jiji|朝日|毎日|読売|CNBC|Yahoo|ヤフー|みんかぶ|MINKABU)"
-_PAT_DATE  = r"(?:\d{4}[./]\d{1,2}[./]\d{1,2})"
-_PAT_URL   = r"(?:https?://\S+)"
-def _strip_media_brackets(s: str) -> str:
-    r = _clean_text_jp_safe(s or "")
-    r = re.sub(rf"（[^）]*?(?:{_PAT_MEDIA}|{_PAT_DATE}|{_PAT_URL})[^）]*?）", "", r)
-    r = re.sub(rf"\([^)]*?(?:{_PAT_MEDIA}|{_PAT_DATE}|{_PAT_URL})[^)]*?\)", "", r)
-    r = re.sub(r"\s{2,}", " ", r).strip()
-    return r
+def _neutralize_tone(s: str) -> str:
+    t = _clean_text_jp_safe(s)
+    for w in NG_WORDS: t = re.sub(w, "（表現を中立化）", t)
+    for pat, rep in ASSERTIVE_PAT: t = re.sub(pat, rep, t)
+    t = re.sub(r"(見極めたい。)(\s*見極めたい。)+", r"\1", t)
+    t = re.sub(r"すべき", "は避けたい", t)
+    return t
 
-# --- RSSユーティリティ ---
+def _strict_style_guard(s: str) -> str:
+    t = _normalize_units_and_notation(_neutralize_tone(s))
+    t = re.sub(r"[・･]\s*", "・", t)
+    t = re.sub(r"(。)\s*(。)+", r"\1", t).strip()
+    if t and not t.endswith("。"): t += "。"
+    return t
+
+# -------------------------------------------------
+# 3) タイトル調整（18〜28字のソフトフィット）
+# -------------------------------------------------
+def _fit_title_soft(title: str, target_min=18, target_max=28) -> str:
+    t = _clean_text_jp_safe(title).strip("。")
+    if not t: return t
+    if target_min <= len(t) <= target_max: return t
+    t = re.sub(r"(について|への|に対する|を巡る)$", "", t)
+    t = re.sub(r"(に注目|に注視|に警戒|を見極めたい|の動向|の行方)$", "に注視", t)
+    t = re.sub(r"(相場|為替|市場)$", "", t)
+    t = re.sub(r"\s+", "", t)
+    if len(t) > target_max and _llm_ready():
+        out = _call_llm_with_flags(
+            "次のタイトルを、日本語で自然さを保ったまま18〜28字程度に短縮してください。助言・断定は避け、句点は付けない：\n" + t,
+            max_tokens=60, temperature=0.2)
+        t2 = _clean_text_jp_safe(out).strip("。")
+        if 12 <= len(t2) <= 32: t = t2
+    if len(t) < target_min: t += "の動向に注視"
+    return t[:target_max]
+
+# -------------------------------------------------
+# 4) 段落③ 一行保証＋回収補強
+# -------------------------------------------------
+def _fit_para3_oneline(cal_src: str, recall: str, period_only: bool=False) -> str:
+    cs = _nfkc(cal_src or "").strip().rstrip("。")
+    rc = _clean_text_jp_safe(recall or "").rstrip("。") or "足もとでは材料待ちの様相が続く"
+    pre = f"本日の指標は、{cs}が発表予定となっている" if cs else "本日の指標は、"
+    line = (pre + (" " if period_only else "。") + rc + "。").replace("\n","")
+    line = re.sub(r"\s+", " ", line); line = re.sub(r"(。)\1+", r"\1", line).strip()
+    if not line.endswith("。"): line += "。"
+    return line
+
+# -------------------------------------------------
+# 5) RSS（Google News）
+# -------------------------------------------------
 def _ensure_feedparser():
     try:
-        import feedparser  # noqa
-        return True
+        import feedparser; return True
     except Exception:
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "feedparser", "-q"])
-            import feedparser  # noqa
-            return True
+            import feedparser; return True
         except Exception:
             return False
 
@@ -7849,131 +8053,150 @@ def _google_news_rss_search(query: str, lang="ja", gl="JP", ceid="JP:ja", limit=
     feed = feedparser.parse(url)
     out = []
     for e in (feed.entries or [])[:limit]:
-        title = str(getattr(e, "title", "") or "")
-        link  = str(getattr(e, "link", "")  or "")
-        publ  = str(getattr(e, "published", "") or getattr(e, "updated", "") or "")
+        title = str(getattr(e,"title","") or ""); link = str(getattr(e,"link","") or "")
+        publ  = str(getattr(e,"published","") or getattr(e,"updated","") or "")
         src   = ""
-        try:
-            src = str(e.source.title)
-        except Exception:
-            pass
+        try: src = str(e.source.title)
+        except Exception: pass
         out.append({"title": title, "url": link, "source": src, "published": publ})
     return out
 
 def _rank_news(items: list[dict], max_items=10):
     def _norm_title(t: str) -> str:
-        t = _nfkc(t or "").strip()
-        t = re.sub(r"\s+", " ", t)
-        t = re.sub(r"[【\[][^】\]]+[】\]]", "", t)
-        return t
-    WEIGHTS = {
-        "FRB":8,"FOMC":8,"パウエル":7,"米雇用統計":9,"NFP":9,"CPI":7,"PCE":7,"ISM":6,"JOLTS":5,"米金利":7,
-        "ECB":8,"ラガルド":6,"ユーロ圏":7,"HICP":6,"PMI":5,"ドイツ":5,"IFO":5,"ZEW":5,
-        "日銀":9,"植田":6,"YCC":6,"長期金利":5,"消費者物価":5,"為替介入":7,"マイナス金利":6,
-        "原油":5,"WTI":5,"OPEC":5,"中東":6,"地政学":6,"停戦":6,"戦闘":6,"停電":5,"地震":5,
-        "為替":3,"外為":3
-    }
-    def score(title: str) -> int:
-        s = 0
-        for k, w in WEIGHTS.items():
-            if k in title: s += w
-        return s
+        t = _nfkc(t or "").strip(); t = re.sub(r"\s+", " ", t)
+        return re.sub(r"[【\[][^】\]]+[】\]]", "", t)
+    WEIGHTS = {"FRB":8,"FOMC":8,"パウエル":7,"米雇用統計":9,"NFP":9,"CPI":7,"PCE":7,"ISM":6,"JOLTS":5,"米金利":7,
+               "ECB":8,"ラガルド":6,"ユーロ圏":7,"HICP":6,"PMI":5,"ドイツ":5,"IFO":5,"ZEW":5,
+               "日銀":9,"植田":6,"YCC":6,"長期金利":5,"消費者物価":5,"為替介入":7,"マイナス金利":6,
+               "原油":5,"WTI":5,"OPEC":5,"中東":6,"地政学":6,"停戦":6,"戦闘":6,"停電":5,"地震":5,"為替":3,"外為":3}
+    def score(title: str) -> int: return sum(w for k, w in WEIGHTS.items() if k in title)
     seen, ranked = set(), []
     for it in items:
-        t = _norm_title(it.get("title",""))
-        if not t or t in seen:
-            continue
-        seen.add(t)
-        ranked.append({**it, "title": t, "_score": score(t)})
+        t = _norm_title(_safe_get(it, "title", "")); 
+        if not t or t in seen: continue
+        seen.add(t); ranked.append({**it, "title": t, "_score": score(t)})
     ranked.sort(key=lambda x: x["_score"], reverse=True)
     return ranked[:max_items]
 
 def _fetch_fx_related_news(max_items=10):
-    ok = _ensure_feedparser()
-    if not ok:
-        st.warning("feedparser のインストールに失敗しました。ニュース取得はスキップします。")
-        return []
+    if not _ensure_feedparser():
+        st.warning("feedparser のインストールに失敗しました。ニュース取得はスキップします。"); return []
     pair = str(st.session_state.get("pair","") or "")
     pair_q = []
     if "ドル" in pair or "USD" in pair.upper(): pair_q += ["ドル 為替", "米金利 為替"]
-    if "円"   in pair or "JPY" in pair.upper(): pair_q += ["日銀 為替", "為替介入"]
+    if "円" in pair or "JPY" in pair.upper(): pair_q += ["日銀 為替", "為替介入"]
     if "ユーロ" in pair or "EUR" in pair.upper(): pair_q += ["ECB 為替", "ユーロ 為替"]
     if "ポンド" in pair or "GBP" in pair.upper(): pair_q += ["BOE 為替", "ポンド 為替"]
     if "フラン" in pair or "CHF" in pair.upper(): pair_q += ["SNB 為替", "スイス 金利"]
-
-    core_queries = [
-        "FRB FOMC 為替","米雇用統計 NFP","米 CPI インフレ","米 PCE 物価","ISM 指数 為替",
-        "ECB 金利 ユーロ","ユーロ圏 HICP 物価","ドイツ IFO 景況","ZEW 景況感",
-        "日銀 金利 為替","為替介入 日本","日本 CPI 物価","長期金利 日本",
-        "原油先物 相場","中東 地政学 為替","米大統領選 為替",
-    ]
-    queries = core_queries + pair_q
+    core = ["FRB FOMC 為替","米雇用統計 NFP","米 CPI インフレ","米 PCE 物価","ISM 指数 為替",
+            "ECB 金利 ユーロ","ユーロ圏 HICP 物価","ドイツ IFO 景況","ZEW 景況感",
+            "日銀 金利 為替","為替介入 日本","日本 CPI 物価","長期金利 日本",
+            "原油先物 相場","中東 地政学 為替","米大統領選 為替"]
     all_items = []
-    for q in queries:
-        try:
-            all_items += _google_news_rss_search(q, limit=8)
-        except Exception:
-            pass
+    for q in core + pair_q:
+        try: all_items += _google_news_rss_search(q, limit=8)
+        except Exception: pass
     items = _rank_news(all_items, max_items=max_items)
-    if items:
-        _ai_flags()["rss_used"] = True
+    if items: _ai_flags()["rss_used"] = True
     return items
 
-# --- タイトル＆回収（AI必須） ---
-def _ai_title_and_recall(
-    preview_text: str,
-    manual_news_list: list[str],
-    picked_news_list: list[dict],
-    base_title_tail: str = "",
-    pair_name: str = "",
-):
-    if not _require_llm("タイトル案のAI生成"):
-        return "", ""
+# -------------------------------------------------
+# 6) ペア変更でキャッシュ破棄
+# -------------------------------------------------
+_cur_pair = str(st.session_state.get("pair", ""))
+if st.session_state.get("__pair_prev_ai_title") != _cur_pair:
+    st.session_state["__pair_prev_ai_title"] = _cur_pair
+    for k in ("p2_ui_preview_text","para2","para2_for_build","para2_final",
+              "ai_title_draft","ai_recall_draft","ai_title_draft_text","ai_recall_draft_text",
+              "preview_report_base","preview_report_main"):
+        st.session_state.pop(k, None)
+    if "_para2_preview" in globals():
+        try: del globals()["_para2_preview"]
+        except Exception: pass
+
+# -------------------------------------------------
+# 7) ニュース見出しクレンジング
+# -------------------------------------------------
+def _clean_news_title_for_prompt(t: str) -> str:
+    s = _nfkc(t)
+    s = re.sub(r"^\d+[).:\-]\s*", "", s)
+    s = re.sub(r"\s*\d{4}[./]\d{1,2}[./]\d{1,2}\s*$", "", s)
+    s = re.sub(r"\s*[–—\-‐\-]\s*[^・、，,。]+$", "", s)
+    s = re.sub(r"（[^）]*）", "", s); s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+_PAT_MEDIA = r"(?:外為どっとコム|ロイター|Reuters|Bloomberg|ブルームバーグ|日経|Nikkei|共同|Kyodo|時事|Jiji|朝日|毎日|読売|CNBC|Yahoo|ヤフー|みんかぶ|MINKABU)"
+_PAT_DATE  = r"(?:\d{4}[./]\d{1,2}[./]\d{1,2})"
+_PAT_URL   = r"(?:https?://\S+)"
+def _strip_media_brackets(s: str) -> str:
+    r = _clean_text_jp_safe(s)
+    r = re.sub(rf"（[^）]*?(?:{_PAT_MEDIA}|{_PAT_DATE}|{_PAT_URL})[^）]*?）", "", r)
+    r = re.sub(rf"\([^)]*?(?:{_PAT_MEDIA}|{_PAT_DATE}|{_PAT_URL})[^)]*?\)", "", r)
+    r = re.sub(r"\s{2,}", " ", r).strip()
+    return r
+
+# -------------------------------------------------
+# 8) タイトル＆回収（AI）+ タイトル長フィット
+# -------------------------------------------------
+def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_news_list: list[dict],
+                         base_title_tail: str = "", pair_name: str = ""):
+    if not _require_llm("タイトル案のAI生成"): return "", ""
     news_lines = [x.strip() for x in (manual_news_list or []) if str(x).strip()]
     def _clean_for_prompt(t: str) -> str:
-        try:
-            if "_clean_news_title_for_prompt" in globals() and callable(globals().get("_clean_news_title_for_prompt")):
-                return _clean_news_title_for_prompt(t)
-        except Exception:
-            pass
-        return str(t)
+        try: return _clean_news_title_for_prompt(t)
+        except Exception: return str(t)
     for d in (picked_news_list or []):
         title = (d or {}).get("title")
-        if title:
-            news_lines.append(_clean_for_prompt(title))
-
+        if title: news_lines.append(_clean_for_prompt(title))
     prompt = (
         "次の素材を踏まえ、FXレポートの『自然で簡潔なタイトル（18〜28字程度）』を1つと、"
-        "『タイトル回収の一文（50〜90字程度）』を1つ作ってください。"
-        "断定は避け、助言はしない。句読点は和文のまま。ニュースの媒体名や日付、URLは本文に書かない。括弧で挿入しない。\n\n"
+        "『タイトル回収の一文（50〜90字程度）』を1つ作成。断定・助言は避け、句読点は和文。媒体名/日付/URLは本文に書かない：\n\n"
         f"【主役ペア】{pair_name}\n"
         f"【タイトル語尾候補】{base_title_tail}\n"
-        "【本日の重要ニュース（手入力+AI候補）】\n- " + "\n- ".join(news_lines[:10]) + "\n\n"
+        "【重要ニュース（手入力+AI候補）】\n- " + "\n- ".join(news_lines[:10]) + "\n\n"
         "【Pre-AI本文プレビュー（抜粋）】\n" + _clean_text_jp_safe(preview_text or "")[:1200]
-        + "\n\n--- 出力フォーマット ---\n"
-          "Title: <タイトル>\n"
-          "Recall: <タイトル回収の一文>\n"
+        + "\n\n--- 出力フォーマット ---\nTitle: <タイトル>\nRecall: <タイトル回収の一文>\n"
     )
-
     out = _call_llm_with_flags(prompt, max_tokens=520, temperature=0.2)
-    if not out or ("Title:" not in out and "Recall:" not in out):
+    if not out:
         st.error("🔴 タイトル案のAI生成に失敗しました。接続やキー、ネットワークを確認してください。")
         return "", ""
 
-    m1 = re.search(r"Title:\s*(.+)", out)
-    m2 = re.search(r"Recall:\s*(.+)", out)
-    title  = _clean_text_jp_safe(m1.group(1)) if m1 else ""
-    recall = _strip_media_brackets(_clean_text_jp_safe(m2.group(1)) if m2 else "")
-    title = title.strip("。"); recall = recall.rstrip("。")
+    # ロバストパース
+    def _parse_title_recall(text: str) -> tuple[str, str]:
+        s = _clean_text_jp_safe(text)
+        s = re.sub(r"^```.*?\n", "", s, flags=re.S)
+        s = re.sub(r"\n```$", "", s, flags=re.S)
+        title = ""; recall = ""
+        for p in [r"(?im)^\s*Title\s*[：:]\s*(.+)$", r"(?im)^\s*タイトル\s*[：:]\s*(.+)$"]:
+            m = re.search(p, s); 
+            if m: title = m.group(1).strip(); break
+        for p in [r"(?im)^\s*Recall\s*[：:]\s*(.+)$", r"(?im)^\s*(?:回収|要旨|要約)\s*[：:]\s*(.+)$"]:
+            m = re.search(p, s); 
+            if m: recall = m.group(1).strip(); break
+        if not title or not recall:
+            lines = [x.strip() for x in s.splitlines() if x.strip()]
+            if not title and lines: title = lines[0]
+            if not recall and len(lines) >= 2: recall = lines[1]
+        return title, recall
+
+    title_raw, recall_raw = _parse_title_recall(out)
+    if not (title_raw and recall_raw):
+        st.error("🔴 タイトル案のAI生成に失敗しました（出力解析エラー）。")
+        return "", ""
+    title  = _fit_title_soft(_clean_text_jp_safe(title_raw)).strip("。")
+    recall = _strip_media_brackets(_clean_text_jp_safe(recall_raw)).rstrip("。")
     return title, recall
 
-# ========== Step6: タイトル / 回収 / ニュース のUI＋同期（ここから） ==========
+# -------------------------------------------------
+# 9) Step6 UI（既存維持）
+# -------------------------------------------------
 with st.container():
     st.markdown("#### AI補正：タイトル/回収 と 重要ニュース（任意）")
-    _llm_lamp_inline()  # 接続ランプ（🟢/🔴）
+    _llm_lamp_inline()
     st.caption("手入力ニュースを優先。AI候補は参考（RSSのみ使用／外部ブラウズ不要）。")
 
-    # 0) クリック適用の“保留値”を、ウィジェット作成前に反映（重要）
     if "__pending_title_input" in st.session_state:
         st.session_state["title_ai"] = st.session_state["__pending_title_input"]
         del st.session_state["__pending_title_input"]
@@ -7982,32 +8205,22 @@ with st.container():
         st.session_state["ai_title_recall_final"] = st.session_state["__pending_recall_input"]
         del st.session_state["__pending_recall_input"]
 
-    # 1) タイトル（AI後が参照する値）
-    ttl_default = str(st.session_state.get(
-        "title_ai",
-        str(globals().get("ttl_display","") or globals().get("title","") or "")
-    ))
-    st.text_input("AI提案タイトル（編集可・句点なし推奨）",
-                  value=ttl_default, key="title_ai")
+    ttl_default = str(st.session_state.get("title_ai", str(globals().get("ttl_display","") or globals().get("title","") or "")))
+    st.text_input("AI提案タイトル（編集可・句点なし推奨）", value=ttl_default, key="title_ai")
 
-    # 2) タイトル回収（入力→最終へ同期）
     def _on_change_recall_input():
         raw = st.session_state.get("ai_title_recall_input", "")
-        st.session_state["ai_title_recall_final"] = _strip_media_brackets(
-            _clean_text_jp_safe(raw).rstrip("。")
-        )
+        st.session_state["ai_title_recall_final"] = _strip_media_brackets(_clean_text_jp_safe(raw).rstrip("。"))
     st.text_area("AI提案：タイトル回収（編集可・句点なし推奨）",
                  value=st.session_state.get("ai_title_recall_final",""),
                  key="ai_title_recall_input", height=80, on_change=_on_change_recall_input)
 
-    # 3) ニュース（手入力）
     st.caption("手入力ニュースを優先。AI候補は未入力分を補完します。")
     st.text_area("本日の重要ニュース（手入力・1行1件）",
                  value=st.session_state.get("manual_news_lines",""),
-                 placeholder="例）米大統領選TV討論会\n中東地政学リスク再燃\n大規模停電 など",
+                 placeholder="例）米CPI / FOMC / 介入観測 など",
                  key="manual_news_lines", height=96)
 
-    # 4) AI候補ニュースの取得
     col1, col2 = st.columns([1,1])
     with col1:
         fetch_now = st.button("AIニュース（RSS）を取得/更新", key="btn_fetch_ai_news")
@@ -8022,7 +8235,6 @@ with st.container():
         except Exception as e:
             st.warning(f"AIニュース取得に失敗しました: {e}")
 
-    # 5) 候補の表示＆選択
     raw_cand = st.session_state.get("ai_news_candidates", [])
     cand_list = []
     for c in raw_cand:
@@ -8036,12 +8248,8 @@ with st.container():
     if cand_list:
         st.caption("AI候補ニュース（複数選択可）")
         def _fmt_title(t):
-            try:
-                if "_clean_news_title_for_prompt" in globals() and callable(globals().get("_clean_news_title_for_prompt")):
-                    return _clean_news_title_for_prompt(t)
-            except Exception:
-                pass
-            return t
+            try: return _clean_news_title_for_prompt(t)
+            except Exception: return t
         view = [f"{i+1}. {_fmt_title(c['title'])}（{c['source']}）" if c['source'] else f"{i+1}. {_fmt_title(c['title'])}"
                 for i, c in enumerate(cand_list)]
         st.multiselect("採用するAI候補ニュースを選択",
@@ -8052,22 +8260,6 @@ with st.container():
     else:
         st.info("『AIニュース（RSS）を取得/更新』を押すと候補が表示されます。")
 
-    # 6) ニュース統合
-    if st.button("ニュースを適用/統合", key="btn_apply_news"):
-        lines = []
-        for ln in str(st.session_state.get("manual_news_lines","")).splitlines():
-            ln = ln.strip()
-            if ln and ln not in lines:
-                lines.append(ln)
-        for i in st.session_state.get("ai_news_selected_idx", []):
-            if isinstance(i, int) and 0 <= i < len(cand_list):
-                t = cand_list[i]["title"].strip()
-                if t and t not in lines:
-                    lines.append(t)
-        st.session_state["manual_news_lines"] = "\n".join(lines[:10])
-        st.success("ニュースを適用しました（AI後プレビューに反映されます）。")
-
-    # 7) タイトル案のAI生成（AI必須）
     colA, colB, colC = st.columns([1,1,2])
     with colA:
         gen_title = st.button("AIでタイトル案を生成", key="btn_ai_title")
@@ -8080,15 +8272,12 @@ with st.container():
 
     if gen_title:
         if _require_llm("タイトル案のAI生成"):
-            preview_all = "\n".join([
-                str(globals().get("p1","")), str(globals().get("p2","")), str(st.session_state.get("calendar_line",""))
-            ])[:1200]
+            preview_all = "\n".join([str(globals().get("p1","")), str(globals().get("p2","")), str(st.session_state.get("calendar_line",""))])[:1200]
             picked = []
             for i in st.session_state.get("ai_news_selected_idx", []):
                 if isinstance(i, int) and 0 <= i < len(cand_list):
                     picked.append(cand_list[i])
             manual_list = [x.strip() for x in str(st.session_state.get("manual_news_lines","")).splitlines() if x.strip()]
-
             t, r = _ai_title_and_recall(preview_all, manual_list, picked,
                                         str(st.session_state.get("title_tail") or ""),
                                         str(st.session_state.get("pair","")))
@@ -8106,50 +8295,123 @@ with st.container():
     if apply_title:
         new_t = _clean_text_jp_safe(st.session_state.get("ai_title_draft_text","")).strip("。")
         if new_t:
-            globals()["title"] = new_t
-            st.session_state["title"] = new_t
-            st.session_state["__pending_title_input"] = new_t
+            globals()["title"] = _fit_title_soft(new_t)
+            st.session_state["title"] = _fit_title_soft(new_t)
+            st.session_state["__pending_title_input"] = _fit_title_soft(new_t)
         new_r_raw = _clean_text_jp_safe(st.session_state.get("ai_recall_draft_text","")).rstrip("。")
         st.session_state["__pending_recall_input"] = _strip_media_brackets(new_r_raw)
         st.success("AIタイトル＆回収を適用しました。プレビューに反映します。")
         st.rerun()
-
-# ========== Step6: タイトル / 回収 / ニュース のUI＋同期（ここまで） ==========
-
-# --- タイトル最終確定（Pre側） ---
+# -------------------------------------------------
+# 10) Pre-AI 文面の準備（既存ロジック踏襲）
+# -------------------------------------------------
 ttl_display = (str(globals().get("title", "")).strip() or str(globals().get("default_title", "")).strip())
 if not ttl_display:
     base = str(st.session_state.get("pair", "") or "ポンド円")
     tail = (st.session_state.get("title_tail") if hasattr(st, "session_state") else None) or "注視か"
     ttl_display = f"{base}の方向感に{tail}"
-ttl_display = _clean_text_jp_safe(ttl_display)
+ttl_display = _fit_title_soft(_clean_text_jp_safe(ttl_display))
 
-# --- 本日のポイント（FxONから2件） ---
+# ポイント（FxON）
+def _events_df_like():
+    for k in ["selected", "edited_df", "df_display"]:
+        df = globals().get(k)
+        if df is not None: return df
+    for k in ["events_df","fxon_events_df","econ_events_df","events_table"]:
+        df = st.session_state.get(k)
+        if df is not None: return df
+    for k in ["events","fxon_events","econ_events"]:
+        arr = st.session_state.get(k)
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            return arr
+    return None
+
+def _pick(row, keys, default=""):
+    for k in keys:
+        if isinstance(row, dict) and k in row:
+            return row.get(k, default)
+        try:
+            return row[k]
+        except Exception:
+            continue
+    return default
+
+def _extract_hhmm(v) -> str:
+    s = str(v or "").strip()
+    m = re.search(r"(\d{1,2}):(\d{2})", s)
+    if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    m = re.search(r"T(\d{2}):(\d{2})", s)
+    if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    m = re.search(r"\b(\d{2})(\d{2})\b", s)
+    if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    return ""
+
+def _strip_country_prefix(title: str) -> str:
+    return re.sub(r"^\s*(米|英|日|欧|独|仏|豪|NZ|加|南ア|スイス|中国)\s*[・･]\s*", "", str(title or "").strip())
+
+def _tidy_label(name: str) -> str:
+    s = _nfkc(name or "")
+    s = re.sub(r"\s+([)）])", r"\1", s)
+    s = re.sub(r"([（(])\s+", r"\1", s)
+    return s.strip()
+
+_JA_NAME_TO_ABBR = {
+    "米": "米","米国": "米","アメリカ": "米",
+    "英": "英","英国": "英","イギリス": "英",
+    "日": "日","日本": "日",
+    "欧": "欧","ユーロ圏": "欧","欧州": "欧","ユーロエリア":"欧",
+    "独": "独","ドイツ": "独",
+    "仏": "仏","フランス": "仏",
+    "伊": "伊","イタリア": "伊",
+    "西": "西","スペイン": "西",
+    "スイス":"スイス",
+    "加":"加","カナダ":"加",
+    "豪":"豪","豪州":"豪","オーストラリア":"豪",
+    "NZ":"NZ","ニュージーランド":"NZ",
+    "中国":"中国","中":"中国",
+    "南ア":"南ア","南アフリカ":"南ア",
+}
+def _abbr_from_region_value(v: str) -> str:
+    s = _nfkc(v).strip()
+    if not s: return ""
+    if s in _JA_NAME_TO_ABBR:
+        return _JA_NAME_TO_ABBR[s]
+    return ""
+
+def _abbr_from_row(ev: dict) -> str:
+    cand_keys = ("地域","国","国コード","region","region_code","regionCode","country","country_name_ja","country_ja","country_code","countryCode","ccy","iso2","iso3","currency")
+    for k in cand_keys:
+        if k in ev and ev[k]:
+            ab = _abbr_from_region_value(ev[k])
+            if ab: return ab
+    return ""
+
+def _normalize_time_str(s: str) -> str:
+    try:
+        h, m = str(s).split(":"); return f"{int(h):02d}:{int(m):02d}"
+    except Exception:
+        return str(s)
+
 def _build_points_from_fxon() -> list[str]:
     src = _events_df_like()
-    if src is None:
-        return []
+    if src is None: return []
+    records = []
     if hasattr(src, "to_dict"):
-        try:
-            records = src.to_dict(orient="records")
-        except Exception:
-            records = []
+        try: records = src.to_dict(orient="records")
+        except Exception: records = []
     else:
         records = list(src)
-
     pts = []
     for r in records:
         t_raw = _pick(r, ["時刻","time","local_time","datetime","start_at","start"])
         title = _pick(r, ["指標","indicator","title","name"], "")
         abbr  = _abbr_from_row(r)
         hhmm  = _extract_hhmm(t_raw)
-        if not title or not hhmm:
-            continue
+        if not title or not hhmm: continue
         ttl = _tidy_label(_strip_country_prefix(title))
         pts.append((hhmm, f"{_normalize_time_str(hhmm)} に{(abbr + '・') if abbr else ''}{ttl}"))
     pts.sort(key=lambda x: (int(x[0].split(':')[0]), int(x[0].split(':')[1])))
-    out = [p[1] for p in pts[:2]]
-    out = [re.sub(r'([0-2]?\d:[0-5]\d)\s*に\s*', r'\1 に', x) for x in out]
+    out = [re.sub(r'([0-2]?\d:[0-5]\d)\s*に\s*', r'\1 に', p[1]) for p in pts[:2]]
     return out
 
 _pts_fx = _build_points_from_fxon()
@@ -8163,44 +8425,30 @@ points = [_norm_point_line(p) for p in points]
 point1 = points[0] if len(points) > 0 else ""
 point2 = points[1] if len(points) > 1 else ""
 
-# --- ①にポイント未言及なら一言だけ挿入 ---
 def _mentions_points(s: str, items: list[str]) -> bool:
-    if not s or not items:
-        return True
+    if not s or not items: return True
     body = str(s).replace(" ", "")
     for it in items:
         key = (it.split("に", 1)[-1] or "").replace(" ", "")
-        if key and key in body:
-            return True
+        if key and key in body: return True
     return False
 
 _pts_short = [re.sub(r'(^|[^\d])([0-9]{1,2}:[0-9]{2})\s*に', r'\1\2 に', x) for x in points if x]
 if _pts_short and not _mentions_points(globals().get("p1", ""), points):
     p1 = re.sub(r"本日は[^。]*?留意したい。", "", str(globals().get("p1", ""))).strip()
     hint = "本日は" + "と".join(_pts_short) + "が控えており、短期の振れに留意したい。"
-    if p1 and not p1.endswith("。"):
-        p1 += " "
+    if p1 and not p1.endswith("。"): p1 += " "
     p1 += hint
 else:
     p1 = str(globals().get("p1", "") or "")
 
-# --- ② 段落の生成（Pre-AI=基礎 / AI後=個別補正）＋体裁・保存・ログ ----
-def _allowed_closers() -> list[str]:
-    if "ALLOWED_PARA2_CLOSERS" in globals() and ALLOWED_PARA2_CLOSERS:
-        return list(ALLOWED_PARA2_CLOSERS)
-    return ["行方を注視したい。","値動きには警戒したい。","当面は静観としたい。","一段の変動に要注意としたい。","方向感を見極めたい。"]
-
-def _ends_with_closer(s: str) -> bool:
-    return any(str(s).endswith(c) for c in _allowed_closers())
-
+# 段落②の合成（既存踏襲）
 def pad_para2(para2: str, min_chars: int = 180) -> str:
     base = str(para2 or "").strip()
-    if len(base) >= min_chars:
-        return base
+    if len(base) >= min_chars: return base
     addon = "短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。"
     if addon not in base:
-        if base and not base.endswith("。"):
-            base += " "
+        if base and not base.endswith("。"): base += " "
         base += addon
     return base
 
@@ -8220,7 +8468,7 @@ def _refine_para2_structured(p2_text: str, pair_name: str) -> str:
     base = _clean_text_jp_safe(p2_text)
     try:
         prompt = (
-            "次の段落②を『日足→4時間足』の順に並べ替え、反復を避け、自然な日本語に整えてください。"
+            "次の段落②を『日足→4時間足』の順で整理し、反復を避け、自然な日本語に整えてください。"
             "助言はしない・句点で終える・専門語（RSI/ボリンジャーバンド/SMA/EMA）は保持。\n"
             f"【通貨ペア】{pair_name}\n【段落②】\n{base}"
         )
@@ -8236,8 +8484,7 @@ def _refine_para2_structured(p2_text: str, pair_name: str) -> str:
     other = [x for x in sents if x not in d1 + h4]
     def _ensure_h4_beg(x: str) -> str:
         x = x.strip()
-        if not x:
-            return x
+        if not x: return x
         if not re.match(r"^4時間足[はでは]", x):
             x = "4時間足では" + ("" if re.match(r"^[はでは]", x) else " ") + x
         return x
@@ -8251,147 +8498,98 @@ def _refine_para2_structured(p2_text: str, pair_name: str) -> str:
     return out
 
 def _p2_ai_postprocess(text: str) -> str:
-    import re as _re
     t = _clean_text_jp_safe(str(text or ""))
     t = t.replace("4時間足では 為替市場は、", "4時間足では ")
-    t = _re.sub(r"(為替市場は、[^。]+。)\s*\1", r"\1", t)
-    t = _re.sub(r"\s+", " ", t).strip()
-    if not t.endswith("。"):
-        t += "。"
-    return t
+    t = re.sub(r"(為替市場は、[^。]+。)\s*\1", r"\1", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t.endswith("。"): t += "。"
+    return _strict_style_guard(t)
 
+# --- ② AI適用
 def _apply_ai_to_p2_only():
     refined = _refine_para2_structured(ai_p2, _cur_pair)
     refined = pad_para2(refined, 180)
-    if not _ends_with_closer(refined):
-        if not refined.endswith("。"): refined += "。"
-        refined += "方向感を見極めたい。"
+    refined = _p2_ai_postprocess(refined)
     st.session_state["p2_ai"] = _clean_text_jp_safe(refined)
 
 def _apply_ai_to_p2_with_ai():
-    if not _require_llm("段落②のAI補正"):
-        return
+    if not _require_llm("段落②のAI補正"): return
     _apply_ai_to_p2_only()
     base = st.session_state.get("p2_ai") or ""
     src  = _p2_ai_postprocess(base)
     prompt = (
         "次の『段落②（為替テクニカル）』を、事実関係を変えずに自然な日本語へ整えてください。"
-        "助言・断定は避け、重複表現を削り、句読点を整えます。専門用語は保持。末尾は句点。\n---\n" + src
+        "助言・断定は避け、重複表現を削り、句読点・用語を整えます。末尾は句点。\n---\n" + src
     )
     tmp = _call_llm_with_flags(prompt, max_tokens=600, temperature=0.2)
     out = _p2_ai_postprocess(tmp or src)
-    try:
-        pair = str(st.session_state.get("pair", ""))
-        closers = ["方向感を見極めたい。","行方を注視したい。","値動きには警戒したい。"]
-        out = _extend_para2_if_short(out, pair, 180, closers)
-    except Exception:
-        if len(out.replace("\n", "")) < 180:
-            out = out.rstrip("。") + "。 市場の振れに留意したい。"
     st.session_state["p2_ai"] = out
 
+# --- ① AI適用
 def _apply_ai_to_p1_only():
-    if not _require_llm("段落①のAI補正"):
-        return
+    if not _require_llm("段落①のAI補正"): return
     out = _call_llm_with_flags(
-        "次の段落①を簡潔に自然文へ整えてください（助言なし・末尾句点）：\n" + _clean_text_jp_safe(ai_p1),
+        "次の段落①を簡潔に自然文へ整えてください（助言なし・末尾句点・数値や固有名詞を維持）：\n" + _clean_text_jp_safe(ai_p1),
         max_tokens=480, temperature=0.2
     )
     if out:
-        st.session_state["p1_ai"] = _clean_text_jp_safe(out).rstrip("。") + "。"
+        st.session_state["p1_ai"] = _strict_style_guard(out).rstrip("。") + "。"
 
+# --- タイトル/③ AI適用
 def _apply_ai_to_title_and_p3():
-    if not _require_llm("タイトル/③のAI補正"):
-        return
-    ttl = ai_title
+    if not _require_llm("タイトル/③のAI補正"): return
+    ttl = _fit_title_soft(ai_title)
     out = _call_llm_with_flags(
-        f"次のタイトルを簡潔に調整してください（句点なし推奨・助言なし）：\n{_clean_text_jp_safe(ttl)}",
+        f"次のタイトルを18〜28字で簡潔に整えてください（句点なし・助言なし）：\n{_clean_text_jp_safe(ttl)}",
         max_tokens=120, temperature=0.2
     )
     if out:
-        ttl = _clean_text_jp_safe(out).strip().rstrip("。")
+        ttl = _fit_title_soft(out)
     preview_for_recall_ai = "\n".join([
         f"ポイント: {', '.join(x for x in (st.session_state.get('points_tags_v2') or []) if x)}",
         f"段落①: {ai_p1}",
         f"段落②: {ai_p2}",
     ])
-    def _make_cal_plus_recall(cal_src: str, ttl: str, preview_text: str = None, manual_news: str = "") -> str:
+    def _make_cal_plus_recall(cal_src: str, ttl: str, preview_text: str = None) -> str:
         cs = _nfkc(cal_src or "").strip()
         cs = re.sub(r"[。．]+$", "", cs)
         period_only = bool(st.session_state.get("recall_period_only", False))
-        if cs:
-            cal_txt = f"本日の指標は、{cs}が発表予定となっている" + (" " if period_only else "。")
-        else:
-            cal_txt = "本日の指標は、" if period_only else "本日の指標は、。"
-
         recall = str(st.session_state.get("ai_title_recall_final", "") or "").strip()
         if not recall:
             prompt = (
-                "以下の素材から、タイトル回収の一文（50〜90字程度）を1つ作成してください。"
-                "断定は避け、助言はしない。末尾は句点。和文で。媒体名や日付、URLは書かない。\n\n"
+                "以下の素材から、タイトル回収の一文（50〜90字程度）を1つ。"
+                "断定・助言は避け、末尾は句点。媒体名や日付、URLは書かない：\n\n"
                 f"【タイトル】{_clean_text_jp_safe(ttl)}\n"
                 f"【手入力ニュース】{_clean_text_jp_safe(st.session_state.get('manual_news_lines',''))}\n"
                 "【プレビュー本文】\n" + _clean_text_jp_safe((preview_text or "")[:1200])
             )
-            out2 = _call_llm_with_flags(prompt, max_tokens=200, temperature=0.2)
-            if out2:
-                recall = out2.strip().rstrip("。")
-
+            out2 = _call_llm_with_flags(prompt, max_tokens=220, temperature=0.2)
+            if out2: recall = out2.strip().rstrip("。")
         if not recall:
             st.error("🔴 タイトル回収文のAI生成に失敗しました。")
-            recall = _clean_text_jp_safe(ttl).rstrip("。")  # 最低限
-
+            recall = _clean_text_jp_safe(ttl).rstrip("。")
         recall = _strip_media_brackets(recall)
-        out_line = cal_txt + _clean_text_jp_safe(recall).rstrip("。") + "。"
-        return re.sub(r"([。])\1+", r"\1", out_line)
-
+        return _fit_para3_oneline(cs, recall, period_only)
     cal_line_src = str(st.session_state.get("calendar_line", "") or "").strip()
     p3 = _make_cal_plus_recall(cal_line_src, ttl, preview_for_recall_ai)
     st.session_state["__pending_title_input"] = ttl
     st.session_state["p3_ai"] = p3
 
-# 2) Pre-AI（段落①/②/③/タイトル）を作成
-ttl_display = str(globals().get("ttl_display","") or globals().get("title","") or "").strip()
-
-# 段落①
-para1_pre = _clean_text_jp_safe(str(p1).strip())
+# -------------------------------------------------
+# 11) Pre-AI / AI後 の確定と描画
+# -------------------------------------------------
+para1_pre = _strict_style_guard(_clean_text_jp_safe(str(p1).strip()))
 if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
-    para1_pre = _final_polish_and_guard(para1_pre, para="p1")
+    try: para1_pre = _final_polish_and_guard(para1_pre, para="p1")
+    except Exception: pass
 
-# 段落②（合成→pad→BP→クローザー）
 p2_src = str(globals().get("p2","") or st.session_state.get("para2_for_build","") or "")
-
-def _needs_recompose_p2(txt: str, pair: str) -> bool:
-    if not txt: return True
-    t = _nfkc(txt); p = _nfkc(pair)
-    if p and p not in t:
-        known = ["ドル円","豪ドル円","ユーロ円","ポンド円","NZドル円","加ドル円","スイスフラン円",
-                 "ユーロドル","ポンドドル","豪ドル/米ドル","米ドル/カナダドル","ドル/スイス"]
-        if any(k in t for k in known):
-            return True
-    try:
-        up_txt, dn_txt, _axis = _choose_breakpoints()
-    except Exception:
-        up_txt = dn_txt = None
-    tcanon = _nfkc(t)
-    def _has_num(x): return bool(x) and x in tcanon
-    has_bp_phrase = (("上値" in tcanon) or ("下値" in tcanon)) and ("付近" in tcanon)
-    if (up_txt and up_txt != "0.00") or (dn_txt and dn_txt != "0.00"):
-        if not (_has_num(up_txt) or _has_num(dn_txt) or has_bp_phrase):
-            return True
-    return False
-
-def _recompose_para2(pair: str) -> str:
-    try:
-        v = (_compose_para2_preview_mix() or "").strip()
-        if v: return _clean_text_jp_safe(v.rstrip("。")) + "。"
-    except Exception: pass
-    try:
-        v = (_compose_para2_preview_from_ui() or "").strip()
-        if v: return _clean_text_jp_safe(v.rstrip("。")) + "。"
-    except Exception: pass
+if not p2_src:
     d1 = st.session_state.get("d1_imp", "横ばい")
     h4 = st.session_state.get("h4_imp", "横ばい")
-    return _clean_text_jp_safe(f"為替市場は、{pair}は日足は{d1}、4時間足は{h4}。")
+    p2_src = _clean_text_jp_safe(f"為替市場は、{_cur_pair}は日足は{d1}、4時間足は{h4}。")
+para2_pre = pad_para2(p2_src, 180)
+para2_pre = _strict_style_guard(para2_pre)
 
 def _fallback_bp_from_ui():
     import re as _re
@@ -8400,23 +8598,14 @@ def _fallback_bp_from_ui():
             if k in st.session_state:
                 s = str(st.session_state.get(k, "")).strip()
                 if not s: continue
-                try:
-                    val = float(_re.sub(r"[^\d\.\-]", "", s))
-                except Exception:
-                    continue
+                try: val = float(_re.sub(r"[^\d\.\-]", "", s))
+                except Exception: continue
                 if abs(val) < 1e-12: continue
                 return f"{val:.2f}"
         return None
     up = _pick_first_num("p2_bp_upper","bp_up","p2_bp_d1_upper","p2_bp_h4_upper")
     dn = _pick_first_num("p2_bp_lower","bp_dn","p2_bp_d1_lower","p2_bp_h4_lower")
     return up, dn
-
-if _needs_recompose_p2(p2_src, _cur_pair):
-    p2_src = _recompose_para2(_cur_pair)
-    st.session_state["para2"] = p2_src
-    st.session_state["para2_for_build"] = p2_src
-
-para2_pre = pad_para2(p2_src, 180)
 
 try:
     up_txt, dn_txt, _axis = _choose_breakpoints()
@@ -8428,16 +8617,13 @@ if (not up_txt or up_txt == "0.00") and (not dn_txt or dn_txt == "0.00"):
     dn_txt = dn_txt if (dn_txt and dn_txt != "0.00") else f_dn
 
 bp_lines = []
-if up_txt and up_txt != "0.00":
-    bp_lines.append(f"上値{up_txt}付近の上抜けの有無をまずは見極めたい。")
-if dn_txt and dn_txt != "0.00":
-    bp_lines.append(f"下値{dn_txt}付近の下抜けには警戒したい。")
+if up_txt and up_txt != "0.00": bp_lines.append(f"上値{up_txt}付近の上抜けの有無をまずは見極めたい。")
+if dn_txt and dn_txt != "0.00": bp_lines.append(f"下値{dn_txt}付近の下抜けには警戒したい。")
 for bp in bp_lines:
     if bp and bp not in para2_pre:
-        if para2_pre and not para2_pre.endswith("。"):
-            para2_pre += "。"
+        if para2_pre and not para2_pre.endswith("。"): para2_pre += "。"
         para2_pre += bp
-para2_pre = para2_pre.replace("。。", "。")
+para2_pre = re.sub(r"。。", "。", para2_pre)
 
 tail = (st.session_state.get("title_tail") or "").strip()
 closer_map = {
@@ -8447,20 +8633,16 @@ closer_map = {
 desired = closer_map.get(tail, "方向感を見極めたい。")
 para2_pre = re.sub(r"(行方を注視したい。|値動きには警戒したい。|当面は静観としたい。|一段の変動に要注意としたい。|方向感を見極めたい。)$", "", para2_pre).rstrip("。") + "。" + desired
 para2_pre = (para2_pre or "").strip().rstrip("。") + "。"
+para2_pre = _strict_style_guard(para2_pre)
 
-# 段落③（＝タイトル回収＋本日の指標 1 行）— Pre用
-def _make_cal_plus_recall_pre(cal_src: str, ttl: str, preview_text: str = None, manual_news: str = "") -> str:
+# ③（タイトル回収＋カレンダー1行）
+def _make_cal_plus_recall_pre(cal_src: str, ttl: str, preview_text: str = None) -> str:
     cs = _nfkc(cal_src or "").strip()
     cs = re.sub(r"[。．]+$", "", cs)
     period_only = bool(st.session_state.get("recall_period_only", False))
-    if cs:
-        cal_txt = f"本日の指標は、{cs}が発表予定となっている" + (" " if period_only else "。")
-    else:
-        cal_txt = "本日の指標は、" if period_only else "本日の指標は、。"
     recall = str(st.session_state.get("ai_title_recall_final", "") or "").strip()
     recall = _strip_media_brackets(recall)
-    out = cal_txt + _clean_text_jp_safe(recall).rstrip("。") + "。"
-    return re.sub(r"([。])\1+", r"\1", out)
+    return _fit_para3_oneline(cs, recall, period_only)
 
 cal_line_src = str(st.session_state.get("calendar_line", "") or "").strip()
 _preview_for_recall_pre = "\n".join([
@@ -8470,11 +8652,11 @@ _preview_for_recall_pre = "\n".join([
 ])
 para3_pre = _make_cal_plus_recall_pre(cal_line_src, ttl_display, _preview_for_recall_pre)
 
-# 3) AI後（stateから）
-ai_title = st.session_state.get("title_ai", ttl_display)
-ai_p1    = st.session_state.get("p1_ai", para1_pre)
-ai_p2    = st.session_state.get("p2_ai", para2_pre)
-ai_p3    = st.session_state.get("p3_ai", para3_pre)
+# 3) AI後（stateから） + 最低限の整形
+ai_title = _fit_title_soft(st.session_state.get("title_ai", ttl_display))
+ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", para1_pre))
+ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", para2_pre))
+ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", para3_pre))
 
 with st.expander("AI補正（個別適用）", expanded=False):
     c1, c2, c3, c4 = st.columns(4)
@@ -8496,13 +8678,13 @@ with st.expander("AI補正（個別適用）", expanded=False):
                 _apply_ai_to_p1_only(); _apply_ai_to_p2_with_ai(); _apply_ai_to_title_and_p3()
                 st.success("全段落＋タイトルをAIで補正しました。"); _ai_usage_lamp_inline()
 
-# 4) もう一度AI後確定（state更新を反映）
-ai_title = st.session_state.get("title_ai", ttl_display)
-ai_p1    = st.session_state.get("p1_ai", para1_pre)
-ai_p2    = st.session_state.get("p2_ai", para2_pre)
-ai_p3    = st.session_state.get("p3_ai", para3_pre)
+# 4) 再同期
+ai_title = _fit_title_soft(st.session_state.get("title_ai", ttl_display))
+ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", para1_pre))
+ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", para2_pre))
+ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", para3_pre))
 
-# 5) プレビュー描画
+# 5) プレビュー描画（互換）
 def _render_report_safe(title, p1, p2, p3, points=None):
     points = list(points or [])[:2]
     try:
@@ -8529,23 +8711,24 @@ def _compact_final_text(s: str, ttl: str) -> str:
 pre_joined = _render_report_safe(ttl_display, para1_pre, para2_pre, para3_pre, points)
 ai_joined  = _render_report_safe(ai_title,    ai_p1,    ai_p2,    ai_p3,    points)
 
-pre_text = (_compact_final_text(pre_joined, ttl_display) + "\n\n" + para3_pre).strip()
-ai_text  = (_compact_final_text(ai_joined,  ai_title)   + "\n\n" + ai_p3   ).strip()
+pre_text = (_compact_final_text(pre_joined, ttl_display) + "\n\n" + _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final",""), bool(st.session_state.get("recall_period_only", False)))).strip()
+ai_text  = (_compact_final_text(ai_joined,  ai_title)   + "\n\n" + _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final","") or ai_p3, bool(st.session_state.get("recall_period_only", False)))).strip()
 
 tab1, tab2 = st.tabs(["Pre-AI版プレビュー", "AI後プレビュー"])
 with tab1:
     st.text_area("Pre-AI本文", value=pre_text, height=420, key="pre_ai_preview", disabled=True)
 with tab2:
     st.text_area("プレビュー", value=ai_text,  height=420, key="preview_report_main_area", disabled=False)
-    # 一括ボタン（AI必須）
     if st.button("AI後プレビューをAIで補正（手動・一括）", key="btn_refine_preview_after"):
         if _require_llm("一括AI補正"):
-            _apply_ai_to_p1_only()          # ①：AI
-            _apply_ai_to_p2_with_ai()       # ②：AI
-            _apply_ai_to_title_and_p3()     # ③＋タイトル：AI
+            _apply_ai_to_p1_only()
+            _apply_ai_to_p2_with_ai()
+            _apply_ai_to_title_and_p3()
             st.success("AI補正を適用しました。"); _ai_usage_lamp_inline()
 
-# 6) 体裁チェック（AI後で判定）
+# -------------------------------------------------
+# 12) 保存直前の一括検証＆最終整形
+# -------------------------------------------------
 try:
     guards = CFG.get("text_guards", {}) or {}
 except Exception:
@@ -8559,48 +8742,54 @@ def _norm_for_check(s: str) -> str:
         except Exception: pass
     return _nfkc(s)
 
-p1_check = _norm_for_check(ai_p1).replace("\n", "")
-p2_check = _norm_for_check(ai_p2).replace("\n", "")
+def _validate_and_fix_all(p1: str, p2: str, p3: str, ttl: str):
+    msgs = []
+    p1c = _norm_for_check(p1).replace("\n", "")
+    p2c = _norm_for_check(p2).replace("\n", "")
+    if len(p1c) < p1_min: msgs.append("段落①が規定文字数に未達")
+    if len(p2c) < p2_min: msgs.append("段落②が規定文字数に未達")
+    if any(w in (p1 + p2) for w in NG_WORDS): msgs.append("売買助言に該当し得る語が含まれる")
+    if not (p3.startswith("本日の指標は、") and p3.endswith("。")):
+        msgs.append("段落③の体裁が不正（本日の指標は、〜 で始まり句点で終える必要）")
+    def _final_sanitize(s: str) -> str:
+        t = _strict_style_guard(s)
+        t = re.sub(r"\s+\n", "\n", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t
+    return msgs, _final_sanitize(p1), _final_sanitize(p2), _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final","") or p3, bool(st.session_state.get("recall_period_only", False))), _fit_title_soft(ttl)
 
-viol = []
-if len(p1_check) < p1_min: viol.append("段落①が規定文字数に未達")
-if len(p2_check) < p2_min: viol.append("段落②が規定文字数に未達")
-ban_words = ["買い","売り","ロング","ショート","損切り","推奨","おすすめ","必勝"]
-if any(w in (ai_p1 + ai_p2) for w in ban_words): viol.append("売買助言に該当し得る語が含まれる")
-
-last_block = ai_text.split("\n\n")[-1].strip() if ai_text else ""
-if not (last_block.startswith("本日の指標は、") and last_block.endswith("。")):
-    viol.append("段落③の体裁が不正（本日の指標は、〜 で始まり句点で終える必要）")
-
+viol, ai_p1_final, ai_p2_final, ai_p3_final, ai_title_final = _validate_and_fix_all(ai_p1, ai_p2, ai_p3, ai_title)
 if viol:
     st.error("体裁チェック NG：" + " / ".join(viol))
 else:
     st.success("体裁チェック OK（①≥220字／②≥180字／③は1行で回収まで同一行・句点で終える）。")
 
-# 7) 保存（AI後を保存）
+# 保存
 out_dir = Path("./out"); out_dir.mkdir(parents=True, exist_ok=True)
 fname = f"m{datetime.now():%Y%m%d}.txt"
 save_path = out_dir / fname
+ai_text_final = (_compact_final_text(_render_report_safe(ai_title_final, ai_p1_final, ai_p2_final, ai_p3_final, points), ai_title_final) + "\n\n" + ai_p3_final).strip()
+
 try:
-    save_path.write_text(ai_text, encoding="utf-8")
+    save_path.write_text(ai_text_final, encoding="utf-8")
     st.success(f"保存しました：{fname}")
     st.download_button("このプレビューをダウンロード",
-                       data=ai_text.encode("utf-8"),
+                       data=ai_text_final.encode("utf-8"),
                        file_name=fname, mime="text/plain",
                        key="dl_report_unified")
 except Exception as e:
     st.warning(f"保存時のエラー：{e}")
 
-# 8) 監査ログ（AI後＋AI使用状況を記録）
+# 監査ログ
 try:
     log = {
         "ts": datetime.now().isoformat(),
         "pair": str(st.session_state.get("pair", "")),
-        "title": ai_title,
+        "title": ai_title_final,
         "points": points,
-        "calendar_line": cal_line_src,
-        "preview_len": len(ai_text),
-        "checks_failed": st.session_state.get("checks_failed", []),
+        "calendar_line": cal_line_src if 'cal_line_src' in locals() else st.session_state.get("calendar_line",""),
+        "preview_len": len(ai_text_final),
+        "checks_failed": viol,
         "ai_flags": _ai_flags(),
         "live_diag": globals().get("live_diag", {}) if isinstance(globals().get("live_diag", {}), dict) else {},
         "te_diag":   globals().get("te_diag", {})   if isinstance(globals().get("te_diag", {}), dict)   else {},
