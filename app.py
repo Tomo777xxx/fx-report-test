@@ -562,23 +562,26 @@ ALLOWED_PARA2_CLOSERS = [
 
 
 def _llm_pick_from_list(system_msg: str, user_msg: str) -> str | None:
+    """
+    llm_complete を経由して同じモデル/エラーハンドリングに統一。
+    失敗時は None を返し、呼び出し側でローカル乱択にフォールバック。
+    """
     try:
-        from openai import OpenAI
-        api_key = _get_api_key()
-        if not api_key:
-            return None
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="gpt-5-thinking",
-            messages=[{"role": "system", "content": system_msg},
-                      {"role": "user", "content": user_msg}],
+        out = llm_complete(
+            prompt=user_msg,
+            system=system_msg,
             temperature=0.2,
-            max_tokens=16,
+            max_tokens=32,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return text.replace("\n", "").strip()
-    except Exception:
+        out = (out or "").replace("\n", "").strip()
+        return out or None
+    except Exception as e:
+        try:
+            _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
         return None
+
 
 def _read_rules_digest(path: str | Path = "data/rules_digest.txt") -> str:
     p = Path(path)
@@ -4900,15 +4903,22 @@ def _ensure_openai_client():
     if _openai_client is not None:
         return _openai_client
     if OpenAI is None:
+        try: _ai_flags()["last_error"] = "ImportError: openai"
+        except Exception: pass
         return None
     key = _get_api_key()
     if not key:
+        try: _ai_flags()["last_error"] = "OPENAI_API_KEY not found"
+        except Exception: pass
         return None
     try:
         _openai_client = OpenAI(api_key=key)
         return _openai_client
-    except Exception:
+    except Exception as e:
+        try: _ai_flags()["last_error"] = f"OpenAIInitError: {type(e).__name__}: {e}"
+        except Exception: pass
         return None
+
 
 def llm_complete(prompt: str,
                  system: str = (
@@ -4918,13 +4928,18 @@ def llm_complete(prompt: str,
                  ),
                  temperature: float = 0.2,
                  max_tokens: int = 800) -> str:
-    """ChatGPT-5 Thinking で短文を整形。失敗時は空文字を返す。"""
+    """
+    モデル名は Secrets の OPENAI_MODEL を優先。
+    未設定なら 'gpt-4o-mini' を既定にして権限不一致で落ちにくくする。
+    失敗時は last_error に理由を残す（UIの AI使用状況 に表示）。
+    """
     client = _ensure_openai_client()
-    if client is None or not prompt:
+    if client is None or not str(prompt).strip():
         return ""
     try:
+        model = CANON_get_secret("OPENAI_MODEL", "gpt-4o-mini")
         resp = client.chat.completions.create(
-            model="gpt-5-thinking",  # ChatGPT5 Thinking を固定
+            model=model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
@@ -4933,8 +4948,13 @@ def llm_complete(prompt: str,
             max_tokens=max_tokens,
         )
         return (resp.choices[0].message.content or "").strip()
-    except Exception:
+    except Exception as e:
+        try:
+            _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
         return ""
+
 
 
 # 目的：段落②が短い時に“安全な汎用文”をYAMLから読み込み、結びの直前に自動で追記するためのローダー群
