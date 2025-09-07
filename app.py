@@ -103,21 +103,95 @@ except Exception:
 
 CANON_JST = _tz(_td(hours=9))
 
-def CANON_get_secret(name: str, default: str | None = None) -> str | None:
-    """
-    secrets → secrets['general'] → 環境変数 → default の順で取得。
-    既存の _get_secret 系は当面そのまま／後続ステップで徐々に置換予定。
-    """
+# ===== [STEP1 PATCH: LLM minimal wiring + diagnostics] =====
+import os
+
+# 汎用 Secret 取得（トップ → [general] → 環境変数）
+def CANON_get_secret(key: str, default=None):
     try:
-        import streamlit as _st
-        if name in _st.secrets:
-            return _st.secrets[name]
-        if "general" in _st.secrets and name in _st.secrets["general"]:
-            return _st.secrets["general"][name]
+        if "st" in globals():
+            try:
+                if key in st.secrets:
+                    return st.secrets[key]
+            except Exception:
+                pass
+            try:
+                if "general" in st.secrets and key in st.secrets["general"]:
+                    return st.secrets["general"][key]
+            except Exception:
+                pass
+        return os.environ.get(key, default)
+    except Exception:
+        return os.environ.get(key, default)
+
+# APIキー取得（無ければ None）
+def _get_api_key():
+    return CANON_get_secret("OPENAI_API_KEY", None)
+
+# 診断：Secrets が見えているか
+def _probe_openai_secrets() -> dict:
+    info = {"top": False, "general": False, "general_key": False, "env": False}
+    try:
+        info["top"] = ("st" in globals()) and ("OPENAI_API_KEY" in st.secrets)
     except Exception:
         pass
-    import os as _os
-    return _os.environ.get(name, default)
+    try:
+        info["general"] = ("st" in globals()) and ("general" in st.secrets)
+        info["general_key"] = info["general"] and ("OPENAI_API_KEY" in st.secrets["general"])
+    except Exception:
+        pass
+    info["env"] = bool(os.environ.get("OPENAI_API_KEY"))
+    info["model"] = CANON_get_secret("OPENAI_MODEL", "<unset>")
+    return info
+
+# OpenAIクライアント生成（失敗理由を ai_flags.last_error に残す）
+_openai_client = None
+def _ensure_openai_client():
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+    try:
+        from openai import OpenAI as _OpenAI
+    except Exception as e:
+        _ai_flags()["last_error"] = f"ImportError(openai): {e}"
+        return None
+    key = _get_api_key()
+    if not key:
+        _ai_flags()["last_error"] = f"OPENAI_API_KEY not found: {_probe_openai_secrets()}"
+        return None
+    try:
+        _openai_client = _OpenAI(api_key=key)
+        return _openai_client
+    except Exception as e:
+        _ai_flags()["last_error"] = f"OpenAIInitError: {type(e).__name__}: {e}"
+        return None
+
+# 最小の LLM 呼び出し（まだ無ければ定義）
+if not callable(globals().get("llm_complete")):
+    def llm_complete(prompt: str,
+                     system: str = "You are a helpful assistant that edits Japanese text naturally without giving trading advice.",
+                     temperature: float = 0.2,
+                     max_tokens: int = 800) -> str:
+        client = _ensure_openai_client()
+        if client is None or not prompt:
+            return ""
+        try:
+            model = CANON_get_secret("OPENAI_MODEL", "gpt-4o-mini")
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
+            return ""
+# ===== [/STEP1 PATCH] =====
+
 # 目的：Country名の表記ゆれを地域コード（US/JP/EU/UK/AU/NZ/CN/ZA…）に正規化する“正”の関数。今後はこの関数のみを参照する
 
 def CANON_map_country_to_region(country: str) -> str:
@@ -7683,6 +7757,9 @@ def _llm_lamp_inline():
         f"**LLM接続**：{lamp} {'接続OK' if ready else '未接続'}",
         help="OPENAI_API_KEY（secrets / 環境変数）を確認"
     )
+with st.expander("LLM診断", expanded=False):
+    st.json(_probe_openai_secrets())
+    st.caption(_ai_flags().get("last_error") or "last_error: <none>")
 
 def _ai_usage_lamp_inline():
     af = _ai_flags()
