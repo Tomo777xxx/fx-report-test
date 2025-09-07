@@ -7712,7 +7712,7 @@ st.session_state["p2_ui_preview_text"] = p2
 # AI補正：タイトル & タイトル回収（手入力ニュース + RSS候補） — MAX版
 # =========================
 
-import os, sys, subprocess, re, json, unicodedata
+import os, sys, subprocess, re, json, unicodedata, inspect
 from pathlib import Path
 from datetime import datetime
 import streamlit as st
@@ -7745,18 +7745,46 @@ def _ensure_openai_client():
     except Exception:
         pass
     # ここでは単純に存在検査だけ（初期化は外側に任せる）
-    return os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-
-def _llm_call(prompt: str, **kw) -> str:
-    """既存 llm_complete を優先。無い場合は最小フォールバック（失敗時は空文字）。"""
     try:
-        if callable(globals().get("llm_complete")):
-            return globals()["llm_complete"](prompt, **kw) or ""
+        if st.secrets.get("OPENAI_API_KEY"):  # secrets 直下
+            return st.secrets["OPENAI_API_KEY"]
     except Exception:
         pass
-    # 簡易フォールバック（OpenAI SDK 初期化は外部に委譲している前提なのでここではノーオペ）
-    # 既存実装がない環境では空文字を返す（UIに未接続を表示）
-    return ""
+    return os.environ.get("OPENAI_API_KEY")
+
+def _func_accepts_kw(func, kwname: str) -> bool:
+    """関数が特定キーワード（例: model）を受け付けるかを判定（**kwargs含む）"""
+    try:
+        sig = inspect.signature(func)
+        for p in sig.parameters.values():
+            if p.kind == p.VAR_KEYWORD:
+                return True   # **kwargs がある
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and p.name == kwname:
+                return True
+    except Exception:
+        pass
+    return False
+
+def _llm_call(prompt: str, **kw) -> str:
+    """既存 llm_complete を優先。未対応キーワードは自動で外して再試行。失敗時は空文字。"""
+    llm = globals().get("llm_complete")
+    if not callable(llm):
+        return ""
+    # llm_complete が model を受け付けないなら除去
+    if "model" in kw and not _func_accepts_kw(llm, "model"):
+        kw = {k: v for k, v in kw.items() if k != "model"}
+    try:
+        return llm(prompt, **kw) or ""
+    except TypeError as e:
+        # それでも型エラーなら、引数なしで最終リトライ
+        try:
+            return llm(prompt) or ""
+        except Exception as e2:
+            _ai_flags()["last_error"] = f"TypeError in llm_complete: {e2}"
+            return ""
+    except Exception as e:
+        _ai_flags()["last_error"] = f"{type(e).__name__}: {e}"
+        return ""
 
 # -------------------------------------------------
 # 1) LLM 必須ガード & ランプ（既存互換＋拡張）
@@ -7801,22 +7829,19 @@ MODEL_PREF_ORDER = [m for m in MODEL_PREF_ORDER if m]
 def _call_llm_with_flags(prompt: str, **kw) -> str:
     af = _ai_flags()
     out = ""
+    if not _require_llm("AI呼び出し"):
+        return ""
     try:
-        if not _require_llm("AI呼び出し"):
-            return ""
-        # memo: 既存 llm_complete が modelを内部で使う場合は任せる。ここでは提示のみ
-        for m in MODEL_PREF_ORDER:
-            try:
-                tmp = _llm_call(prompt, model=m, **kw)
-                af["models_used"].append(m)
-                out = (tmp or "").strip()
-                if out:
-                    break
-            except Exception as e:
-                af["last_error"] = f"{type(e).__name__}: {e}"
-                continue
-        if not out:
-            # 最後にデフォ（model 指定なし）
+        used_any = False
+        for m in (MODEL_PREF_ORDER or [""]):
+            tmp = _llm_call(prompt, model=m, **kw) if m else _llm_call(prompt, **kw)
+            tmp = (tmp or "").strip()
+            if tmp:
+                af["models_used"].append(m or "<default>")
+                out = tmp
+                used_any = True
+                break
+        if not used_any:
             out = (_llm_call(prompt, **kw) or "").strip()
         if out:
             af["llm_used"] = True
@@ -7897,30 +7922,23 @@ def _normalize_units_and_notation(s: str) -> str:
         t = re.sub(pat, rep, t)
     # 時刻 8:5 → 08:05
     def _fix_time(m):
-        hh = int(m.group(1))
-        mm = int(m.group(2))
+        hh = int(m.group(1)); mm = int(m.group(2))
         return f"{hh:02d}:{mm:02d}"
     t = re.sub(r"\b([0-2]?\d):([0-5]?\d)\b", _fix_time, t)
     return t
 
 def _neutralize_tone(s: str) -> str:
     t = _clean_text_jp_safe(s)
-    # NGワードは即時弱化 or 削除
     for w in NG_WORDS:
         t = re.sub(w, "（表現を中立化）", t)
-    # 強断定をソフト化
     for pat, rep in ASSERTIVE_PAT:
         t = re.sub(pat, rep, t)
-    # “〜したい”の連発は1つに
     t = re.sub(r"(見極めたい。)(\s*見極めたい。)+", r"\1", t)
-    # 助言臭の「〜すべき」は「〜は避けたい/注意したい」へ
     t = re.sub(r"すべき", "は避けたい", t)
     return t
 
-# 正典ルールの軽量ガード（PDFを前段で読み込めない時でも最低限のスタイルを守る）
 def _strict_style_guard(s: str) -> str:
     t = _normalize_units_and_notation(_neutralize_tone(s))
-    # 箇条書き化の抑制：句点で整形
     t = re.sub(r"[・･]\s*", "・", t)
     t = re.sub(r"(。)\s*(。)+", r"\1", t).strip()
     if t and not t.endswith("。"):
@@ -7969,9 +7987,7 @@ def _fit_para3_oneline(cal_src: str, recall: str, period_only: bool = False) -> 
     line = (pre + (" " if period_only else "。") + rc + "。").replace("\n", "")
     line = re.sub(r"\s+", " ", line)
     line = re.sub(r"(。)\1+", r"\1", line)
-    # 体裁：先頭・末尾
-    line = re.sub(r"^\s+", "", line)
-    line = re.sub(r"\s+$", "", line)
+    line = re.sub(r"^\s+|\s+$", "", line)
     if not line.endswith("。"):
         line += "。"
     return line
