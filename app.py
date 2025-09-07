@@ -7765,18 +7765,27 @@ def _func_accepts_kw(func, kwname: str) -> bool:
         pass
     return False
 
+def _filter_kwargs(func, kwargs: dict) -> dict:
+    """func が受理できるキーワードだけに間引く（**kwargsがあればそのまま通す）"""
+    try:
+        sig = inspect.signature(func)
+        if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+            return dict(kwargs)
+        return {k: v for k, v in kwargs.items() if k in sig.parameters}
+    except Exception:
+        return {}
+
 def _llm_call(prompt: str, **kw) -> str:
     """既存 llm_complete を優先。未対応キーワードは自動で外して再試行。失敗時は空文字。"""
     llm = globals().get("llm_complete")
     if not callable(llm):
         return ""
-    # llm_complete が model を受け付けないなら除去
-    if "model" in kw and not _func_accepts_kw(llm, "model"):
-        kw = {k: v for k, v in kw.items() if k != "model"}
+    # llm_complete 側が受け取れない引数を除去
+    kw = _filter_kwargs(llm, kw)
     try:
         return llm(prompt, **kw) or ""
-    except TypeError as e:
-        # それでも型エラーなら、引数なしで最終リトライ
+    except TypeError:
+        # まだ型不一致なら最終フォールバック（引数なし）
         try:
             return llm(prompt) or ""
         except Exception as e2:
@@ -7834,6 +7843,7 @@ def _call_llm_with_flags(prompt: str, **kw) -> str:
     try:
         used_any = False
         for m in (MODEL_PREF_ORDER or [""]):
+            # llm_complete が model を受理できない実装でも、_llm_call 側で安全に捌く
             tmp = _llm_call(prompt, model=m, **kw) if m else _llm_call(prompt, **kw)
             tmp = (tmp or "").strip()
             if tmp:
@@ -8146,15 +8156,50 @@ def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_
         + "\n\n--- 出力フォーマット ---\nTitle: <タイトル>\nRecall: <タイトル回収の一文>\n"
     )
     out = _call_llm_with_flags(prompt, max_tokens=520, temperature=0.2)
-    if not out or ("Title:" not in out and "Recall:" not in out):
+    if not out:
         st.error("🔴 タイトル案のAI生成に失敗しました。接続やキー、ネットワークを確認してください。")
         return "", ""
-    m1 = re.search(r"Title:\s*(.+)", out)
-    m2 = re.search(r"Recall:\s*(.+)", out)
-    title  = _clean_text_jp_safe(m1.group(1)) if m1 else ""
-    recall = _strip_media_brackets(_clean_text_jp_safe(m2.group(1)) if m2 else "")
-    title  = _fit_title_soft(title).strip("。")
-    recall = recall.rstrip("。")
+
+    # 堅牢パーサ（全角/半角コロン・日本語ラベル・コードブロック対応）
+    def _parse_title_recall(text: str) -> tuple[str, str]:
+        s = _clean_text_jp_safe(text)
+        s = re.sub(r"^```.*?\n", "", s, flags=re.S)
+        s = re.sub(r"\n```$", "", s, flags=re.S)
+
+        title = ""
+        recall = ""
+
+        title_patterns  = [r"(?im)^\s*Title\s*[：:]\s*(.+)$",
+                           r"(?im)^\s*タイトル\s*[：:]\s*(.+)$"]
+        recall_patterns = [r"(?im)^\s*Recall\s*[：:]\s*(.+)$",
+                           r"(?im)^\s*(?:回収|要旨|要約)\s*[：:]\s*(.+)$"]
+
+        for p in title_patterns:
+            m = re.search(p, s)
+            if m:
+                title = m.group(1).strip()
+                break
+        for p in recall_patterns:
+            m = re.search(p, s)
+            if m:
+                recall = m.group(1).strip()
+                break
+
+        if not title or not recall:
+            lines = [x.strip() for x in s.splitlines() if x.strip()]
+            if not title and lines:
+                title = lines[0]
+            if not recall and len(lines) >= 2:
+                recall = lines[1]
+        return title, recall
+
+    title_raw, recall_raw = _parse_title_recall(out)
+    if not (title_raw and recall_raw):
+        st.error("🔴 タイトル案のAI生成に失敗しました（出力解析エラー）。")
+        return "", ""
+
+    title  = _fit_title_soft(_clean_text_jp_safe(title_raw)).strip("。")
+    recall = _strip_media_brackets(_clean_text_jp_safe(recall_raw)).rstrip("。")
     return title, recall
 
 # -------------------------------------------------
