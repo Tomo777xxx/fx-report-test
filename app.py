@@ -8538,7 +8538,7 @@ with st.container():
         key="calendar_max_items",
     )
 
-    # 次回 rerun で widget に反映するための「保留」キーを先に処理（※widget生成前）
+    # ▼ このランで widget を作る前に「保留キー」を消化（widget作成後に同キーへ value= を渡さない）
     if "__pending_title_input" in st.session_state:
         st.session_state["title_ai"] = str(st.session_state["__pending_title_input"] or "")
         del st.session_state["__pending_title_input"]
@@ -8548,25 +8548,38 @@ with st.container():
         st.session_state["ai_title_recall_final"] = pend
         del st.session_state["__pending_recall_input"]
 
+    # ▼ title_ai は「既に state にある場合は value を渡さない」ことで API 例外を回避
     ttl_default = str(
         st.session_state.get(
             "title_ai",
             str(globals().get("ttl_display", "") or globals().get("title", "") or ""),
         )
     )
-    st.text_input("AI提案タイトル（編集可・句点なし推奨）", value=ttl_default, key="title_ai")
+    if "title_ai" in st.session_state:
+        st.text_input("AI提案タイトル（編集可・句点なし推奨）", key="title_ai")
+    else:
+        st.text_input("AI提案タイトル（編集可・句点なし推奨）", value=ttl_default, key="title_ai")
 
     def _on_change_recall_input():
         raw = st.session_state.get("ai_title_recall_input", "")
         st.session_state["ai_title_recall_final"] = _strip_media_brackets(_clean_text_jp_safe(raw).rstrip("。"))
 
-    st.text_area(
-        "AI提案：タイトル回収（編集可・句点なし推奨）",
-        value=st.session_state.get("ai_title_recall_final", ""),
-        key="ai_title_recall_input",
-        height=80,
-        on_change=_on_change_recall_input,
-    )
+    # ▼ ai_title_recall_input も同様に、既存なら value を渡さない
+    if "ai_title_recall_input" in st.session_state:
+        st.text_area(
+            "AI提案：タイトル回収（編集可・句点なし推奨）",
+            key="ai_title_recall_input",
+            height=80,
+            on_change=_on_change_recall_input,
+        )
+    else:
+        st.text_area(
+            "AI提案：タイトル回収（編集可・句点なし推奨）",
+            value=st.session_state.get("ai_title_recall_final", ""),
+            key="ai_title_recall_input",
+            height=80,
+            on_change=_on_change_recall_input,
+        )
 
     st.caption("手入力ニュースを優先。AI候補は未入力分を補完します。")
     st.text_area(
@@ -8636,6 +8649,27 @@ with st.container():
             key="recall_period_only",
         )
 
+    # ▼ ポイントから ③ をバックフィルする補助（イベントが空でも「、。」とならない）
+    def _backfill_calendar_from_points(points_list):
+        try:
+            cal_line_now = (st.session_state.get("calendar_line") or "").strip()
+            if cal_line_now:
+                return
+            evs = []
+            for p in points_list or []:
+                s = _nfkc(p or "").strip()
+                m = re.match(r"^\s*([0-2]?\d):([0-5]\d)\s*に\s*(.+)$", s)
+                if not m:
+                    continue
+                hh = int(m.group(1)); mm = int(m.group(2)); raw = m.group(3).strip()
+                dt = datetime(_now_jst().year, _now_jst().month, _now_jst().day, hh, mm, tzinfo=_JST)
+                evs.append({"dt": dt, "label_raw": raw, "line": f"{hh}:{mm:02d} に{raw}", "_score": 50})
+            if evs:
+                st.session_state["calendar_events_kept"] = evs[:6]
+                st.session_state["calendar_line"] = "、".join([e["line"] for e in st.session_state["calendar_events_kept"]])
+        except Exception:
+            pass
+
     if gen_title:
         if _require_llm("タイトル案のAI生成"):
             # ③ 自動選抜を先に反映
@@ -8646,6 +8680,9 @@ with st.container():
                 st.session_state["calendar_events_kept"] = kept_evs
                 st.session_state["calendar_events_dropped"] = dropped_evs
                 st.session_state["calendar_line"] = cal_line
+
+            # ③が空ならポイントから補完
+            _backfill_calendar_from_points(st.session_state.get("points_tags_v2", []))
 
             preview_all = "\n".join(
                 [
@@ -8672,7 +8709,7 @@ with st.container():
             )
 
             if t:
-                # 強制適用（B）：同一ラン中は widget キーは直接書き換えず、保留キーへ
+                # 同一ランでは widget を直接上書きせず、保留キーへ
                 t_fit = _fit_title_soft(t)
                 st.session_state["ai_title_draft_text"] = t_fit
                 st.session_state["ai_recall_draft_text"] = r
@@ -8742,6 +8779,27 @@ def _mentions_points(s: str, items) -> bool:
             return True
     return False
 
+# ▼ ③が空なら、ここでもポイントから補完（Pre-AI 側でも「、。」を回避）
+def _backfill_calendar_from_points(points_list):
+    try:
+        cal_line_now = (st.session_state.get("calendar_line") or "").strip()
+        if cal_line_now:
+            return
+        evs = []
+        for p in points_list or []:
+            s = _nfkc(p or "").strip()
+            m = re.match(r"^\s*([0-2]?\d):([0-5]\d)\s*に\s*(.+)$", s)
+            if not m:
+                continue
+            hh = int(m.group(1)); mm = int(m.group(2)); raw = m.group(3).strip()
+            dt = datetime(_now_jst().year, _now_jst().month, _now_jst().day, hh, mm, tzinfo=_JST)
+            evs.append({"dt": dt, "label_raw": raw, "line": f"{hh}:{mm:02d} に{raw}", "_score": 50})
+        if evs:
+            st.session_state["calendar_events_kept"] = evs[:6]
+            st.session_state["calendar_line"] = "、".join([e["line"] for e in st.session_state["calendar_events_kept"]])
+    except Exception:
+        pass
+
 _pts_short = [re.sub(r"(^|[^\d])([0-9]{1,2}:[0-9]{2})\s*に", r"\1\2 に", x) for x in points if x]
 if _pts_short and not _mentions_points(globals().get("p1", ""), points):
     p1 = re.sub(r"本日は[^。]*?留意したい。", "", str(globals().get("p1", ""))).strip()
@@ -8769,7 +8827,7 @@ def pad_para2(para2: str, min_chars: int = 180) -> str:
         if add not in base:
             base = (base + "。" + add) if base else add
         i += 1
-        if i > 8:  # 念のためのブレーキ
+        if i > 8:
             break
     return (base or "").strip().rstrip("。") + "。"
 
@@ -8784,6 +8842,18 @@ def _dedup_d1_h4_phrasing(s: str) -> str:
     t = re.sub(r"(4時間足[はでは]*)(?=4時間足[はでは]*)", r"\1、", t)
     t = re.sub(r"([。])\1+", r"\1", t)
     return t
+
+# ★ 数値を含む文の重複を署名で除去（②の不改変違反を抑制）
+def _dedup_numeric_sentences(text: str) -> str:
+    s = _clean_text_jp_safe(text or "")
+    sents = [x.strip() for x in re.split(r"[。]+", s) if x.strip()]
+    out, seen = [], set()
+    for seg in sents:
+        sig = re.sub(r"\d+(?:,\d{3})*(?:\.\d+)?", "<NUM>", _nfkc(seg))
+        if sig in seen:
+            continue
+        seen.add(sig); out.append(seg)
+    return "。".join(out).rstrip("。") + "。"
 
 # ② 冒頭定型の強制（常に所定の文言で開始）
 def _enforce_para2_lead(text: str, pair_name: str) -> str:
@@ -8839,11 +8909,14 @@ def _refine_para2_structured(p2_text: str, pair_name: str) -> str:
 
 def _p2_ai_postprocess(text: str) -> str:
     t = _clean_text_jp_safe(str(text or ""))
+    # 冗長修正
     t = t.replace("4時間足では 為替市場は、", "4時間足では ")
+    t = t.replace("為替市場において、", "為替市場は、")
     t = re.sub(r"(為替市場は、[^。]+。)\s*\1", r"\1", t)
     t = re.sub(r"[【［\[][^】］\]]+[】］\]]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     t = _enforce_para2_lead(t, _cur_pair)
+    t = _dedup_numeric_sentences(t)  # ★ 数値重複の最終除去
     if not t.endswith("。"):
         t += "。"
     return _strict_style_guard(t)
@@ -8929,6 +9002,9 @@ def _apply_ai_to_title_and_p3():
         st.session_state["calendar_events_kept"] = kept_evs
         st.session_state["calendar_events_dropped"] = dropped_evs
         st.session_state["calendar_line"] = cal_line
+
+    # ③が空ならポイントから補完
+    _backfill_calendar_from_points(st.session_state.get("points_tags_v2", []))
 
     preview_for_recall_ai = "\n".join(
         [
@@ -9068,13 +9144,16 @@ para2_pre = re.sub(
 para2_pre = (para2_pre or "").strip().rstrip("。") + "。"
 para2_pre = _strict_style_guard(para2_pre)
 
-# ★ ここで再度 最低文字数を保証（取りこぼし防止）
+# ★ 最低文字数を保証
 try:
     guards = globals().get("CFG", {}).get("text_guards", {}) if isinstance(globals().get("CFG", {}), dict) else {}
 except Exception:
     guards = {}
 p2_min_fallback = int(guards.get("p2_min_chars", 180))
 para2_pre = pad_para2(para2_pre, p2_min_fallback)
+
+# ▼ ③：イベントが空ならポイントから補完（ここでも実施）
+_backfill_calendar_from_points(points)
 
 # ③（タイトル回収＋カレンダー1行）
 def _make_cal_plus_recall_pre(cal_src: str, ttl: str, preview_text=None) -> str:
@@ -9172,7 +9251,6 @@ def _render_report_safe(title, p1, p2, p3, points=None) -> str:
     rr = globals().get("render_report")
     if callable(rr):
         try:
-            # 新署名
             return rr(
                 title=title,
                 point1=(points[0] if points else ""),
@@ -9184,7 +9262,6 @@ def _render_report_safe(title, p1, p2, p3, points=None) -> str:
             )
         except TypeError:
             try:
-                # 旧署名
                 return rr(
                     title=title,
                     point1=(points[0] if points else ""),
@@ -9198,7 +9275,6 @@ def _render_report_safe(title, p1, p2, p3, points=None) -> str:
                 pass
         except Exception:
             pass
-    # フォールバック：素朴なテキスト構成
     pt1 = f"・{points[0]}" if points and points[0] else ""
     pt2 = f"・{points[1]}" if len(points) > 1 and points[1] else ""
     blocks = [str(title).strip(), pt1, pt2, str(p1).strip(), str(p2).strip(), str(p3).strip()]
@@ -9220,7 +9296,7 @@ def _compact_final_text(s: str, ttl: str) -> str:
     t = re.sub(r"([。])\1+", r"\1", t)
     return t.strip()
 
-pre_joined = _render_report_safe(ai_title, para1_pre, para2_pre, para3_pre, points)  # タイトルはAI優先
+pre_joined = _render_report_safe(ai_title, para1_pre, para2_pre, para3_pre, points)
 ai_joined = _render_report_safe(ai_title, ai_p1, ai_p2, ai_p3, points)
 
 pre_text = (
@@ -9264,7 +9340,7 @@ try:
     guards = CFG_local.get("text_guards", {}) if isinstance(CFG_local, dict) else {}
 except Exception:
     guards = {}
-p1_min = int(guards.get("p1_min_chars", 180))  # “同程度”に合わせる
+p1_min = int(guards.get("p1_min_chars", 180))
 p2_min = int(guards.get("p2_min_chars", 180))
 
 def _norm_for_check(s: str) -> str:
@@ -9276,7 +9352,6 @@ def _norm_for_check(s: str) -> str:
     return _nfkc(s)
 
 def _validate_tokens_unchanged(before_text: str, after_text: str, extra_terms=None) -> bool:
-    # DATE/TIME/NUM/IND の順序・件数一致をチェック
     _, seq_b, order_b = _mask_sensitive(before_text or "", extra_terms=extra_terms)
     _, seq_a, order_a = _mask_sensitive(after_text or "", extra_terms=extra_terms)
     return (order_b == order_a) and ([x[1] for x in seq_b] == [x[1] for x in seq_a])
