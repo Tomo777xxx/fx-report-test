@@ -7709,12 +7709,13 @@ st.session_state["p1_ui_preview_text"] = p1
 st.session_state["p2_ui_preview_text"] = p2
 
 # =========================
-# AI補正：タイトル & タイトル回収（手入力ニュース + RSS候補）— “確実にAIを叩く”版
+# AI補正：タイトル & タイトル回収（手入力ニュース + RSS候補）
+# 仕様A〜J 準拠・置き換え版（指標名マスク/照合 + ③短尺時の相対均しを追加）
 # =========================
 
 import os, sys, subprocess, re, json, unicodedata, inspect
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import streamlit as st
 
 # -------------------------------------------------
@@ -7734,6 +7735,27 @@ def _safe_get(d, k, default=""):
         return d.get(k, default)
     except Exception:
         return default
+
+def _strlen_ja(s: str) -> int:
+    return len(_nfkc(s or ""))
+
+# JST
+_JST = timezone(timedelta(hours=9))
+def _now_jst() -> datetime:
+    try:
+        return datetime.now(_JST)
+    except Exception:
+        return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(_JST)
+
+def _window_bounds_jst(today: datetime | None = None):
+    """
+    本日 0:00 〜 翌日 18:00（JST）の時間窓を返す
+    """
+    base = today or _now_jst()
+    day0 = base.astimezone(_JST).date()
+    start = datetime(day0.year, day0.month, day0.day, 0, 0, tzinfo=_JST)
+    end   = start + timedelta(days=1, hours=18)  # 翌日18:00
+    return start, end
 
 # ===== OpenAI を“必ず”叩くための最低限の配線 =====
 def _ensure_pkg(pkg: str) -> bool:
@@ -7943,7 +7965,6 @@ def _ai_usage_lamp_inline():
 
 with st.expander("LLM診断", expanded=False):
     probe = {}
-    # app.py 互換の診断ヘルパがあれば呼ぶ（任意）
     try:
         if callable(globals().get("_probe_openai_secrets")):
             probe = globals()["_probe_openai_secrets"]()
@@ -7978,12 +7999,13 @@ NORMALIZE_MAP = [
     (r"２００SMA|200ＳＭＡ|200SＭＡ", "200SMA"),
     (r"４時間足", "4時間足"),
     (r"ひあし|しあし", "日足"),
-    (r"\s*:\s*", ":"),
+    (r"\s*:\s*", ":"),  # コロン余白
 ]
 def _normalize_units_and_notation(s: str) -> str:
     t = _clean_text_jp_safe(s)
     for pat, rep in NORMALIZE_MAP: t = re.sub(pat, rep, t)
-    def _fix_time(m): return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    # 時刻は H:MM（時間はゼロ埋めしない／分は2桁）
+    def _fix_time(m): return f"{int(m.group(1))}:{int(m.group(2)):02d}"
     return re.sub(r"\b([0-2]?\d):([0-5]?\d)\b", _fix_time, t)
 
 def _neutralize_tone(s: str) -> str:
@@ -8002,12 +8024,110 @@ def _strict_style_guard(s: str) -> str:
     return t
 
 # -------------------------------------------------
-# 3) タイトル調整（18〜28字のソフトフィット）
+# 2.5) マスキング → 生成 → 復元・照合（A:不改変保証／IND追加）
 # -------------------------------------------------
+_TOKEN_PATTERNS = {
+    "DATE": re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
+    "TIME": re.compile(r"\b([0-2]?\d:[0-5]\d)\b"),
+    "NUM":  re.compile(r"(?<![A-Za-z])[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?"),
+}
+
+def _collect_indicator_terms() -> list[str]:
+    """
+    当日採用イベント（kept）の原文ラベルから“指標名候補”を抽出し、長い順にユニーク化。
+    """
+    terms = []
+    kept = st.session_state.get("calendar_events_kept") or []
+    for e in kept:
+        raw = _nfkc(e.get("label_raw","")).strip()
+        if not raw: continue
+        terms.append(raw)
+        # 先頭の国・区切り「・」除去バリアント
+        terms.append(re.sub(r"^[^・･]+[・･]\s*", "", raw))
+        # 括弧内キーワード
+        for m in re.findall(r"[（(]([^）)]+)[）)]", raw):
+            frag = _nfkc(m).strip()
+            if frag:
+                terms.append(frag)
+                for part in re.split(r"[／/・･\s]", frag):
+                    p = _nfkc(part).strip()
+                    if p: terms.append(p)
+        # 大文字略称
+        for m in re.findall(r"\b[A-Z]{2,6}\b", raw):
+            terms.append(m)
+        # 代表的な和語
+        for key in ["消費者物価","雇用統計","小売売上高","国内総生産","政策金利","議事要旨","声明","記者会見","要人発言",
+                    "CPI","PCE","コアPCE","ISM","PMI","GDP","NFP","HICP","IFO","ZEW","JOLTS","原油在庫","OPEC","WTI"]:
+            if key in raw: terms.append(key)
+    # 整理
+    out, seen = [], set()
+    for t in sorted({ _nfkc(x).strip() for x in terms if _nfkc(x).strip() }, key=lambda z: len(z), reverse=True):
+        if len(t) >= 2 and t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+def _mask_sensitive(text: str, extra_terms: list[str] | None = None):
+    """
+    extra_terms: 指標名（IND）プレースホルダ対象。順序・件数は出力検証に使用。
+    """
+    s = str(text or "")
+    seq: list[tuple[str,str]] = []
+    order: list[str] = []
+    counters = {"IND":0, "DATE":0, "TIME":0, "NUM":0}
+
+    def _make_repl(kind: str):
+        def _repl(m: re.Match):
+            ph = f"<{kind}_{counters[kind]}>"
+            seq.append((kind, m.group(0)))
+            order.append(ph)
+            counters[kind] += 1
+            return ph
+        return _repl
+
+    # 1) 指標名（長い順）を先に保護
+    if extra_terms:
+        for term in extra_terms:
+            if not term: continue
+            try:
+                s = re.sub(re.escape(term), _make_repl("IND"), s)
+            except Exception:
+                # まれな正規化不整合はスキップ
+                pass
+
+    # 2) DATE / TIME / NUM
+    s = re.sub(_TOKEN_PATTERNS["DATE"], _make_repl("DATE"), s)
+    s = re.sub(_TOKEN_PATTERNS["TIME"], _make_repl("TIME"), s)
+    s = re.sub(_TOKEN_PATTERNS["NUM"],  _make_repl("NUM"),  s)
+
+    return s, seq, order
+
+def _unmask_and_verify(llm_out: str, seq, order):
+    out = str(llm_out or "")
+    found = re.findall(r"<(DATE|TIME|NUM|IND)_(\d+)>", out)
+    got = [f"<{k}_{i}>" for k, i in found]
+    if order and got != order:
+        return "", False, "placeholder order/count mismatch"
+    # 復元：order の順で置換
+    for idx, ph in enumerate(order):
+        try:
+            token = seq[idx][1]
+        except Exception:
+            return "", False, "placeholder seq mismatch"
+        out = out.replace(ph, token, 1)
+    return out, True, ""
+
+# -------------------------------------------------
+# 3) タイトル調整（18〜28字のソフトフィット）＋重複語尾抑止
+# -------------------------------------------------
+def _dedup_tail(t: str) -> str:
+    # 例：「…に注視かの動向に注視」型の重複抑止
+    t1 = re.sub(r"(に注視|に警戒|の動向|の行方)(か)?(の動向|の行方|に注視|に警戒)+$", r"\1\2", t)
+    return t1
+
 def _fit_title_soft(title: str, target_min=18, target_max=28) -> str:
     t = _clean_text_jp_safe(title).strip("。")
     if not t: return t
-    if target_min <= len(t) <= target_max: return t
+    if target_min <= len(t) <= target_max: return _dedup_tail(t)
     t = re.sub(r"(について|への|に対する|を巡る)$", "", t)
     t = re.sub(r"(に注目|に注視|に警戒|を見極めたい|の動向|の行方)$", "に注視", t)
     t = re.sub(r"(相場|為替|市場)$", "", t)
@@ -8019,19 +8139,35 @@ def _fit_title_soft(title: str, target_min=18, target_max=28) -> str:
         t2 = _clean_text_jp_safe(out).strip("。")
         if 12 <= len(t2) <= 32: t = t2
     if len(t) < target_min: t += "の動向に注視"
-    return t[:target_max]
+    return _dedup_tail(t[:target_max])
 
 # -------------------------------------------------
-# 4) 段落③ 一行保証＋回収補強
+# 4) 段落③ 一行保証＋回収補強＋長さ予算制御
 # -------------------------------------------------
+P3_MAX_CHARS = 220  # ③の目安上限（A/C/F/D 準拠）
+
 def _fit_para3_oneline(cal_src: str, recall: str, period_only: bool=False) -> str:
-    cs = _nfkc(cal_src or "").strip().rstrip("。")
+    cs = (_nfkc(cal_src or "")).strip().rstrip("。")
     rc = _clean_text_jp_safe(recall or "").rstrip("。") or "足もとでは材料待ちの様相が続く"
     pre = f"本日の指標は、{cs}が発表予定となっている" if cs else "本日の指標は、"
     line = (pre + (" " if period_only else "。") + rc + "。").replace("\n","")
     line = re.sub(r"\s+", " ", line); line = re.sub(r"(。)\1+", r"\1", line).strip()
     if not line.endswith("。"): line += "。"
     return line
+
+def _shrink_text_keep_facts(text: str, min_len: int, max_len: int, extra_terms: list[str] | None = None) -> str:
+    base = _clean_text_jp_safe(text or "")
+    if min_len <= _strlen_ja(base) <= max_len or not _llm_ready():
+        return base
+    masked, seq, order = _mask_sensitive(base, extra_terms=extra_terms)
+    prompt = (
+        f"次の日本語文を{min_len}〜{max_len}字程度に自然に要約してください。"
+        "数値/日付/時刻/指標名は絶対に変更しないため、同じプレースホルダを保ってください。"
+        "助言や断定は禁止。末尾は句点：\n" + masked
+    )
+    out = _call_llm_with_flags(prompt, max_tokens=480, temperature=0.2)
+    unmasked, ok, _ = _unmask_and_verify(out or masked, seq, order)
+    return _strict_style_guard(unmasked if ok and unmasked else base)
 
 # -------------------------------------------------
 # 5) RSS（Google News）
@@ -8101,7 +8237,205 @@ def _fetch_fx_related_news(max_items=10):
     return items
 
 # -------------------------------------------------
-# 6) ペア変更でキャッシュ破棄
+# 6) イベント（経済指標）抽出・重要度スコアリング・自動選抜（D / I / J）
+# -------------------------------------------------
+def _events_df_like():
+    for k in ["selected", "edited_df", "df_display"]:
+        df = globals().get(k)
+        if df is not None: return df
+    for k in ["events_df","fxon_events_df","econ_events_df","events_table"]:
+        df = st.session_state.get(k)
+        if df is not None: return df
+    for k in ["events","fxon_events","econ_events"]:
+        arr = st.session_state.get(k)
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            return arr
+    return None
+
+def _pick(row, keys, default=""):
+    for k in keys:
+        if isinstance(row, dict) and k in row:
+            return row.get(k, default)
+        try:
+            return row[k]
+        except Exception:
+            continue
+    return default
+
+def _parse_dt_jst(row) -> datetime | None:
+    cand = _pick(row, ["datetime","start_at","start","local_time","time","date"])
+    s = str(cand or "").strip()
+    if not s: return None
+    s2 = _nfkc(s)
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2}).*?([0-2]?\d):([0-5]\d)", s2)
+    if m:
+        y,mn,d,hh,mm = map(int, m.groups())
+        try: return datetime(y,mn,d,hh,mm, tzinfo=_JST)
+        except Exception: pass
+    m = re.search(r"T([0-2]?\d):([0-5]\d)", s2)
+    if m:
+        hh,mm = map(int, m.groups())
+        base = _now_jst().date()
+        return datetime(base.year, base.month, base.day, hh, mm, tzinfo=_JST)
+    m = re.search(r"\b([0-2]?\d):([0-5]\d)\b", s2)
+    if m:
+        hh,mm = map(int, m.groups())
+        base = _now_jst().date()
+        return datetime(base.year, base.month, base.day, hh, mm, tzinfo=_JST)
+    return None
+
+def _fmt_hhmm(dt: datetime | None, fallback: str = "") -> str:
+    if isinstance(dt, datetime):
+        return f"{int(dt.hour)}:{int(dt.minute):02d}"
+    m = re.search(r"([0-2]?\d):([0-5]\d)", str(fallback))
+    if m:
+        return f"{int(m.group(1))}:{int(m.group(2)):02d}"
+    return ""
+
+# 重要度スコア（通貨ペア文脈で加点）
+_KEY_SCORES = [
+    (r"(FOMC|連邦公開市場委員会|政策金利|利上げ|利下げ|議事要旨|声明|記者会見|要人発言|パウエル|ラガルド|植田|総裁)", 95),
+    (r"(CPI|消費者物価|PCE|コアPCE|HICP|インフレ)", 90),
+    (r"(雇用統計|NFP|失業率|賃金|JOLTS)", 88),
+    (r"(ISM|PMI|製造業|非製造業|サービス業)", 78),
+    (r"(小売売上高|小売販売|GDP|国内総生産)", 82),
+    (r"(原油在庫|EIA|API|OPEC|WTI)", 76),
+    (r"(入札|T[- ]?Note|国債|利回り)", 72),
+    (r"(貿易収支|経常収支|財政収支)", 60),
+    (r"(NFIB|MBA|レッドブック|卸売在庫|マネーサプライ)", 40),
+]
+
+_LOW_IMPORT_PAT = re.compile(r"(NFIB|MBA|レッドブック|卸売在庫|マネーサプライ)", re.I)
+
+def _pair_bias(pair: str, label: str) -> int:
+    p = (pair or "").upper()
+    lb = _nfkc(label)
+    b = 0
+    if "USD" in p or "ドル" in p:
+        if "米" in lb: b += 8
+    if "JPY" in p or "円" in p:
+        if "日" in lb: b += 8
+    if "EUR" in p or "ユーロ" in p:
+        if "欧" in lb or "ユーロ" in lb: b += 6
+    if "GBP" in p or "ポンド" in p:
+        if "英" in lb: b += 6
+    return b
+
+def _importance_score(label: str, pair: str) -> int:
+    score = 0
+    for pat, w in _KEY_SCORES:
+        if re.search(pat, label, flags=re.I):
+            score = max(score, w)
+    score += _pair_bias(pair, label)
+    return score
+
+def _event_label_raw(r: dict) -> str:
+    """
+    ラベルの“原文”を取得（時刻以外は一切整形しない）
+    """
+    for k in ["line","display","text","title","指標","name"]:
+        if k in r and str(r[k]).strip():
+            return str(r[k])
+    return ""
+
+def _select_events_for_window(max_items: int = 6):
+    """
+    本日0:00〜翌日18:00（JST）の範囲で、低重要度を除外しつつ重要順に最大max_items。
+    監査用に events_in/kept/dropped を返す。
+    """
+    src = _events_df_like()
+    events_in, kept, dropped = [], [], []
+    if src is None:
+        return events_in, kept, dropped
+
+    if hasattr(src, "to_dict"):
+        try: records = src.to_dict(orient="records")
+        except Exception: records = []
+    else:
+        records = list(src)
+
+    start, end = _window_bounds_jst()
+    pair = str(st.session_state.get("pair","") or "")
+
+    # 収集（同一行の二重連結を防止：H:MM に<原文> の完全一致で一意化）
+    seen_lines = set()
+    for r in records:
+        dt = _parse_dt_jst(r)
+        raw = _event_label_raw(r)
+        if not dt or not raw: 
+            if not dt:
+                dropped.append({"reason":"no-datetime", "row": r})
+            elif not raw:
+                dropped.append({"reason":"no-label", "row": r})
+            continue
+        hhmm = _fmt_hhmm(dt, _pick(r, ["time","local_time","datetime","start_at","start"], ""))  # H:MM 固定
+        if not hhmm:
+            dropped.append({"reason":"no-time", "row": r})
+            continue
+        line = f"{hhmm} に{raw}"
+
+        # 範囲・重要度の前に、完全同一行の重複をドロップ
+        if line in seen_lines:
+            dropped.append({"reason":"duplicate-line", "line": line})
+            continue
+        seen_lines.add(line)
+
+        rec = {"dt": dt, "label_raw": raw, "line": line}
+        if not (start <= dt <= end):
+            dropped.append({"reason":"out-of-range", "line": line, "dt": dt})
+            continue
+        if _LOW_IMPORT_PAT.search(raw or ""):
+            dropped.append({"reason":"low-importance", "line": line, "dt": dt})
+            continue
+        sc = _importance_score(raw, pair)
+        rec["_score"] = sc
+        events_in.append(rec)
+
+    # スコア降順→時刻昇順で上位
+    events_in.sort(key=lambda x: (-x["_score"], x["dt"]))
+    kept = events_in[:max_items]
+    # 上限超過のドロップ理由
+    for x in events_in[max_items:]:
+        dropped.append({"reason":"over-max-items", "line": x["line"], "score": x["_score"]})
+    return events_in, kept, dropped
+
+def _build_calendar_events_and_line(max_items: int = 6):
+    """
+    ③の“イベント列”生成。長さが超過する場合は重要度下位から段階的に間引く。
+    """
+    events_in, kept, dropped = _select_events_for_window(max_items=max_items)
+
+    # 連結前の二重ガード（順序保持で一意化）
+    dedup_lines = set()
+    evs = []
+    for e in kept:
+        ln = e.get("line","")
+        if ln in dedup_lines:
+            dropped.append({"reason":"duplicate-line-post", "line": ln})
+            continue
+        dedup_lines.add(ln)
+        evs.append(e)
+
+    def _join_lines(evlist):
+        return "、".join([e["line"] for e in evlist])
+
+    base_prefix = "本日の指標は、"
+    base_suffix = "が発表予定となっている"
+    while True:
+        cal = _join_lines(evs)
+        front_len = _strlen_ja(base_prefix + cal + base_suffix + "。")
+        if front_len <= P3_MAX_CHARS or len(evs) <= 1:
+            break
+        drop_ev = evs.pop()  # 重要度下位（末尾）
+        dropped.append({"reason":"too-long-pruned", "line": drop_ev["line"]})
+    return events_in, evs, dropped, _join_lines(evs)
+
+def _build_points_from_selected(top_k: int = 2) -> list[str]:
+    _, kept, _, _ = _build_calendar_events_and_line(max_items=max(10, top_k))
+    return [e["line"] for e in kept[:top_k]]
+
+# -------------------------------------------------
+# 7) ペア変更でキャッシュ破棄
 # -------------------------------------------------
 _cur_pair = str(st.session_state.get("pair", ""))
 if st.session_state.get("__pair_prev_ai_title") != _cur_pair:
@@ -8115,7 +8449,7 @@ if st.session_state.get("__pair_prev_ai_title") != _cur_pair:
         except Exception: pass
 
 # -------------------------------------------------
-# 7) ニュース見出しクレンジング
+# 8) ニュース見出しクレンジング
 # -------------------------------------------------
 def _clean_news_title_for_prompt(t: str) -> str:
     s = _nfkc(t)
@@ -8137,7 +8471,7 @@ def _strip_media_brackets(s: str) -> str:
     return r
 
 # -------------------------------------------------
-# 8) タイトル＆回収（AI）+ タイトル長フィット
+# 9) タイトル＆回収（AI）+ タイトル強制適用
 # -------------------------------------------------
 def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_news_list: list[dict],
                          base_title_tail: str = "", pair_name: str = ""):
@@ -8163,7 +8497,6 @@ def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_
         st.error("🔴 タイトル案のAI生成に失敗しました。接続やキー、ネットワークを確認してください。")
         return "", ""
 
-    # ロバストパース
     def _parse_title_recall(text: str) -> tuple[str, str]:
         s = _clean_text_jp_safe(text)
         s = re.sub(r"^```.*?\n", "", s, flags=re.S)
@@ -8190,12 +8523,15 @@ def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_
     return title, recall
 
 # -------------------------------------------------
-# 9) Step6 UI（既存維持）
+# 10) Step6 UI（自動選抜・AI題の強制適用・状態表示）
 # -------------------------------------------------
 with st.container():
     st.markdown("#### AI補正：タイトル/回収 と 重要ニュース（任意）")
     _llm_lamp_inline()
     st.caption("手入力ニュースを優先。AI候補は参考（RSSのみ使用／外部ブラウズ不要）。")
+
+    st.checkbox("本日の指標（③）を自動選抜（本日0:00〜翌日18:00 JST）", value=st.session_state.get("calendar_autoselect", True), key="calendar_autoselect")
+    st.number_input("③の最大件数（重要順）", min_value=3, max_value=10, value=int(st.session_state.get("calendar_max_items", 6) or 6), step=1, key="calendar_max_items")
 
     if "__pending_title_input" in st.session_state:
         st.session_state["title_ai"] = st.session_state["__pending_title_input"]
@@ -8260,18 +8596,22 @@ with st.container():
     else:
         st.info("『AIニュース（RSS）を取得/更新』を押すと候補が表示されます。")
 
-    colA, colB, colC = st.columns([1,1,2])
+    colA, colB = st.columns([1,3])
     with colA:
-        gen_title = st.button("AIでタイトル案を生成", key="btn_ai_title")
+        gen_title = st.button("AIでタイトル案を生成 & 適用", key="btn_ai_title")
     with colB:
-        apply_title = st.button("↑ このタイトルを適用", key="btn_apply_title")
-    with colC:
         st.checkbox("③は『回収文のみ句点』にする",
                     value=st.session_state.get("recall_period_only", False),
                     key="recall_period_only")
 
     if gen_title:
         if _require_llm("タイトル案のAI生成"):
+            # ③ 自動選抜を先に反映
+            if st.session_state.get("calendar_autoselect", True):
+                _, kept_evs, dropped_evs, cal_line = _build_calendar_events_and_line(max_items=int(st.session_state.get("calendar_max_items",6)))
+                st.session_state["calendar_events_kept"] = kept_evs
+                st.session_state["calendar_events_dropped"] = dropped_evs
+                st.session_state["calendar_line"] = cal_line
             preview_all = "\n".join([str(globals().get("p1","")), str(globals().get("p2","")), str(st.session_state.get("calendar_line",""))])[:1200]
             picked = []
             for i in st.session_state.get("ai_news_selected_idx", []):
@@ -8282,28 +8622,33 @@ with st.container():
                                         str(st.session_state.get("title_tail") or ""),
                                         str(st.session_state.get("pair","")))
             if t:
-                st.session_state["ai_title_draft_text"] = t
+                # 強制適用（B）
+                t_fit = _fit_title_soft(t)
+                st.session_state["title_ai"] = t_fit
+                st.session_state["ai_title_draft_text"] = t_fit
                 st.session_state["ai_recall_draft_text"] = r
-                st.success("AIがタイトル案と回収文を生成しました。")
+                st.session_state["__pending_title_input"] = t_fit
+                st.session_state["__pending_recall_input"] = _strip_media_brackets(_clean_text_jp_safe(r).rstrip("。"))
+                st.session_state["title_source"] = "ai-applied"
+                st.success("AIがタイトル案と回収文を生成・適用しました。")
             _ai_usage_lamp_inline()
 
-    st.text_input("AI提案タイトル（編集可）",
-                  value=st.session_state.get("ai_title_draft_text", ""), key="ai_title_draft_text")
-    st.text_area("AI提案：タイトル回収（編集可・句点なし推奨）",
-                 value=st.session_state.get("ai_recall_draft_text", ""), height=66, key="ai_recall_draft_text")
+    # 状態表示：AIタイトル適用中
+    st.info(f"AIタイトル適用中：{_fit_title_soft(st.session_state.get('title_ai','')) or '（未生成）'}")
 
-    if apply_title:
-        new_t = _clean_text_jp_safe(st.session_state.get("ai_title_draft_text","")).strip("。")
-        if new_t:
-            globals()["title"] = _fit_title_soft(new_t)
-            st.session_state["title"] = _fit_title_soft(new_t)
-            st.session_state["__pending_title_input"] = _fit_title_soft(new_t)
-        new_r_raw = _clean_text_jp_safe(st.session_state.get("ai_recall_draft_text","")).rstrip("。")
-        st.session_state["__pending_recall_input"] = _strip_media_brackets(new_r_raw)
-        st.success("AIタイトル＆回収を適用しました。プレビューに反映します。")
-        st.rerun()
+    # 監査用：イベント候補と採用結果
+    with st.expander("③ 重要イベント：候補→採用→プレビュー", expanded=False):
+        try:
+            evs_in, evs_kept, evs_drop, cal_line = _build_calendar_events_and_line(max_items=int(st.session_state.get("calendar_max_items",6)))
+            st.write({"events_in": [e["line"] for e in evs_in],
+                      "events_kept": [e["line"] for e in evs_kept],
+                      "events_dropped": evs_drop,
+                      "preview_line": cal_line})
+        except Exception:
+            st.caption("イベント候補の構築に失敗しました。")
+
 # -------------------------------------------------
-# 10) Pre-AI 文面の準備（既存ロジック踏襲）
+# 11) Pre-AI 文面の準備（③自動選抜）
 # -------------------------------------------------
 ttl_display = (str(globals().get("title", "")).strip() or str(globals().get("default_title", "")).strip())
 if not ttl_display:
@@ -8312,118 +8657,23 @@ if not ttl_display:
     ttl_display = f"{base}の方向感に{tail}"
 ttl_display = _fit_title_soft(_clean_text_jp_safe(ttl_display))
 
-# ポイント（FxON）
-def _events_df_like():
-    for k in ["selected", "edited_df", "df_display"]:
-        df = globals().get(k)
-        if df is not None: return df
-    for k in ["events_df","fxon_events_df","econ_events_df","events_table"]:
-        df = st.session_state.get(k)
-        if df is not None: return df
-    for k in ["events","fxon_events","econ_events"]:
-        arr = st.session_state.get(k)
-        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-            return arr
-    return None
+# ③ 自動選抜を反映
+if st.session_state.get("calendar_autoselect", True):
+    _, kept_evs, dropped_evs, cal_line = _build_calendar_events_and_line(max_items=int(st.session_state.get("calendar_max_items",6)))
+    st.session_state["calendar_events_kept"] = kept_evs
+    st.session_state["calendar_events_dropped"] = dropped_evs
+    st.session_state["calendar_line"] = cal_line
 
-def _pick(row, keys, default=""):
-    for k in keys:
-        if isinstance(row, dict) and k in row:
-            return row.get(k, default)
-        try:
-            return row[k]
-        except Exception:
-            continue
-    return default
+# --- 「本日のポイント」＝上位2件
+def _norm_point_line(s: str) -> str:
+    return re.sub(r'^\s*([0-9]{1,2}:[0-9]{2})\s*に\s*', r'\1 に', _nfkc(s))
 
-def _extract_hhmm(v) -> str:
-    s = str(v or "").strip()
-    m = re.search(r"(\d{1,2}):(\d{2})", s)
-    if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-    m = re.search(r"T(\d{2}):(\d{2})", s)
-    if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-    m = re.search(r"\b(\d{2})(\d{2})\b", s)
-    if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-    return ""
-
-def _strip_country_prefix(title: str) -> str:
-    return re.sub(r"^\s*(米|英|日|欧|独|仏|豪|NZ|加|南ア|スイス|中国)\s*[・･]\s*", "", str(title or "").strip())
-
-def _tidy_label(name: str) -> str:
-    s = _nfkc(name or "")
-    s = re.sub(r"\s+([)）])", r"\1", s)
-    s = re.sub(r"([（(])\s+", r"\1", s)
-    return s.strip()
-
-_JA_NAME_TO_ABBR = {
-    "米": "米","米国": "米","アメリカ": "米",
-    "英": "英","英国": "英","イギリス": "英",
-    "日": "日","日本": "日",
-    "欧": "欧","ユーロ圏": "欧","欧州": "欧","ユーロエリア":"欧",
-    "独": "独","ドイツ": "独",
-    "仏": "仏","フランス": "仏",
-    "伊": "伊","イタリア": "伊",
-    "西": "西","スペイン": "西",
-    "スイス":"スイス",
-    "加":"加","カナダ":"加",
-    "豪":"豪","豪州":"豪","オーストラリア":"豪",
-    "NZ":"NZ","ニュージーランド":"NZ",
-    "中国":"中国","中":"中国",
-    "南ア":"南ア","南アフリカ":"南ア",
-}
-def _abbr_from_region_value(v: str) -> str:
-    s = _nfkc(v).strip()
-    if not s: return ""
-    if s in _JA_NAME_TO_ABBR:
-        return _JA_NAME_TO_ABBR[s]
-    return ""
-
-def _abbr_from_row(ev: dict) -> str:
-    cand_keys = ("地域","国","国コード","region","region_code","regionCode","country","country_name_ja","country_ja","country_code","countryCode","ccy","iso2","iso3","currency")
-    for k in cand_keys:
-        if k in ev and ev[k]:
-            ab = _abbr_from_region_value(ev[k])
-            if ab: return ab
-    return ""
-
-def _normalize_time_str(s: str) -> str:
-    try:
-        h, m = str(s).split(":"); return f"{int(h):02d}:{int(m):02d}"
-    except Exception:
-        return str(s)
-
-def _build_points_from_fxon() -> list[str]:
-    src = _events_df_like()
-    if src is None: return []
-    records = []
-    if hasattr(src, "to_dict"):
-        try: records = src.to_dict(orient="records")
-        except Exception: records = []
-    else:
-        records = list(src)
-    pts = []
-    for r in records:
-        t_raw = _pick(r, ["時刻","time","local_time","datetime","start_at","start"])
-        title = _pick(r, ["指標","indicator","title","name"], "")
-        abbr  = _abbr_from_row(r)
-        hhmm  = _extract_hhmm(t_raw)
-        if not title or not hhmm: continue
-        ttl = _tidy_label(_strip_country_prefix(title))
-        pts.append((hhmm, f"{_normalize_time_str(hhmm)} に{(abbr + '・') if abbr else ''}{ttl}"))
-    pts.sort(key=lambda x: (int(x[0].split(':')[0]), int(x[0].split(':')[1])))
-    out = [re.sub(r'([0-2]?\d:[0-5]\d)\s*に\s*', r'\1 に', p[1]) for p in pts[:2]]
-    return out
-
-_pts_fx = _build_points_from_fxon()
+_pts_fx = _build_points_from_selected(top_k=2)
 if _pts_fx and not st.session_state.get("points_tags_v2"):
     st.session_state["points_tags_v2"] = _pts_fx
 
-def _norm_point_line(s: str) -> str:
-    return re.sub(r'^\s*([0-9]{1,2}:[0-9]{2})\s*に\s*', r'\1 に', _nfkc(s))
 points = list(st.session_state.get("points_tags_v2", []) or [])[:2]
 points = [_norm_point_line(p) for p in points]
-point1 = points[0] if len(points) > 0 else ""
-point2 = points[1] if len(points) > 1 else ""
 
 def _mentions_points(s: str, items: list[str]) -> bool:
     if not s or not items: return True
@@ -8442,7 +8692,7 @@ if _pts_short and not _mentions_points(globals().get("p1", ""), points):
 else:
     p1 = str(globals().get("p1", "") or "")
 
-# 段落②の合成（既存踏襲）
+# 段落②：骨子生成と最低限の充填
 def pad_para2(para2: str, min_chars: int = 180) -> str:
     base = str(para2 or "").strip()
     if len(base) >= min_chars: return base
@@ -8464,17 +8714,36 @@ def _dedup_d1_h4_phrasing(s: str) -> str:
     t = re.sub(r"([。])\1+", r"\1", t)
     return t
 
+# ② 冒頭定型の強制（常に所定の文言で開始）
+def _enforce_para2_lead(text: str, pair_name: str) -> str:
+    d1 = st.session_state.get("d1_imp", "横ばい")
+    h4 = st.session_state.get("h4_imp", "横ばい")
+    lead = f"為替市場は、{pair_name}は日足は{d1}、4時間足は{h4}。"
+    s = _clean_text_jp_safe(text or "")
+    # 既に「為替市場は、」で始まるが、定型に合致しない場合は冒頭1文を置換
+    if re.match(r"^為替市場は、", s):
+        if not re.match(r"^為替市場は、\S+は日足は.+?、4時間足は.+?。", s):
+            s = re.sub(r"^為替市場は、.*?。", lead, s, count=1)
+        return s
+    # 先頭が定型でなければ前置き
+    return (lead + s.lstrip())
+
 def _refine_para2_structured(p2_text: str, pair_name: str) -> str:
-    base = _clean_text_jp_safe(p2_text)
+    base = _clean_text_jp_safe(p2_text or "")
     try:
+        # マスク（数値/日付/時刻/指標名）した上でLLMへ
+        ind_terms = _collect_indicator_terms()
+        masked, seq, order = _mask_sensitive(base, extra_terms=ind_terms)
         prompt = (
             "次の段落②を『日足→4時間足』の順で整理し、反復を避け、自然な日本語に整えてください。"
-            "助言はしない・句点で終える・専門語（RSI/ボリンジャーバンド/SMA/EMA）は保持。\n"
-            f"【通貨ペア】{pair_name}\n【段落②】\n{base}"
+            "助言はしない・句点で終える・専門語（RSI/ボリンジャーバンド/SMA/EMA）は保持。"
+            "数値/日付/時刻/指標名はプレースホルダを維持：\n"
+            f"【通貨ペア】{pair_name}\n【段落②】\n{masked}"
         )
         out = _call_llm_with_flags(prompt, max_tokens=520, temperature=0.2)
         if isinstance(out, str) and out.strip():
-            base = out.strip()
+            unmasked, ok, _ = _unmask_and_verify(out, seq, order)
+            base = unmasked if ok and unmasked else base
     except Exception:
         pass
     s = _normalize_tf_words(base)
@@ -8501,11 +8770,15 @@ def _p2_ai_postprocess(text: str) -> str:
     t = _clean_text_jp_safe(str(text or ""))
     t = t.replace("4時間足では 為替市場は、", "4時間足では ")
     t = re.sub(r"(為替市場は、[^。]+。)\s*\1", r"\1", t)
+    # 装飾除去（J）
+    t = re.sub(r"[【［\[][^】］\]]+[】］\]]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
+    # ② 冒頭定型の強制（後工程でも崩れない二重ガード）
+    t = _enforce_para2_lead(t, _cur_pair)
     if not t.endswith("。"): t += "。"
     return _strict_style_guard(t)
 
-# --- ② AI適用
+# --- ② AI適用（マスキング＋復元）
 def _apply_ai_to_p2_only():
     refined = _refine_para2_structured(ai_p2, _cur_pair)
     refined = pad_para2(refined, 180)
@@ -8517,25 +8790,51 @@ def _apply_ai_to_p2_with_ai():
     _apply_ai_to_p2_only()
     base = st.session_state.get("p2_ai") or ""
     src  = _p2_ai_postprocess(base)
+    ind_terms = _collect_indicator_terms()
+    masked, seq, order = _mask_sensitive(src, extra_terms=ind_terms)
     prompt = (
         "次の『段落②（為替テクニカル）』を、事実関係を変えずに自然な日本語へ整えてください。"
-        "助言・断定は避け、重複表現を削り、句読点・用語を整えます。末尾は句点。\n---\n" + src
+        "助言・断定は避け、重複表現を削り、句読点・用語を整えます。"
+        "数値/日付/時刻/指標名はプレースホルダを維持。末尾は句点：\n---\n" + masked
     )
     tmp = _call_llm_with_flags(prompt, max_tokens=600, temperature=0.2)
-    out = _p2_ai_postprocess(tmp or src)
+    out_raw = tmp or masked
+    unmasked, ok, _ = _unmask_and_verify(out_raw, seq, order)
+    out = _p2_ai_postprocess(unmasked if ok and unmasked else src)
     st.session_state["p2_ai"] = out
 
-# --- ① AI適用
+# --- ① AI適用（マスキング＋復元）
 def _apply_ai_to_p1_only():
     if not _require_llm("段落①のAI補正"): return
+    base = _clean_text_jp_safe(ai_p1)
+    ind_terms = _collect_indicator_terms()
+    masked, seq, order = _mask_sensitive(base, extra_terms=ind_terms)
     out = _call_llm_with_flags(
-        "次の段落①を簡潔に自然文へ整えてください（助言なし・末尾句点・数値や固有名詞を維持）：\n" + _clean_text_jp_safe(ai_p1),
+        "次の段落①を簡潔に自然文へ整えてください（助言なし・末尾句点・プレースホルダ維持：数値/日付/時刻/指標名）：\n" + masked,
         max_tokens=480, temperature=0.2
     )
     if out:
-        st.session_state["p1_ai"] = _strict_style_guard(out).rstrip("。") + "。"
+        unmasked, ok, _ = _unmask_and_verify(out, seq, order)
+        fixed = _strict_style_guard(unmasked if ok and unmasked else base).rstrip("。") + "。"
+        st.session_state["p1_ai"] = fixed
 
-# --- タイトル/③ AI適用
+# --- タイトル/③ AI適用＋長さ管理
+def _expand_recall_if_short(recall: str, ttl: str) -> str:
+    r = _strip_media_brackets(_clean_text_jp_safe(recall or "").rstrip("。"))
+    if 50 <= _strlen_ja(r) <= 90 or not _llm_ready():
+        return r
+    prompt = (
+        "次の文を、意味を変えずに日本語で50〜90字程度に自然に拡張してください。"
+        "断定・助言は禁止。数値・指標名に触れない。末尾は句点：\n"
+        f"タイトル: {ttl}\n"
+        f"文: {r or ttl}"
+    )
+    out = _call_llm_with_flags(prompt, max_tokens=120, temperature=0.2)
+    r2 = _clean_text_jp_safe(out or r).rstrip("。")
+    if _strlen_ja(r2) < 40:
+        return r
+    return r2
+
 def _apply_ai_to_title_and_p3():
     if not _require_llm("タイトル/③のAI補正"): return
     ttl = _fit_title_soft(ai_title)
@@ -8545,6 +8844,14 @@ def _apply_ai_to_title_and_p3():
     )
     if out:
         ttl = _fit_title_soft(out)
+
+    # ③再構築
+    if st.session_state.get("calendar_autoselect", True):
+        _, kept_evs, dropped_evs, cal_line = _build_calendar_events_and_line(max_items=int(st.session_state.get("calendar_max_items",6)))
+        st.session_state["calendar_events_kept"] = kept_evs
+        st.session_state["calendar_events_dropped"] = dropped_evs
+        st.session_state["calendar_line"] = cal_line
+
     preview_for_recall_ai = "\n".join([
         f"ポイント: {', '.join(x for x in (st.session_state.get('points_tags_v2') or []) if x)}",
         f"段落①: {ai_p1}",
@@ -8565,18 +8872,35 @@ def _apply_ai_to_title_and_p3():
             )
             out2 = _call_llm_with_flags(prompt, max_tokens=220, temperature=0.2)
             if out2: recall = out2.strip().rstrip("。")
-        if not recall:
-            st.error("🔴 タイトル回収文のAI生成に失敗しました。")
-            recall = _clean_text_jp_safe(ttl).rstrip("。")
-        recall = _strip_media_brackets(recall)
-        return _fit_para3_oneline(cs, recall, period_only)
+        recall = _expand_recall_if_short(recall, ttl)
+
+        # 一旦組み立て
+        p3 = _fit_para3_oneline(cs, recall, period_only)
+        # 文字数が上限を超える場合：まずイベントを間引く→それでも超過なら回収文を短縮（D）
+        if _strlen_ja(p3) > P3_MAX_CHARS:
+            evs = list(st.session_state.get("calendar_events_kept") or [])
+            dropped = list(st.session_state.get("calendar_events_dropped") or [])
+            while _strlen_ja(p3) > P3_MAX_CHARS and len(evs) > 1:
+                drop = evs.pop()
+                dropped.append({"reason":"too-long-after-recall", "line": drop.get("line")})
+                cs2 = "、".join([e["line"] for e in evs])
+                p3 = _fit_para3_oneline(cs2, recall, period_only)
+            st.session_state["calendar_events_kept"] = evs
+            st.session_state["calendar_events_dropped"] = dropped
+            st.session_state["calendar_line"] = "、".join([e["line"] for e in evs])
+        if _strlen_ja(p3) > P3_MAX_CHARS and _llm_ready():
+            ind_terms = _collect_indicator_terms()
+            p3 = _fit_para3_oneline(st.session_state.get("calendar_line",""), _shrink_text_keep_facts(recall, 50, 70, extra_terms=ind_terms), period_only)
+        return p3
+
     cal_line_src = str(st.session_state.get("calendar_line", "") or "").strip()
     p3 = _make_cal_plus_recall(cal_line_src, ttl, preview_for_recall_ai)
     st.session_state["__pending_title_input"] = ttl
     st.session_state["p3_ai"] = p3
+    st.session_state["title_source"] = "ai-applied"
 
 # -------------------------------------------------
-# 11) Pre-AI / AI後 の確定と描画
+# 12) Pre-AI / AI後 の確定と描画・分量均し
 # -------------------------------------------------
 para1_pre = _strict_style_guard(_clean_text_jp_safe(str(p1).strip()))
 if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
@@ -8590,7 +8914,10 @@ if not p2_src:
     p2_src = _clean_text_jp_safe(f"為替市場は、{_cur_pair}は日足は{d1}、4時間足は{h4}。")
 para2_pre = pad_para2(p2_src, 180)
 para2_pre = _strict_style_guard(para2_pre)
+# ② 冒頭定型の強制（この段階で必ず定型で開始）
+para2_pre = _enforce_para2_lead(para2_pre, _cur_pair)
 
+# ブレークポイント取り込み（各1本まで）
 def _fallback_bp_from_ui():
     import re as _re
     def _pick_first_num(*keys):
@@ -8616,9 +8943,12 @@ if (not up_txt or up_txt == "0.00") and (not dn_txt or dn_txt == "0.00"):
     up_txt = up_txt if (up_txt and up_txt != "0.00") else f_up
     dn_txt = dn_txt if (dn_txt and dn_txt != "0.00") else f_dn
 
+# 明示的に各1本制限
 bp_lines = []
 if up_txt and up_txt != "0.00": bp_lines.append(f"上値{up_txt}付近の上抜けの有無をまずは見極めたい。")
 if dn_txt and dn_txt != "0.00": bp_lines.append(f"下値{dn_txt}付近の下抜けには警戒したい。")
+bp_lines = bp_lines[:2]
+
 for bp in bp_lines:
     if bp and bp not in para2_pre:
         if para2_pre and not para2_pre.endswith("。"): para2_pre += "。"
@@ -8641,8 +8971,27 @@ def _make_cal_plus_recall_pre(cal_src: str, ttl: str, preview_text: str = None) 
     cs = re.sub(r"[。．]+$", "", cs)
     period_only = bool(st.session_state.get("recall_period_only", False))
     recall = str(st.session_state.get("ai_title_recall_final", "") or "").strip()
-    recall = _strip_media_brackets(recall)
-    return _fit_para3_oneline(cs, recall, period_only)
+    recall = _expand_recall_if_short(recall, ttl)
+    p3 = _fit_para3_oneline(cs, recall, period_only)
+    # 上限超過時のイベント間引き
+    if _strlen_ja(p3) > P3_MAX_CHARS:
+        evs = list(st.session_state.get("calendar_events_kept") or [])
+        dropped = list(st.session_state.get("calendar_events_dropped") or [])
+        while _strlen_ja(p3) > P3_MAX_CHARS and len(evs) > 1:
+            drop = evs.pop()
+            dropped.append({"reason":"too-long-pre", "line": drop.get("line")})
+            cs2 = "、".join([e["line"] for e in evs])
+            p3 = _fit_para3_oneline(cs2, recall, period_only)
+        st.session_state["calendar_events_kept"] = evs
+        st.session_state["calendar_events_dropped"] = dropped
+        st.session_state["calendar_line"] = "、".join([e["line"] for e in evs])
+    return p3
+
+if st.session_state.get("calendar_autoselect", True):
+    _, kept_evs, dropped_evs, cal_line = _build_calendar_events_and_line(max_items=int(st.session_state.get("calendar_max_items",6)))
+    st.session_state["calendar_events_kept"] = kept_evs
+    st.session_state["calendar_events_dropped"] = dropped_evs
+    st.session_state["calendar_line"] = cal_line
 
 cal_line_src = str(st.session_state.get("calendar_line", "") or "").strip()
 _preview_for_recall_pre = "\n".join([
@@ -8652,11 +9001,19 @@ _preview_for_recall_pre = "\n".join([
 ])
 para3_pre = _make_cal_plus_recall_pre(cal_line_src, ttl_display, _preview_for_recall_pre)
 
-# 3) AI後（stateから） + 最低限の整形
+# 3) AI後（stateから）
 ai_title = _fit_title_soft(st.session_state.get("title_ai", ttl_display))
 ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", para1_pre))
 ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", para2_pre))
 ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", para3_pre))
+
+# 3.5) 分量を“同程度”に（C/F）：①②は過長時のみ圧縮、③が短い日は相対均しで少しだけ圧縮
+ind_terms_for_balance = _collect_indicator_terms()
+ai_p1 = _shrink_text_keep_facts(ai_p1, 180, 220, extra_terms=ind_terms_for_balance)
+ai_p2 = _shrink_text_keep_facts(ai_p2, 180, 220, extra_terms=ind_terms_for_balance)
+if _strlen_ja(ai_p3) < 160:
+    ai_p1 = _shrink_text_keep_facts(ai_p1, 170, 200, extra_terms=ind_terms_for_balance)
+    ai_p2 = _shrink_text_keep_facts(ai_p2, 170, 200, extra_terms=ind_terms_for_balance)
 
 with st.expander("AI補正（個別適用）", expanded=False):
     c1, c2, c3, c4 = st.columns(4)
@@ -8678,11 +9035,11 @@ with st.expander("AI補正（個別適用）", expanded=False):
                 _apply_ai_to_p1_only(); _apply_ai_to_p2_with_ai(); _apply_ai_to_title_and_p3()
                 st.success("全段落＋タイトルをAIで補正しました。"); _ai_usage_lamp_inline()
 
-# 4) 再同期
+# 4) 再同期（AIタイトル強制優先）
 ai_title = _fit_title_soft(st.session_state.get("title_ai", ttl_display))
-ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", para1_pre))
-ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", para2_pre))
-ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", para3_pre))
+ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", ai_p1))
+ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", ai_p2))
+ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", ai_p3))
 
 # 5) プレビュー描画（互換）
 def _render_report_safe(title, p1, p2, p3, points=None):
@@ -8708,11 +9065,20 @@ def _compact_final_text(s: str, ttl: str) -> str:
     t = re.sub(r"([。])\1+", r"\1", t)
     return t.strip()
 
-pre_joined = _render_report_safe(ttl_display, para1_pre, para2_pre, para3_pre, points)
-ai_joined  = _render_report_safe(ai_title,    ai_p1,    ai_p2,    ai_p3,    points)
+pre_joined = _render_report_safe(ai_title, para1_pre, para2_pre, para3_pre, points)  # タイトルはAI優先
+ai_joined  = _render_report_safe(ai_title, ai_p1, ai_p2, ai_p3, points)
 
-pre_text = (_compact_final_text(pre_joined, ttl_display) + "\n\n" + _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final",""), bool(st.session_state.get("recall_period_only", False)))).strip()
-ai_text  = (_compact_final_text(ai_joined,  ai_title)   + "\n\n" + _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final","") or ai_p3, bool(st.session_state.get("recall_period_only", False)))).strip()
+pre_text = (_compact_final_text(pre_joined, ai_title) + "\n\n" + _fit_para3_oneline(
+    st.session_state.get("calendar_line",""),
+    st.session_state.get("ai_title_recall_final",""),
+    bool(st.session_state.get("recall_period_only", False))
+)).strip()
+
+ai_text  = (_compact_final_text(ai_joined,  ai_title)   + "\n\n" + _fit_para3_oneline(
+    st.session_state.get("calendar_line",""),
+    st.session_state.get("ai_title_recall_final","") or ai_p3,
+    bool(st.session_state.get("recall_period_only", False))
+)).strip()
 
 tab1, tab2 = st.tabs(["Pre-AI版プレビュー", "AI後プレビュー"])
 with tab1:
@@ -8727,13 +9093,13 @@ with tab2:
             st.success("AI補正を適用しました。"); _ai_usage_lamp_inline()
 
 # -------------------------------------------------
-# 12) 保存直前の一括検証＆最終整形
+# 13) 保存直前の一括検証＆最終整形（A/C/D/F/G/H/I/J）
 # -------------------------------------------------
 try:
     guards = CFG.get("text_guards", {}) or {}
 except Exception:
     guards = {}
-p1_min = int(guards.get("p1_min_chars", 220))
+p1_min = int(guards.get("p1_min_chars", 180))  # “同程度”に合わせる
 p2_min = int(guards.get("p2_min_chars", 180))
 
 def _norm_for_check(s: str) -> str:
@@ -8741,6 +9107,26 @@ def _norm_for_check(s: str) -> str:
         try: return _canon_normalize(s)
         except Exception: pass
     return _nfkc(s)
+
+def _validate_tokens_unchanged(before_text: str, after_text: str, extra_terms: list[str] | None = None) -> bool:
+    # マスク列の一致で、集合/順序/件数の差異を検出（DATE/TIME/NUM/IND）
+    _, seq_b, order_b = _mask_sensitive(before_text or "", extra_terms=extra_terms)
+    _, seq_a, order_a = _mask_sensitive(after_text or "", extra_terms=extra_terms)
+    return (order_b == order_a) and ([x[1] for x in seq_b] == [x[1] for x in seq_a])
+
+def _validate_low_importance_absent(cal_line: str) -> bool:
+    return not bool(_LOW_IMPORT_PAT.search(cal_line or ""))
+
+def _validate_events_raw_match(kept_events) -> bool:
+    # 「H:MM に<原文>」の原文部分は、そのイベントの raw と一致しているか（時刻以外は不改変）
+    for e in kept_events or []:
+        line = e.get("line","")
+        raw = e.get("label_raw","")
+        m = re.search(r"^\s*[0-2]?\d:[0-5]\d\s*に(.+)$", line)
+        if not m: return False
+        if m.group(1) != raw:
+            return False
+    return True
 
 def _validate_and_fix_all(p1: str, p2: str, p3: str, ttl: str):
     msgs = []
@@ -8751,46 +9137,88 @@ def _validate_and_fix_all(p1: str, p2: str, p3: str, ttl: str):
     if any(w in (p1 + p2) for w in NG_WORDS): msgs.append("売買助言に該当し得る語が含まれる")
     if not (p3.startswith("本日の指標は、") and p3.endswith("。")):
         msgs.append("段落③の体裁が不正（本日の指標は、〜 で始まり句点で終える必要）")
+    if "\n" in p3.strip():
+        msgs.append("段落③が一行になっていない")
+
+    # ③のイベント範囲・低重要度・原文一致
+    start, end = _window_bounds_jst()
+    kept = list(st.session_state.get("calendar_events_kept") or [])
+    for e in kept:
+        if not (start <= e["dt"] <= end):
+            msgs.append("③に範囲外イベントが混入"); break
+    if not _validate_low_importance_absent(st.session_state.get("calendar_line","")):
+        msgs.append("③に低重要度イベントが混入")
+    if not _validate_events_raw_match(kept):
+        msgs.append("③のイベントが原文と一致していない（時刻以外の整形検出）")
+
+    # 不改変保証（①②の数値・時刻・指標名）
+    ind_terms = _collect_indicator_terms()
+    if not _validate_tokens_unchanged(para1_pre, p1, extra_terms=ind_terms):
+        msgs.append("①で数値/日付/時刻/指標名の不改変違反")
+    if not _validate_tokens_unchanged(para2_pre, p2, extra_terms=ind_terms):
+        msgs.append("②で数値/日付/時刻/指標名の不改変違反")
+
     def _final_sanitize(s: str) -> str:
         t = _strict_style_guard(s)
         t = re.sub(r"\s+\n", "\n", t)
         t = re.sub(r"\n{3,}", "\n\n", t)
         return t
-    return msgs, _final_sanitize(p1), _final_sanitize(p2), _fit_para3_oneline(st.session_state.get("calendar_line",""), st.session_state.get("ai_title_recall_final","") or p3, bool(st.session_state.get("recall_period_only", False))), _fit_title_soft(ttl)
+
+    return msgs, _final_sanitize(p1), _final_sanitize(p2), _fit_para3_oneline(
+        st.session_state.get("calendar_line",""),
+        st.session_state.get("ai_title_recall_final","") or p3,
+        bool(st.session_state.get("recall_period_only", False))
+    ), _fit_title_soft(ttl)
 
 viol, ai_p1_final, ai_p2_final, ai_p3_final, ai_title_final = _validate_and_fix_all(ai_p1, ai_p2, ai_p3, ai_title)
 if viol:
     st.error("体裁チェック NG：" + " / ".join(viol))
 else:
-    st.success("体裁チェック OK（①≥220字／②≥180字／③は1行で回収まで同一行・句点で終える）。")
+    st.success("体裁チェック OK（①/②は180〜220字※③短尺時は相対均し、③は一行・本日0:00〜翌日18:00 JST・回収句点・原文一致）。")
 
-# 保存
+# 保存（違反時は中断・DL非表示）
+can_save = not bool(viol)
+
 out_dir = Path("./out"); out_dir.mkdir(parents=True, exist_ok=True)
 fname = f"m{datetime.now():%Y%m%d}.txt"
 save_path = out_dir / fname
 ai_text_final = (_compact_final_text(_render_report_safe(ai_title_final, ai_p1_final, ai_p2_final, ai_p3_final, points), ai_title_final) + "\n\n" + ai_p3_final).strip()
 
-try:
-    save_path.write_text(ai_text_final, encoding="utf-8")
-    st.success(f"保存しました：{fname}")
-    st.download_button("このプレビューをダウンロード",
-                       data=ai_text_final.encode("utf-8"),
-                       file_name=fname, mime="text/plain",
-                       key="dl_report_unified")
-except Exception as e:
-    st.warning(f"保存時のエラー：{e}")
+if can_save:
+    try:
+        save_path.write_text(ai_text_final, encoding="utf-8")
+        st.success(f"保存しました：{fname}")
+        st.download_button("このプレビューをダウンロード",
+                           data=ai_text_final.encode("utf-8"),
+                           file_name=fname, mime="text/plain",
+                           key="dl_report_unified")
+    except Exception as e:
+        st.warning(f"保存時のエラー：{e}")
+else:
+    st.warning("違反を検出したため、保存とダウンロードを中止しました。")
 
-# 監査ログ
+# 監査ログ（I）
 try:
+    ev_in, ev_kept, ev_drop, cal_line_now = _build_calendar_events_and_line(max_items=int(st.session_state.get("calendar_max_items",6)))
     log = {
         "ts": datetime.now().isoformat(),
         "pair": str(st.session_state.get("pair", "")),
         "title": ai_title_final,
+        "title_source": st.session_state.get("title_source","ai-applied" if st.session_state.get("title_ai") else "fallback"),
         "points": points,
-        "calendar_line": cal_line_src if 'cal_line_src' in locals() else st.session_state.get("calendar_line",""),
-        "preview_len": len(ai_text_final),
+        "calendar_line": st.session_state.get("calendar_line",""),
+        "char_counts": {"p1": _strlen_ja(ai_p1_final), "p2": _strlen_ja(ai_p2_final), "p3": _strlen_ja(ai_p3_final)},
         "checks_failed": viol,
         "ai_flags": _ai_flags(),
+        "llm_models": list(dict.fromkeys(_ai_flags().get("models_used") or [])),
+        "rss_used": bool(_ai_flags().get("rss_used")),
+        "range_filter": "today~nextday 18:00 JST",
+        "time_format": "H:MM",
+        "calendar_autoselect": bool(st.session_state.get("calendar_autoselect", True)),
+        "calendar_max_items": int(st.session_state.get("calendar_max_items",6)),
+        "events_in": [e["line"] for e in ev_in],
+        "events_kept": [e["line"] for e in ev_kept],
+        "events_dropped": ev_drop,
         "live_diag": globals().get("live_diag", {}) if isinstance(globals().get("live_diag", {}), dict) else {},
         "te_diag":   globals().get("te_diag", {})   if isinstance(globals().get("te_diag", {}), dict)   else {},
     }
