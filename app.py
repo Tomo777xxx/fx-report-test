@@ -7716,6 +7716,7 @@ st.session_state["p2_ui_preview_text"] = p2
 import os, sys, subprocess, re, json, unicodedata, inspect
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Tuple, Dict, Any
 import streamlit as st
 
 # -------------------------------------------------
@@ -7747,7 +7748,7 @@ def _now_jst() -> datetime:
     except Exception:
         return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(_JST)
 
-def _window_bounds_jst(today: datetime | None = None):
+def _window_bounds_jst(today: Optional[datetime] = None) -> Tuple[datetime, datetime]:
     """
     本日 0:00 〜 翌日 18:00（JST）の時間窓を返す
     """
@@ -7768,7 +7769,7 @@ def _ensure_pkg(pkg: str) -> bool:
         except Exception:
             return False
 
-def _get_api_key() -> str | None:
+def _get_api_key() -> Optional[str]:
     """secrets[top] → secrets[general] → env の順で取得"""
     try:
         if "OPENAI_API_KEY" in st.secrets:
@@ -7839,18 +7840,6 @@ def _direct_openai_call(prompt: str, model=None, max_tokens=512, temperature=0.2
     except Exception as e:
         _ai_flags()["last_error"] = f"OpenAI call error: {e}"
         return ""
-
-def _func_accepts_kw(func, kwname: str) -> bool:
-    try:
-        sig = inspect.signature(func)
-        for p in sig.parameters.values():
-            if p.kind == p.VAR_KEYWORD:
-                return True
-            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and p.name == kwname:
-                return True
-    except Exception:
-        pass
-    return False
 
 def _filter_kwargs(func, kwargs: dict) -> dict:
     try:
@@ -8006,7 +7995,7 @@ def _normalize_units_and_notation(s: str) -> str:
     for pat, rep in NORMALIZE_MAP: t = re.sub(pat, rep, t)
     # 時刻は H:MM（時間はゼロ埋めしない／分は2桁）
     def _fix_time(m): return f"{int(m.group(1))}:{int(m.group(2)):02d}"
-    return re.sub(r"\b([0-2]?\d):([0-5]?\d)\b", _fix_time, t)
+    return re.sub(r"\b([0-2]?\d):([0-5]\d)\b", _fix_time, t)
 
 def _neutralize_tone(s: str) -> str:
     t = _clean_text_jp_safe(s)
@@ -8026,17 +8015,17 @@ def _strict_style_guard(s: str) -> str:
 # -------------------------------------------------
 # 2.5) マスキング → 生成 → 復元・照合（A:不改変保証／IND追加）
 # -------------------------------------------------
-_TOKEN_PATTERNS = {
+_TOKEN_PATTERNS: Dict[str, Any] = {
     "DATE": re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
     "TIME": re.compile(r"\b([0-2]?\d:[0-5]\d)\b"),
     "NUM":  re.compile(r"(?<![A-Za-z])[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?"),
 }
 
-def _collect_indicator_terms() -> list[str]:
+def _collect_indicator_terms() -> List[str]:
     """
     当日採用イベント（kept）の原文ラベルから“指標名候補”を抽出し、長い順にユニーク化。
     """
-    terms = []
+    terms: List[str] = []
     kept = st.session_state.get("calendar_events_kept") or []
     for e in kept:
         raw = _nfkc(e.get("label_raw","")).strip()
@@ -8066,13 +8055,13 @@ def _collect_indicator_terms() -> list[str]:
             seen.add(t); out.append(t)
     return out
 
-def _mask_sensitive(text: str, extra_terms: list[str] | None = None):
+def _mask_sensitive(text: str, extra_terms: Optional[List[str]] = None):
     """
     extra_terms: 指標名（IND）プレースホルダ対象。順序・件数は出力検証に使用。
     """
     s = str(text or "")
-    seq: list[tuple[str,str]] = []
-    order: list[str] = []
+    seq: List[Tuple[str,str]] = []
+    order: List[str] = []
     counters = {"IND":0, "DATE":0, "TIME":0, "NUM":0}
 
     def _make_repl(kind: str):
@@ -8091,7 +8080,6 @@ def _mask_sensitive(text: str, extra_terms: list[str] | None = None):
             try:
                 s = re.sub(re.escape(term), _make_repl("IND"), s)
             except Exception:
-                # まれな正規化不整合はスキップ
                 pass
 
     # 2) DATE / TIME / NUM
@@ -8101,7 +8089,7 @@ def _mask_sensitive(text: str, extra_terms: list[str] | None = None):
 
     return s, seq, order
 
-def _unmask_and_verify(llm_out: str, seq, order):
+def _unmask_and_verify(llm_out: str, seq, order) -> Tuple[str, bool, str]:
     out = str(llm_out or "")
     found = re.findall(r"<(DATE|TIME|NUM|IND)_(\d+)>", out)
     got = [f"<{k}_{i}>" for k, i in found]
@@ -8120,7 +8108,6 @@ def _unmask_and_verify(llm_out: str, seq, order):
 # 3) タイトル調整（18〜28字のソフトフィット）＋重複語尾抑止
 # -------------------------------------------------
 def _dedup_tail(t: str) -> str:
-    # 例：「…に注視かの動向に注視」型の重複抑止
     t1 = re.sub(r"(に注視|に警戒|の動向|の行方)(か)?(の動向|の行方|に注視|に警戒)+$", r"\1\2", t)
     return t1
 
@@ -8155,7 +8142,7 @@ def _fit_para3_oneline(cal_src: str, recall: str, period_only: bool=False) -> st
     if not line.endswith("。"): line += "。"
     return line
 
-def _shrink_text_keep_facts(text: str, min_len: int, max_len: int, extra_terms: list[str] | None = None) -> str:
+def _shrink_text_keep_facts(text: str, min_len: int, max_len: int, extra_terms: Optional[List[str]] = None) -> str:
     base = _clean_text_jp_safe(text or "")
     if min_len <= _strlen_ja(base) <= max_len or not _llm_ready():
         return base
@@ -8183,12 +8170,19 @@ def _ensure_feedparser():
             return False
 
 def _google_news_rss_search(query: str, lang="ja", gl="JP", ceid="JP:ja", limit=8):
-    import urllib.parse, feedparser
+    import urllib.parse
+    try:
+        import feedparser
+    except Exception:
+        return []
     q = urllib.parse.quote(query)
     url = f"https://news.google.com/rss/search?q={q}&hl={lang}&gl={gl}&ceid={ceid}"
-    feed = feedparser.parse(url)
+    try:
+        feed = feedparser.parse(url)
+    except Exception:
+        return []
     out = []
-    for e in (feed.entries or [])[:limit]:
+    for e in (getattr(feed, "entries", []) or [])[:limit]:
         title = str(getattr(e,"title","") or ""); link = str(getattr(e,"link","") or "")
         publ  = str(getattr(e,"published","") or getattr(e,"updated","") or "")
         src   = ""
@@ -8197,7 +8191,7 @@ def _google_news_rss_search(query: str, lang="ja", gl="JP", ceid="JP:ja", limit=
         out.append({"title": title, "url": link, "source": src, "published": publ})
     return out
 
-def _rank_news(items: list[dict], max_items=10):
+def _rank_news(items: List[dict], max_items=10) -> List[dict]:
     def _norm_title(t: str) -> str:
         t = _nfkc(t or "").strip(); t = re.sub(r"\s+", " ", t)
         return re.sub(r"[【\[][^】\]]+[】\]]", "", t)
@@ -8214,7 +8208,7 @@ def _rank_news(items: list[dict], max_items=10):
     ranked.sort(key=lambda x: x["_score"], reverse=True)
     return ranked[:max_items]
 
-def _fetch_fx_related_news(max_items=10):
+def _fetch_fx_related_news(max_items=10) -> List[dict]:
     if not _ensure_feedparser():
         st.warning("feedparser のインストールに失敗しました。ニュース取得はスキップします。"); return []
     pair = str(st.session_state.get("pair","") or "")
@@ -8228,7 +8222,7 @@ def _fetch_fx_related_news(max_items=10):
             "ECB 金利 ユーロ","ユーロ圏 HICP 物価","ドイツ IFO 景況","ZEW 景況感",
             "日銀 金利 為替","為替介入 日本","日本 CPI 物価","長期金利 日本",
             "原油先物 相場","中東 地政学 為替","米大統領選 為替"]
-    all_items = []
+    all_items: List[dict] = []
     for q in core + pair_q:
         try: all_items += _google_news_rss_search(q, limit=8)
         except Exception: pass
@@ -8262,7 +8256,7 @@ def _pick(row, keys, default=""):
             continue
     return default
 
-def _parse_dt_jst(row) -> datetime | None:
+def _parse_dt_jst(row) -> Optional[datetime]:
     cand = _pick(row, ["datetime","start_at","start","local_time","time","date"])
     s = str(cand or "").strip()
     if not s: return None
@@ -8284,7 +8278,7 @@ def _parse_dt_jst(row) -> datetime | None:
         return datetime(base.year, base.month, base.day, hh, mm, tzinfo=_JST)
     return None
 
-def _fmt_hhmm(dt: datetime | None, fallback: str = "") -> str:
+def _fmt_hhmm(dt: Optional[datetime], fallback: str = "") -> str:
     if isinstance(dt, datetime):
         return f"{int(dt.hour)}:{int(dt.minute):02d}"
     m = re.search(r"([0-2]?\d):([0-5]\d)", str(fallback))
@@ -8430,7 +8424,7 @@ def _build_calendar_events_and_line(max_items: int = 6):
         dropped.append({"reason":"too-long-pruned", "line": drop_ev["line"]})
     return events_in, evs, dropped, _join_lines(evs)
 
-def _build_points_from_selected(top_k: int = 2) -> list[str]:
+def _build_points_from_selected(top_k: int = 2) -> List[str]:
     _, kept, _, _ = _build_calendar_events_and_line(max_items=max(10, top_k))
     return [e["line"] for e in kept[:top_k]]
 
@@ -8473,8 +8467,8 @@ def _strip_media_brackets(s: str) -> str:
 # -------------------------------------------------
 # 9) タイトル＆回収（AI）+ タイトル強制適用
 # -------------------------------------------------
-def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_news_list: list[dict],
-                         base_title_tail: str = "", pair_name: str = ""):
+def _ai_title_and_recall(preview_text: str, manual_news_list: List[str], picked_news_list: List[dict],
+                         base_title_tail: str = "", pair_name: str = "") -> Tuple[str, str]:
     if not _require_llm("タイトル案のAI生成"): return "", ""
     news_lines = [x.strip() for x in (manual_news_list or []) if str(x).strip()]
     def _clean_for_prompt(t: str) -> str:
@@ -8497,7 +8491,7 @@ def _ai_title_and_recall(preview_text: str, manual_news_list: list[str], picked_
         st.error("🔴 タイトル案のAI生成に失敗しました。接続やキー、ネットワークを確認してください。")
         return "", ""
 
-    def _parse_title_recall(text: str) -> tuple[str, str]:
+    def _parse_title_recall(text: str) -> Tuple[str, str]:
         s = _clean_text_jp_safe(text)
         s = re.sub(r"^```.*?\n", "", s, flags=re.S)
         s = re.sub(r"\n```$", "", s, flags=re.S)
@@ -8572,7 +8566,7 @@ with st.container():
             st.warning(f"AIニュース取得に失敗しました: {e}")
 
     raw_cand = st.session_state.get("ai_news_candidates", [])
-    cand_list = []
+    cand_list: List[dict] = []
     for c in raw_cand:
         if isinstance(c, dict):
             title = c.get("title") or c.get("headline") or str(c)
@@ -8613,7 +8607,7 @@ with st.container():
                 st.session_state["calendar_events_dropped"] = dropped_evs
                 st.session_state["calendar_line"] = cal_line
             preview_all = "\n".join([str(globals().get("p1","")), str(globals().get("p2","")), str(st.session_state.get("calendar_line",""))])[:1200]
-            picked = []
+            picked: List[dict] = []
             for i in st.session_state.get("ai_news_selected_idx", []):
                 if isinstance(i, int) and 0 <= i < len(cand_list):
                     picked.append(cand_list[i])
@@ -8675,7 +8669,7 @@ if _pts_fx and not st.session_state.get("points_tags_v2"):
 points = list(st.session_state.get("points_tags_v2", []) or [])[:2]
 points = [_norm_point_line(p) for p in points]
 
-def _mentions_points(s: str, items: list[str]) -> bool:
+def _mentions_points(s: str, items: List[str]) -> bool:
     if not s or not items: return True
     body = str(s).replace(" ", "")
     for it in items:
@@ -8692,15 +8686,26 @@ if _pts_short and not _mentions_points(globals().get("p1", ""), points):
 else:
     p1 = str(globals().get("p1", "") or "")
 
-# 段落②：骨子生成と最低限の充填
+# 段落②：骨子生成と最低限の充填（★強化版）
 def pad_para2(para2: str, min_chars: int = 180) -> str:
-    base = str(para2 or "").strip()
-    if len(base) >= min_chars: return base
-    addon = "短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。"
-    if addon not in base:
-        if base and not base.endswith("。"): base += " "
-        base += addon
-    return base
+    """
+    必要になるまで安全な定型を追加して、最低文字数を確実に満たす。
+    """
+    base = _clean_text_jp_safe(para2 or "").rstrip("。")
+    fillers = [
+        "短期は20SMAやボリンジャーバンド周辺の反応を確かめつつ、過度な方向感は決めつけない構えとしたい。",
+        "イベント前は値幅が出やすく、行って来いにも注意しながら、時間軸ごとの支持・抵抗の確認を重ねたい。",
+        "インジケーターは過度に信頼せず、上下いずれの振れにも備え、短期の偏りを避けたい。",
+    ]
+    i = 0
+    while _strlen_ja(base) < min_chars:
+        add = fillers[i % len(fillers)]
+        if add not in base:
+            base = (base + "。" + add) if base else add
+        i += 1
+        if i > 8:  # 念のためのブレーキ
+            break
+    return (base or "").strip().rstrip("。") + "。"
 
 def _normalize_tf_words(s: str) -> str:
     t = _nfkc(s)
@@ -8720,18 +8725,15 @@ def _enforce_para2_lead(text: str, pair_name: str) -> str:
     h4 = st.session_state.get("h4_imp", "横ばい")
     lead = f"為替市場は、{pair_name}は日足は{d1}、4時間足は{h4}。"
     s = _clean_text_jp_safe(text or "")
-    # 既に「為替市場は、」で始まるが、定型に合致しない場合は冒頭1文を置換
     if re.match(r"^為替市場は、", s):
         if not re.match(r"^為替市場は、\S+は日足は.+?、4時間足は.+?。", s):
             s = re.sub(r"^為替市場は、.*?。", lead, s, count=1)
         return s
-    # 先頭が定型でなければ前置き
     return (lead + s.lstrip())
 
 def _refine_para2_structured(p2_text: str, pair_name: str) -> str:
     base = _clean_text_jp_safe(p2_text or "")
     try:
-        # マスク（数値/日付/時刻/指標名）した上でLLMへ
         ind_terms = _collect_indicator_terms()
         masked, seq, order = _mask_sensitive(base, extra_terms=ind_terms)
         prompt = (
@@ -8770,10 +8772,8 @@ def _p2_ai_postprocess(text: str) -> str:
     t = _clean_text_jp_safe(str(text or ""))
     t = t.replace("4時間足では 為替市場は、", "4時間足では ")
     t = re.sub(r"(為替市場は、[^。]+。)\s*\1", r"\1", t)
-    # 装飾除去（J）
     t = re.sub(r"[【［\[][^】］\]]+[】］\]]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
-    # ② 冒頭定型の強制（後工程でも崩れない二重ガード）
     t = _enforce_para2_lead(t, _cur_pair)
     if not t.endswith("。"): t += "。"
     return _strict_style_guard(t)
@@ -8806,7 +8806,7 @@ def _apply_ai_to_p2_with_ai():
 # --- ① AI適用（マスキング＋復元）
 def _apply_ai_to_p1_only():
     if not _require_llm("段落①のAI補正"): return
-    base = _clean_text_jp_safe(ai_p1)
+    base = _clean_text_jp_safe(st.session_state.get("p1_ai", "") or globals().get("p1",""))
     ind_terms = _collect_indicator_terms()
     masked, seq, order = _mask_sensitive(base, extra_terms=ind_terms)
     out = _call_llm_with_flags(
@@ -8837,7 +8837,7 @@ def _expand_recall_if_short(recall: str, ttl: str) -> str:
 
 def _apply_ai_to_title_and_p3():
     if not _require_llm("タイトル/③のAI補正"): return
-    ttl = _fit_title_soft(ai_title)
+    ttl = _fit_title_soft(st.session_state.get("title_ai", "") or ttl_display)
     out = _call_llm_with_flags(
         f"次のタイトルを18〜28字で簡潔に整えてください（句点なし・助言なし）：\n{_clean_text_jp_safe(ttl)}",
         max_tokens=120, temperature=0.2
@@ -8854,10 +8854,10 @@ def _apply_ai_to_title_and_p3():
 
     preview_for_recall_ai = "\n".join([
         f"ポイント: {', '.join(x for x in (st.session_state.get('points_tags_v2') or []) if x)}",
-        f"段落①: {ai_p1}",
-        f"段落②: {ai_p2}",
+        f"段落①: {st.session_state.get('p1_ai', _clean_text_jp_safe(globals().get('p1','')))}",
+        f"段落②: {st.session_state.get('p2_ai', '')}",
     ])
-    def _make_cal_plus_recall(cal_src: str, ttl: str, preview_text: str = None) -> str:
+    def _make_cal_plus_recall(cal_src: str, ttl: str, preview_text: Optional[str] = None) -> str:
         cs = _nfkc(cal_src or "").strip()
         cs = re.sub(r"[。．]+$", "", cs)
         period_only = bool(st.session_state.get("recall_period_only", False))
@@ -8902,9 +8902,9 @@ def _apply_ai_to_title_and_p3():
 # -------------------------------------------------
 # 12) Pre-AI / AI後 の確定と描画・分量均し
 # -------------------------------------------------
-para1_pre = _strict_style_guard(_clean_text_jp_safe(str(p1).strip()))
+para1_pre = _strict_style_guard(_clean_text_jp_safe(str(globals().get("p1","")).strip()))
 if "_final_polish_and_guard" in globals() and callable(globals().get("_final_polish_and_guard")):
-    try: para1_pre = _final_polish_and_guard(para1_pre, para="p1")
+    try: para1_pre = globals()["_final_polish_and_guard"](para1_pre, para="p1")
     except Exception: pass
 
 p2_src = str(globals().get("p2","") or st.session_state.get("para2_for_build","") or "")
@@ -8914,7 +8914,6 @@ if not p2_src:
     p2_src = _clean_text_jp_safe(f"為替市場は、{_cur_pair}は日足は{d1}、4時間足は{h4}。")
 para2_pre = pad_para2(p2_src, 180)
 para2_pre = _strict_style_guard(para2_pre)
-# ② 冒頭定型の強制（この段階で必ず定型で開始）
 para2_pre = _enforce_para2_lead(para2_pre, _cur_pair)
 
 # ブレークポイント取り込み（各1本まで）
@@ -8935,7 +8934,7 @@ def _fallback_bp_from_ui():
     return up, dn
 
 try:
-    up_txt, dn_txt, _axis = _choose_breakpoints()
+    up_txt, dn_txt, _axis = globals().get("_choose_breakpoints", lambda: (None, None, None))()
 except Exception:
     up_txt = dn_txt = None
 if (not up_txt or up_txt == "0.00") and (not dn_txt or dn_txt == "0.00"):
@@ -8943,7 +8942,6 @@ if (not up_txt or up_txt == "0.00") and (not dn_txt or dn_txt == "0.00"):
     up_txt = up_txt if (up_txt and up_txt != "0.00") else f_up
     dn_txt = dn_txt if (dn_txt and dn_txt != "0.00") else f_dn
 
-# 明示的に各1本制限
 bp_lines = []
 if up_txt and up_txt != "0.00": bp_lines.append(f"上値{up_txt}付近の上抜けの有無をまずは見極めたい。")
 if dn_txt and dn_txt != "0.00": bp_lines.append(f"下値{dn_txt}付近の下抜けには警戒したい。")
@@ -8965,8 +8963,16 @@ para2_pre = re.sub(r"(行方を注視したい。|値動きには警戒したい
 para2_pre = (para2_pre or "").strip().rstrip("。") + "。"
 para2_pre = _strict_style_guard(para2_pre)
 
+# ★ ここで再度 最低文字数を保証（取りこぼし防止）
+try:
+    guards = globals().get("CFG", {}).get("text_guards", {}) if isinstance(globals().get("CFG", {}), dict) else {}
+except Exception:
+    guards = {}
+p2_min_fallback = int(guards.get("p2_min_chars", 180))
+para2_pre = pad_para2(para2_pre, p2_min_fallback)
+
 # ③（タイトル回収＋カレンダー1行）
-def _make_cal_plus_recall_pre(cal_src: str, ttl: str, preview_text: str = None) -> str:
+def _make_cal_plus_recall_pre(cal_src: str, ttl: str, preview_text: Optional[str] = None) -> str:
     cs = _nfkc(cal_src or "").strip()
     cs = re.sub(r"[。．]+$", "", cs)
     period_only = bool(st.session_state.get("recall_period_only", False))
@@ -9007,7 +9013,7 @@ ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", para1_pre))
 ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", para2_pre))
 ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", para3_pre))
 
-# 3.5) 分量を“同程度”に（C/F）：①②は過長時のみ圧縮、③が短い日は相対均しで少しだけ圧縮
+# 3.5) 分量を“同程度”に（C/F）
 ind_terms_for_balance = _collect_indicator_terms()
 ai_p1 = _shrink_text_keep_facts(ai_p1, 180, 220, extra_terms=ind_terms_for_balance)
 ai_p2 = _shrink_text_keep_facts(ai_p2, 180, 220, extra_terms=ind_terms_for_balance)
@@ -9041,15 +9047,30 @@ ai_p1    = _strict_style_guard(st.session_state.get("p1_ai", ai_p1))
 ai_p2    = _strict_style_guard(st.session_state.get("p2_ai", ai_p2))
 ai_p3    = _strict_style_guard(st.session_state.get("p3_ai", ai_p3))
 
-# 5) プレビュー描画（互換）
-def _render_report_safe(title, p1, p2, p3, points=None):
+# 5) プレビュー描画（互換・フォールバック堅牢化）
+def _render_report_safe(title, p1, p2, p3, points=None) -> str:
     points = list(points or [])[:2]
-    try:
-        return render_report(title=title, point1=(points[0] if points else ""), point2=(points[1] if len(points)>1 else ""),
-                             para1=p1, para2=p2, cal_line=st.session_state.get("calendar_line",""), title_recall=p3)
-    except TypeError:
-        return render_report(title=title, point1=(points[0] if points else ""), point2=(points[1] if len(points)>1 else ""),
-                             para1=p1, para2=p2, calendar_line=st.session_state.get("calendar_line",""), title_recall=p3)
+    cal_line = st.session_state.get("calendar_line","")
+    rr = globals().get("render_report")
+    if callable(rr):
+        try:
+            # 新署名
+            return rr(title=title, point1=(points[0] if points else ""), point2=(points[1] if len(points)>1 else ""),
+                      para1=p1, para2=p2, cal_line=cal_line, title_recall=p3)
+        except TypeError:
+            try:
+                # 旧署名
+                return rr(title=title, point1=(points[0] if points else ""), point2=(points[1] if len(points)>1 else ""),
+                          para1=p1, para2=p2, calendar_line=cal_line, title_recall=p3)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    # フォールバック：素朴なテキスト構成
+    pt1 = f"・{points[0]}" if points and points[0] else ""
+    pt2 = f"・{points[1]}" if len(points)>1 and points[1] else ""
+    blocks = [str(title).strip(), pt1, pt2, str(p1).strip(), str(p2).strip(), str(p3).strip()]
+    return "\n\n".join([b for b in blocks if b])
 
 points = list(st.session_state.get("points_tags_v2", []) or [])[:2]
 
@@ -9057,7 +9078,7 @@ def _compact_final_text(s: str, ttl: str) -> str:
     t = (s or "").strip()
     t = re.sub(r"本日の指標は、.*?(?=\n\n|$)", "", t, flags=re.S).strip()
     if ttl:
-        try: solo = (build_title_recall(ttl) or ttl).strip()
+        try: solo = (globals().get("build_title_recall", lambda x: x)(ttl) or ttl).strip()
         except Exception: solo = ttl
         solo = re.escape(_nfkc(solo).rstrip("。"))
         t = re.sub(rf"(?m)^\s*{solo}。?\s*$\n?", "", t)
@@ -9096,7 +9117,8 @@ with tab2:
 # 13) 保存直前の一括検証＆最終整形（A/C/D/F/G/H/I/J）
 # -------------------------------------------------
 try:
-    guards = CFG.get("text_guards", {}) or {}
+    CFG_local = globals().get("CFG", {})
+    guards = CFG_local.get("text_guards", {}) if isinstance(CFG_local, dict) else {}
 except Exception:
     guards = {}
 p1_min = int(guards.get("p1_min_chars", 180))  # “同程度”に合わせる
@@ -9104,12 +9126,11 @@ p2_min = int(guards.get("p2_min_chars", 180))
 
 def _norm_for_check(s: str) -> str:
     if "_canon_normalize" in globals() and callable(globals().get("_canon_normalize")):
-        try: return _canon_normalize(s)
+        try: return globals()["_canon_normalize"](s)
         except Exception: pass
     return _nfkc(s)
 
-def _validate_tokens_unchanged(before_text: str, after_text: str, extra_terms: list[str] | None = None) -> bool:
-    # マスク列の一致で、集合/順序/件数の差異を検出（DATE/TIME/NUM/IND）
+def _validate_tokens_unchanged(before_text: str, after_text: str, extra_terms: Optional[List[str]] = None) -> bool:
     _, seq_b, order_b = _mask_sensitive(before_text or "", extra_terms=extra_terms)
     _, seq_a, order_a = _mask_sensitive(after_text or "", extra_terms=extra_terms)
     return (order_b == order_a) and ([x[1] for x in seq_b] == [x[1] for x in seq_a])
@@ -9118,7 +9139,6 @@ def _validate_low_importance_absent(cal_line: str) -> bool:
     return not bool(_LOW_IMPORT_PAT.search(cal_line or ""))
 
 def _validate_events_raw_match(kept_events) -> bool:
-    # 「H:MM に<原文>」の原文部分は、そのイベントの raw と一致しているか（時刻以外は不改変）
     for e in kept_events or []:
         line = e.get("line","")
         raw = e.get("label_raw","")
